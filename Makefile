@@ -32,6 +32,7 @@ LDFLAGS = -arch arm64 \
           -framework UIKit \
           -framework AdSupport \
           -framework AppTrackingTransparency \
+          -framework Security \
           -install_name @executable_path/PrivacyHook.dylib \
           -Wl,-weak_framework,AppTrackingTransparency
 
