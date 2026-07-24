@@ -1,0 +1,49 @@
+# ============================================================
+# GitHub Actions Workflow: Build PrivacyHook.dylib
+#
+# This workflow compiles the dylib on a free macOS runner.
+# You do NOT need a Mac — just push this repo to GitHub and
+# the dylib will be built automatically.
+#
+# After the build completes, download PrivacyHook.dylib from
+# the workflow artifacts.
+# ============================================================
+
+name: Build PrivacyHook
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build dylib
+        run: make
+
+      - name: Verify build
+        run: |
+          echo "=== Architecture ==="
+          lipo -info PrivacyHook.dylib
+          echo ""
+          echo "=== Load Commands ==="
+          otool -L PrivacyHook.dylib
+          echo ""
+          echo "=== File Info ==="
+          file PrivacyHook.dylib
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrivacyHook-dylib
+          path: PrivacyHook.dylib
+          retention-days: 90
