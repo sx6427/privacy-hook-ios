@@ -329,14 +329,104 @@ static void initPrivacyHook(void) {
         // ============================================================
         clearSharedCookies();
 
-        // NOTE: bundleIdentifier, canOpenURL, and app group hooks REMOVED.
-        // The bundleIdentifier hook created a mismatch between the runtime
-        // bundleIdentifier (returning original com.baidu.BaiduMobile) and
-        // infoDictionary[@"CFBundleIdentifier"] (returning the real modified
-        // Bundle ID). Payment SDKs compare these two values and detect the
-        // mismatch as "non-genuine app". Without the hook, both values are
-        // consistent (com.baidu.BaiduMobile.BaiduBoxAppA1), which the payment
-        // SDK accepts.
+        // ============================================================
+        // 7. NSBundle — return ORIGINAL Bundle ID for payment compatibility
+        //    Payment SDKs check bundleIdentifier == "com.baidu.BaiduMobile"
+        //    Must hook ALL access paths: bundleIdentifier, infoDictionary,
+        //    objectForInfoDictionaryKey: — all return com.baidu.BaiduMobile
+        // ============================================================
+        {
+            static NSString *origBundleID = nil;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                const char parts[] = {99,111,109,46,98,97,105,100,117,46,
+                                      66,97,105,100,117,77,111,98,105,108,101,0};
+                origBundleID = rtStr(parts);
+            });
+
+            Class bundleClass = objc_getClass("NSBundle");
+            if (bundleClass) {
+                // 7a. bundleIdentifier method
+                Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
+                if (m) {
+                    static IMP orig_bundleID = NULL;
+                    orig_bundleID = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        if (s == [NSBundle mainBundle]) {
+                            return origBundleID;
+                        }
+                        return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
+                    });
+                    hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
+                                       imp, method_getTypeEncoding(m));
+                }
+
+                // 7b. objectForInfoDictionaryKey: — intercept CFBundleIdentifier
+                m = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
+                if (m) {
+                    static IMP orig_infoKey = NULL;
+                    orig_infoKey = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
+                        if (s == [NSBundle mainBundle] && key &&
+                            [key isEqualToString:@"CFBundleIdentifier"]) {
+                            return origBundleID;
+                        }
+                        return ((id(*)(id, SEL, NSString *))orig_infoKey)(
+                            s, @selector(objectForInfoDictionaryKey:), key);
+                    });
+                    hookInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:),
+                                       imp, method_getTypeEncoding(m));
+                }
+
+                // 7c. infoDictionary — replace CFBundleIdentifier in returned dict
+                m = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
+                if (m) {
+                    static IMP orig_infoDict = NULL;
+                    orig_infoDict = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        NSDictionary *result = ((NSDictionary *(*)(id, SEL))orig_infoDict)(
+                            s, @selector(infoDictionary));
+                        if (s == [NSBundle mainBundle] && result) {
+                            NSMutableDictionary *mut = [result mutableCopy];
+                            mut[@"CFBundleIdentifier"] = origBundleID;
+                            return mut;
+                        }
+                        return result;
+                    });
+                    hookInstanceMethod(bundleClass, @selector(infoDictionary),
+                                       imp, method_getTypeEncoding(m));
+                }
+            }
+        }
+
+        // ============================================================
+        // 8. UIApplication canOpenURL — hide TrollStore URL scheme
+        // ============================================================
+        Class uiAppClass = objc_getClass("UIApplication");
+        if (uiAppClass) {
+            __block NSString *scheme1 = rtConcat("apple-magnifier-", "enable");
+            __block NSString *scheme2 = rtConcat("troll", "store");
+            __block NSString *scheme3 = rtStr("ts");
+
+            Method m = class_getInstanceMethod(uiAppClass, @selector(canOpenURL:));
+            if (m) {
+                static IMP orig_canOpenURL = NULL;
+                orig_canOpenURL = method_getImplementation(m);
+                IMP imp = imp_implementationWithBlock(^BOOL(id s, NSURL *url) {
+                    NSString *scheme = [url scheme];
+                    if (scheme) {
+                        if ([scheme isEqualToString:scheme1] ||
+                            [scheme isEqualToString:scheme2] ||
+                            [scheme hasPrefix:scheme3]) {
+                            return NO;
+                        }
+                    }
+                    return ((BOOL(*)(id, SEL, NSURL *))orig_canOpenURL)(s, @selector(canOpenURL:), url);
+                });
+                hookInstanceMethod(uiAppClass, @selector(canOpenURL:),
+                                   imp, method_getTypeEncoding(m));
+            }
+        }
     }
 }
 
