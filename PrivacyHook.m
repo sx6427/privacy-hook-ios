@@ -2,43 +2,21 @@
 //  PrivacyHook.m
 //  Device Fingerprint + Login State Isolation Dylib for iOS
 //
-//  v17: v16 + infoDictionary & objectForInfoDictionaryKey hooks.
+//  v18: Clear persistent SDK risk flags on EVERY launch.
 //
-//  Payment SDK reads CFBundleIdentifier via THREE paths:
-//  1. [NSBundle mainBundle].bundleIdentifier  → hooked (v13+)
-//  2. [NSBundle mainBundle].infoDictionary[@"CFBundleIdentifier"]  → NOT hooked
-//  3. [NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleIdentifier"]  → NOT hooked
+//  Problem: v14's aggressive hooks triggered SDK to write a persistent
+//  "modified environment" flag to Keychain. Our v16 only cleared
+//  Keychain on FIRST launch (using a UserDefaults flag), so the SDK's
+//  flag survived across launches. Even after uninstall+reinstall,
+//  Keychain items persist on iOS.
 //
-//  v13 "worked" sometimes because the SDK check is probabilistic.
-//  After v14's aggressive hooks, the server risk score increased to 100% fail.
-//  v17 hooks ALL THREE paths to make client-side check consistently pass,
-//  allowing server risk score to decrease over time.
+//  Fix: Clear Keychain EVERY launch (not just first). Also clear all
+//  non-our NSUserDefaults keys to remove any SDK-written flags.
 //
-//  infoDictionary hook: returns a CACHED mutable copy with ONLY
-//  CFBundleIdentifier changed. All other keys (icons, config, etc.)
-//  are preserved exactly. This avoids the icon disappearance issue
-//  that v9 had (which likely returned a fresh dict each time or
-//  modified other keys).
+//  Reverted to v16 base: only bundleIdentifier method hook (no
+//  infoDictionary / objectForInfoDictionaryKey — they break icons).
 //
 //  NO fishhook. NO C function hooks. ObjC swizzle ONLY.
-//
-//  Hooks:
-//    [Device Fingerprint — ObjC swizzle]
-//    - ASIdentifierManager advertisingIdentifier (IDFA)
-//    - ASIdentifierManager isAdvertisingTrackingEnabled
-//    - ATTrackingManager trackingAuthorizationStatus
-//    - ATTrackingManager requestTrackingAuthorizationWithCompletionHandler:
-//    - UIDevice identifierForVendor (IDFV)
-//    - UIDevice name (device name)
-//
-//    [Login State Isolation]
-//    - UIPasteboard (blocks clipboard-based cross-app login sharing)
-//    - Keychain clear on first launch
-//    - NSHTTPCookieStorage (clears shared cookies)
-//    - NSFileManager containerURLForSecurityApplicationGroupIdentifier:
-//
-//    [Payment Compatibility]
-//    - NSBundle bundleIdentifier (return original for payment SDKs)
 //
 
 #import <Foundation/Foundation.h>
@@ -121,13 +99,12 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Keychain + Cookie clearing
+// Keychain + Cookie + UserDefaults clearing
 // ============================================================
-static void clearKeychainOnFirstLaunch(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"kc");
-    if ([defaults boolForKey:key]) return;
 
+// Clear ALL keychain items on EVERY launch
+// (SDK may have written risk flags that persist across reinstalls)
+static void clearKeychainEveryLaunch(void) {
     NSArray *secItemClasses = @[
         (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecClassInternetPassword,
@@ -139,7 +116,33 @@ static void clearKeychainOnFirstLaunch(void) {
         NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
         SecItemDelete((__bridge CFDictionaryRef)query);
     }
-    [defaults setBool:YES forKey:key];
+}
+
+// Clear all NSUserDefaults keys EXCEPT our own (BaiduBox.cfg.*)
+// SDK may store risk flags in UserDefaults
+static void clearNonOurUserDefaults(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *allKeys = [defaults dictionaryRepresentation];
+    NSString *ourPrefix = @"BaiduBox.cfg.";
+
+    // Save our values first
+    NSMutableDictionary *ourValues = [NSMutableDictionary dictionary];
+    for (NSString *key in allKeys) {
+        if ([key hasPrefix:ourPrefix]) {
+            ourValues[key] = allKeys[key];
+        }
+    }
+
+    // Remove the persistent domain (clears everything for this app)
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+    if (bundleID) {
+        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleID];
+    }
+
+    // Restore our values
+    for (NSString *key in ourValues) {
+        [defaults setObject:ourValues[key] forKey:key];
+    }
     [defaults synchronize];
 }
 
@@ -157,7 +160,39 @@ static void clearSharedCookies(void) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        // --- Initialize spoofed values ---
+        // --- Save our spoofed values BEFORE clearing UserDefaults ---
+        // Read existing values if they exist, generate if not
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSString *ourPrefix = @"BaiduBox.cfg.";
+
+        // Save our existing values
+        NSMutableDictionary *savedValues = [NSMutableDictionary dictionary];
+        NSDictionary *allKeys = [defaults dictionaryRepresentation];
+        for (NSString *key in allKeys) {
+            if ([key hasPrefix:ourPrefix]) {
+                savedValues[key] = allKeys[key];
+            }
+        }
+
+        // --- Clear ALL persistent SDK risk flags ---
+        // Keychain: clear EVERY launch (iOS keychain persists across reinstalls!)
+        clearKeychainEveryLaunch();
+
+        // UserDefaults: clear everything except our keys
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        if (bundleID) {
+            [defaults removePersistentDomainForName:bundleID];
+        }
+        // Restore our values
+        for (NSString *key in savedValues) {
+            [defaults setObject:savedValues[key] forKey:key];
+        }
+        [defaults synchronize];
+
+        // Cookies
+        clearSharedCookies();
+
+        // --- Initialize spoofed values (after clearing) ---
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
@@ -253,17 +288,7 @@ static void initPrivacyHook(void) {
         }
 
         // ============================================================
-        // 5. Keychain clear on first launch
-        // ============================================================
-        clearKeychainOnFirstLaunch();
-
-        // ============================================================
-        // 6. Clear shared cookies
-        // ============================================================
-        clearSharedCookies();
-
-        // ============================================================
-        // 7. App Group container blocked
+        // 5. App Group container blocked
         // ============================================================
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
@@ -278,16 +303,9 @@ static void initPrivacyHook(void) {
         }
 
         // ============================================================
-        // 8. NSBundle — return ORIGINAL Bundle ID via ALL paths
-        //    Payment SDKs read CFBundleIdentifier through:
-        //    a) bundleIdentifier method
-        //    b) infoDictionary[@"CFBundleIdentifier"]
-        //    c) objectForInfoDictionaryKey:@"CFBundleIdentifier"]
-        //    We must hook ALL THREE to ensure consistency.
-        //
-        //    infoDictionary: returns a CACHED mutable copy with ONLY
-        //    CFBundleIdentifier changed. All other keys preserved.
-        //    This avoids icon/config issues that v9 had.
+        // 6. NSBundle bundleIdentifier — return ORIGINAL Bundle ID
+        //    Payment SDKs check bundleIdentifier == "com.baidu.BaiduMobile"
+        //    Only hook the METHOD, not infoDictionary (breaks icons).
         // ============================================================
         {
             static NSString *origBundleID = nil;
@@ -300,7 +318,6 @@ static void initPrivacyHook(void) {
 
             Class bundleClass = objc_getClass("NSBundle");
             if (bundleClass) {
-                // 8a. bundleIdentifier method
                 Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
                 if (m) {
                     static IMP orig_bundleID = NULL;
@@ -312,52 +329,6 @@ static void initPrivacyHook(void) {
                         return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
                     });
                     hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
-                                       imp, method_getTypeEncoding(m));
-                }
-
-                // 8b. objectForInfoDictionaryKey: — intercept CFBundleIdentifier only
-                m = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
-                if (m) {
-                    static IMP orig_infoKey = NULL;
-                    orig_infoKey = method_getImplementation(m);
-                    IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
-                        if (s == [NSBundle mainBundle] && key &&
-                            [key isEqualToString:@"CFBundleIdentifier"]) {
-                            return origBundleID;
-                        }
-                        return ((id(*)(id, SEL, NSString *))orig_infoKey)(
-                            s, @selector(objectForInfoDictionaryKey:), key);
-                    });
-                    hookInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:),
-                                       imp, method_getTypeEncoding(m));
-                }
-
-                // 8c. infoDictionary — return cached copy with CFBundleIdentifier changed
-                //     ONLY this key is modified. All other keys (icons, display name,
-                //     URL schemes, etc.) are preserved exactly.
-                //     The result is cached so the same object is always returned
-                //     (avoids pointer-equality checks failing).
-                m = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
-                if (m) {
-                    static IMP orig_infoDict = NULL;
-                    orig_infoDict = method_getImplementation(m);
-                    static NSDictionary *cachedModifiedDict = nil;
-                    IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) {
-                        if (s != [NSBundle mainBundle]) {
-                            return ((NSDictionary *(*)(id, SEL))orig_infoDict)(
-                                s, @selector(infoDictionary));
-                        }
-                        static dispatch_once_t dictOnce;
-                        dispatch_once(&dictOnce, ^{
-                            NSDictionary *orig = ((NSDictionary *(*)(id, SEL))orig_infoDict)(
-                                s, @selector(infoDictionary));
-                            NSMutableDictionary *mut = [NSMutableDictionary dictionaryWithDictionary:orig];
-                            mut[@"CFBundleIdentifier"] = origBundleID;
-                            cachedModifiedDict = [NSDictionary dictionaryWithDictionary:mut];
-                        });
-                        return cachedModifiedDict;
-                    });
-                    hookInstanceMethod(bundleClass, @selector(infoDictionary),
                                        imp, method_getTypeEncoding(m));
                 }
             }
