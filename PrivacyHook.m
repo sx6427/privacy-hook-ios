@@ -1,59 +1,168 @@
-//
-//  PrivacyHook.m
-//  Device Fingerprint + Login State Isolation Dylib for iOS
-//
-//  v2: Added UIPasteboard, Keychain, Cookie, App Group isolation
-//
-//  Hooks:
-//    [Device Fingerprint]
-//    - ASIdentifierManager advertisingIdentifier (IDFA)
-//    - ASIdentifierManager isAdvertisingTrackingEnabled
-//    - ATTrackingManager trackingAuthorizationStatus (iOS 14+)
-//    - ATTrackingManager requestTrackingAuthorizationWithCompletionHandler:
-//    - UIDevice identifierForVendor (IDFV)
-//
-//    [Login State Isolation - NEW in v2]
-//    - UIPasteboard (blocks clipboard-based cross-app login sharing)
-//    - Keychain clear on first launch (removes original app's credentials)
-//    - NSHTTPCookieStorage (clears shared cookies on every launch)
-//    - NSFileManager containerURLForSecurityApplicationGroupIdentifier: (blocks App Groups)
-//
-//  Build: make
-//  Inject: Use modify_ipa.py to inject into IPA
-//
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <sys/sysctl.h>
+#import <net/if.h>
+#import <net/if_dl.h>
+#import <ifaddrs.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <mach/mach.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#include <string.h>
+
+#define NSLog(...)
+
+// ============================================================
+// Runtime string construction
+// ============================================================
+static NSString *rtStr(const char *s) {
+    return [NSString stringWithUTF8String:s];
+}
+
+static NSString *rtConcat(const char *a, const char *b) {
+    return [NSString stringWithFormat:@"%s%s", a, b];
+}
 
 // ============================================================
 // Persistent spoofed identifiers
 // ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
+static NSString *_spoofedDeviceName = nil;
+static NSString *_spoofedSerialNumber = nil;
+static NSString *_spoofedUDID = nil;
+static NSString *_spoofedMAC = nil;
+static NSString *_spoofedLocalIP = nil;
+
+static volatile BOOL g_initialized = NO;
 
 // ============================================================
-// Generate or load a persistent spoofed UUID from NSUserDefaults
+// NSUserDefaults key prefix — looks like Baidu's own
 // ============================================================
-static NSUUID *getOrCreateSpoofedUUID(NSString *key) {
+static NSString *kPrefix(void) {
+    return rtConcat("BaiduBox.cfg.", "");
+}
+
+static NSString *kKey(const char *suffix) {
+    return [NSString stringWithFormat:@"%@%s", kPrefix(), suffix];
+}
+
+// ============================================================
+// Spoofed value generators
+// ============================================================
+static NSUUID *getOrCreateSpoofedUUID(const char *suffix) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(suffix);
     NSString *uuidString = [defaults stringForKey:key];
-
     if (uuidString) {
         return [[NSUUID alloc] initWithUUIDString:uuidString];
     }
-
     NSUUID *newUUID = [NSUUID UUID];
     [defaults setObject:[newUUID UUIDString] forKey:key];
     [defaults synchronize];
     return newUUID;
 }
 
+static NSString *getOrCreateSpoofedString(const char *suffix, NSUInteger length) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(suffix);
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
+
+    NSMutableString *str = [NSMutableString stringWithCapacity:length];
+    NSString *chars = @"0123456789abcdef";
+    for (NSUInteger i = 0; i < length; i++) {
+        [str appendFormat:@"%C", (unichar)[chars characterAtIndex:arc4random_uniform((uint32_t)chars.length)]];
+    }
+    [defaults setObject:str forKey:key];
+    [defaults synchronize];
+    return str;
+}
+
+static NSString *getOrCreateSpoofedSerial(const char *suffix) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(suffix);
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
+
+    NSString *chars = @"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    NSMutableString *str = [NSMutableString stringWithCapacity:12];
+    for (int i = 0; i < 12; i++) {
+        [str appendFormat:@"%C", (unichar)[chars characterAtIndex:arc4random_uniform((uint32_t)chars.length)]];
+    }
+    [defaults setObject:str forKey:key];
+    [defaults synchronize];
+    return str;
+}
+
+static NSString *getOrCreateSpoofedDeviceName(const char *suffix) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(suffix);
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
+
+    NSArray *prefixes = @[@"张", @"李", @"王", @"刘", @"陈", @"杨", @"赵", @"黄",
+                          @"周", @"吴", @"徐", @"孙", @"马", @"朱", @"胡", @"林",
+                          @"何", @"郭", @"高", @"罗", @"郑", @"梁", @"谢", @"宋",
+                          @"唐", @"许", @"韩", @"冯", @"邓", @"曹", @"彭", @"曾"];
+    NSArray *suffixes = @[@"的 iPhone", @"的 iPhone", @"的 iPhone",
+                          @"的iPhone", @"的 iPhone 14", @"的 iPhone 13",
+                          @"的 iPhone 15", @"的 iPhone 12"];
+    NSString *prefix = prefixes[arc4random_uniform((uint32_t)prefixes.count)];
+    NSString *suffix2 = suffixes[arc4random_uniform((uint32_t)suffixes.count)];
+    NSString *name = [NSString stringWithFormat:@"%@%@", prefix, suffix2];
+
+    [defaults setObject:name forKey:key];
+    [defaults synchronize];
+    return name;
+}
+
+static NSString *getOrCreateSpoofedMAC(const char *suffix) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(suffix);
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
+
+    uint8_t firstByte = 0x02 | (arc4random_uniform(64) << 2);
+    NSMutableString *mac = [NSMutableString string];
+    [mac appendFormat:@"%02x", firstByte];
+    for (int i = 1; i < 6; i++) {
+        [mac appendString:@":"];
+        [mac appendFormat:@"%02x", arc4random_uniform(256)];
+    }
+    [defaults setObject:mac forKey:key];
+    [defaults synchronize];
+    return mac;
+}
+
+static NSString *getOrCreateSpoofedIP(const char *suffix) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(suffix);
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
+
+    uint32_t r = arc4random_uniform(100);
+    uint8_t subnet;
+    if (r < 45) subnet = 1;
+    else if (r < 80) subnet = 0;
+    else if (r < 90) subnet = 31;
+    else subnet = (uint8_t)arc4random_uniform(254) + 1;
+    uint8_t host = (uint8_t)arc4random_uniform(253) + 2;
+
+    NSString *ip = [NSString stringWithFormat:@"192.168.%d.%d", subnet, host];
+    [defaults setObject:ip forKey:key];
+    [defaults synchronize];
+    return ip;
+}
+
 // ============================================================
-// Helper: replace an instance method's implementation
+// Method hooking helpers
 // ============================================================
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
@@ -63,9 +172,6 @@ static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types
     }
 }
 
-// ============================================================
-// Helper: replace a class method's implementation
-// ============================================================
 static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Class metaClass = object_getClass(cls);
     Method method = class_getClassMethod(cls, sel);
@@ -76,18 +182,13 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Clear keychain on first launch only.
-// On subsequent launches, the app can use keychain normally
-// to persist its own login state.
+// Keychain + Cookie clearing
 // ============================================================
 static void clearKeychainOnFirstLaunch(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    if ([defaults boolForKey:@"PrivacyHook.KeychainCleared"]) {
-        NSLog(@"[PrivacyHook] Keychain already cleared on previous launch, skipping");
-        return;
-    }
+    NSString *key = kKey("kc");
+    if ([defaults boolForKey:key]) return;
 
-    // Delete all keychain items of each class
     NSArray *secItemClasses = @[
         (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecClassInternetPassword,
@@ -95,225 +196,307 @@ static void clearKeychainOnFirstLaunch(void) {
         (__bridge id)kSecClassCertificate,
         (__bridge id)kSecClassIdentity
     ];
-
     for (id secItemClass in secItemClasses) {
         NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
-        OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
-        NSLog(@"[PrivacyHook] Cleared keychain class %@ (status: %d)", secItemClass, status);
+        SecItemDelete((__bridge CFDictionaryRef)query);
     }
-
-    [defaults setBool:YES forKey:@"PrivacyHook.KeychainCleared"];
+    [defaults setBool:YES forKey:key];
     [defaults synchronize];
-    NSLog(@"[PrivacyHook] ✓ Keychain cleared on first launch");
 }
 
-// ============================================================
-// Clear all shared cookies on every launch
-// ============================================================
 static void clearSharedCookies(void) {
     NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
     NSArray *cookies = [[storage cookies] copy];
     for (NSHTTPCookie *cookie in cookies) {
         [storage deleteCookie:cookie];
     }
-    NSLog(@"[PrivacyHook] ✓ Cleared %lu shared cookies", (unsigned long)cookies.count);
 }
 
 // ============================================================
-// Constructor — runs automatically when the dylib is loaded
-// (before the app's main() function)
+// Constructor
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        NSLog(@"[PrivacyHook] v2 Initializing: fingerprint + login state isolation...");
+        // --- Initialize spoofed values ---
+        _spoofedIDFA = getOrCreateSpoofedUUID("id1");
+        _spoofedIDFV = getOrCreateSpoofedUUID("id2");
+        _spoofedDeviceName = getOrCreateSpoofedDeviceName("dn");
+        _spoofedSerialNumber = getOrCreateSpoofedSerial("sr");
+        _spoofedUDID = getOrCreateSpoofedString("ud", 40);
+        _spoofedMAC = getOrCreateSpoofedMAC("mc");
+        _spoofedLocalIP = getOrCreateSpoofedIP("ip");
 
-        // Load or create persistent spoofed identifiers
-        _spoofedIDFA = getOrCreateSpoofedUUID(@"PrivacyHook.SpoofedIDFA");
-        _spoofedIDFV = getOrCreateSpoofedUUID(@"PrivacyHook.SpoofedIDFV");
-
-        NSLog(@"[PrivacyHook] Spoofed IDFA: %@", _spoofedIDFA);
-        NSLog(@"[PrivacyHook] Spoofed IDFV: %@", _spoofedIDFV);
+        g_initialized = YES;
 
         // ============================================================
-        // 1. ASIdentifierManager - IDFA
+        // 1. IDFA
         // ============================================================
         Class asmClass = objc_getClass("ASIdentifierManager");
         if (asmClass) {
-            Method idfaMethod = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
-            if (idfaMethod) {
-                IMP idfaImp = imp_implementationWithBlock(^NSUUID *(id _self) {
-                    return _spoofedIDFA;
-                });
-                hookInstanceMethod(asmClass, @selector(advertisingIdentifier),
-                                   idfaImp, method_getTypeEncoding(idfaMethod));
-                NSLog(@"[PrivacyHook] ✓ Hooked IDFA");
+            Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFA; });
+                hookInstanceMethod(asmClass, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
             }
-
-            Method trackingMethod = class_getInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled));
-            if (trackingMethod) {
-                IMP trackingImp = imp_implementationWithBlock(^BOOL(id _self) {
-                    return YES;
-                });
-                hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled),
-                                   trackingImp, method_getTypeEncoding(trackingMethod));
-                NSLog(@"[PrivacyHook] ✓ Hooked isAdvertisingTrackingEnabled");
+            m = class_getInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; });
+                hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled), imp, method_getTypeEncoding(m));
             }
         }
 
         // ============================================================
-        // 2. ATTrackingManager (iOS 14+)
+        // 2. ATTrackingManager
         // ============================================================
         Class attClass = objc_getClass("ATTrackingManager");
         if (attClass) {
-            Method authMethod = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
-            if (authMethod) {
-                IMP authImp = imp_implementationWithBlock(^NSInteger(id _self) {
-                    return 3; // ATTrackingManagerAuthorizationStatusAuthorized
-                });
-                hookClassMethod(attClass, @selector(trackingAuthorizationStatus),
-                                authImp, method_getTypeEncoding(authMethod));
-                NSLog(@"[PrivacyHook] ✓ Hooked ATT trackingAuthorizationStatus");
+            Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSInteger(id s) { return 3; });
+                hookClassMethod(attClass, @selector(trackingAuthorizationStatus), imp, method_getTypeEncoding(m));
             }
-
-            Method reqMethod = class_getClassMethod(attClass,
-                @selector(requestTrackingAuthorizationWithCompletionHandler:));
-            if (reqMethod) {
-                IMP reqImp = imp_implementationWithBlock(^(id _self, void (^handler)(NSInteger)) {
-                    if (handler) {
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            handler(3);
-                        });
-                    }
+            m = class_getClassMethod(attClass, @selector(requestTrackingAuthorizationWithCompletionHandler:));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSInteger)) {
+                    if (h) dispatch_async(dispatch_get_main_queue(), ^{ h(3); });
                 });
-                hookClassMethod(attClass,
-                                @selector(requestTrackingAuthorizationWithCompletionHandler:),
-                                reqImp, method_getTypeEncoding(reqMethod));
-                NSLog(@"[PrivacyHook] ✓ Hooked ATT requestTrackingAuthorization");
+                hookClassMethod(attClass, @selector(requestTrackingAuthorizationWithCompletionHandler:), imp, method_getTypeEncoding(m));
             }
         }
 
         // ============================================================
-        // 3. UIDevice - identifierForVendor (IDFV)
+        // 3. IDFV + device name
         // ============================================================
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
-            Method idfvMethod = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
-            if (idfvMethod) {
-                IMP idfvImp = imp_implementationWithBlock(^NSUUID *(id _self) {
-                    return _spoofedIDFV;
-                });
-                hookInstanceMethod(uiDeviceClass, @selector(identifierForVendor),
-                                   idfvImp, method_getTypeEncoding(idfvMethod));
-                NSLog(@"[PrivacyHook] ✓ Hooked IDFV");
+            Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFV; });
+                hookInstanceMethod(uiDeviceClass, @selector(identifierForVendor), imp, method_getTypeEncoding(m));
+            }
+            m = class_getInstanceMethod(uiDeviceClass, @selector(name));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; });
+                hookInstanceMethod(uiDeviceClass, @selector(name), imp, method_getTypeEncoding(m));
             }
         }
 
         // ============================================================
-        // 4. UIPasteboard — Block clipboard reads
-        //    This is the #1 way Chinese apps share login state.
-        //    Baidu writes a login token to the system pasteboard,
-        //    and the clone reads it for auto-login.
-        //    We return empty for ALL read operations.
+        // 4. UIPasteboard — block ALL reads
         // ============================================================
         Class pbClass = objc_getClass("UIPasteboard");
         if (pbClass) {
-            // string → return @""
-            Method stringMethod = class_getInstanceMethod(pbClass, @selector(string));
-            if (stringMethod) {
-                IMP stringImp = imp_implementationWithBlock(^NSString *(id _self) {
-                    return @"";
-                });
-                hookInstanceMethod(pbClass, @selector(string),
-                                   stringImp, method_getTypeEncoding(stringMethod));
+            Method m = class_getInstanceMethod(pbClass, @selector(string));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; });
+                hookInstanceMethod(pbClass, @selector(string), imp, method_getTypeEncoding(m));
             }
-
-            // strings → return @[]
-            Method stringsMethod = class_getInstanceMethod(pbClass, @selector(strings));
-            if (stringsMethod) {
-                IMP stringsImp = imp_implementationWithBlock(^NSArray *(id _self) {
-                    return @[];
-                });
-                hookInstanceMethod(pbClass, @selector(strings),
-                                   stringsImp, method_getTypeEncoding(stringsMethod));
+            m = class_getInstanceMethod(pbClass, @selector(strings));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSArray *(id s) { return @[]; });
+                hookInstanceMethod(pbClass, @selector(strings), imp, method_getTypeEncoding(m));
             }
-
-            // dataForPasteboardType: → return nil
-            Method dataMethod = class_getInstanceMethod(pbClass, @selector(dataForPasteboardType:));
-            if (dataMethod) {
-                IMP dataImp = imp_implementationWithBlock(^NSData *(id _self, NSString *type) {
-                    return nil;
-                });
-                hookInstanceMethod(pbClass, @selector(dataForPasteboardType:),
-                                   dataImp, method_getTypeEncoding(dataMethod));
+            m = class_getInstanceMethod(pbClass, @selector(dataForPasteboardType:));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSData *(id s, NSString *t) { return nil; });
+                hookInstanceMethod(pbClass, @selector(dataForPasteboardType:), imp, method_getTypeEncoding(m));
             }
-
-            // valueForPasteboardType: → return nil
-            Method valueMethod = class_getInstanceMethod(pbClass, @selector(valueForPasteboardType:));
-            if (valueMethod) {
-                IMP valueImp = imp_implementationWithBlock(^id(id _self, NSString *type) {
-                    return nil;
-                });
-                hookInstanceMethod(pbClass, @selector(valueForPasteboardType:),
-                                   valueImp, method_getTypeEncoding(valueMethod));
+            m = class_getInstanceMethod(pbClass, @selector(valueForPasteboardType:));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^id(id s, NSString *t) { return nil; });
+                hookInstanceMethod(pbClass, @selector(valueForPasteboardType:), imp, method_getTypeEncoding(m));
             }
-
-            // items → return @[]
-            Method itemsMethod = class_getInstanceMethod(pbClass, @selector(items));
-            if (itemsMethod) {
-                IMP itemsImp = imp_implementationWithBlock(^NSArray *(id _self) {
-                    return @[];
-                });
-                hookInstanceMethod(pbClass, @selector(items),
-                                   itemsImp, method_getTypeEncoding(itemsMethod));
+            m = class_getInstanceMethod(pbClass, @selector(items));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSArray *(id s) { return @[]; });
+                hookInstanceMethod(pbClass, @selector(items), imp, method_getTypeEncoding(m));
             }
-
-            // containsPasteboardTypes: → return NO
-            Method containsMethod = class_getInstanceMethod(pbClass, @selector(containsPasteboardTypes:));
-            if (containsMethod) {
-                IMP containsImp = imp_implementationWithBlock(^BOOL(id _self, NSArray *types) {
-                    return NO;
-                });
-                hookInstanceMethod(pbClass, @selector(containsPasteboardTypes:),
-                                   containsImp, method_getTypeEncoding(containsMethod));
+            m = class_getInstanceMethod(pbClass, @selector(containsPasteboardTypes:));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^BOOL(id s, NSArray *t) { return NO; });
+                hookInstanceMethod(pbClass, @selector(containsPasteboardTypes:), imp, method_getTypeEncoding(m));
             }
-
-            NSLog(@"[PrivacyHook] ✓ Hooked UIPasteboard (clipboard isolation)");
         }
 
         // ============================================================
-        // 5. Keychain — Clear on first launch
-        //    Removes any credentials that might be shared via
-        //    TrollStore's shared keychain access group.
-        //    Only runs once; subsequent launches use keychain normally.
+        // 5. Keychain clear on first launch
         // ============================================================
         clearKeychainOnFirstLaunch();
 
         // ============================================================
-        // 6. NSHTTPCookieStorage — Clear shared cookies
+        // 6. Clear shared cookies
         // ============================================================
         clearSharedCookies();
 
         // ============================================================
-        // 7. NSFileManager — Block App Group container access
-        //    Prevents reading shared files via App Groups
+        // 7. App Group container blocked
         // ============================================================
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
-            Method groupMethod = class_getInstanceMethod(fmClass,
+            Method m = class_getInstanceMethod(fmClass,
                 @selector(containerURLForSecurityApplicationGroupIdentifier:));
-            if (groupMethod) {
-                IMP groupImp = imp_implementationWithBlock(^NSURL *(id _self, NSString *groupIdentifier) {
-                    NSLog(@"[PrivacyHook] Blocked App Group access: %@", groupIdentifier);
-                    return nil;
-                });
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *g) { return nil; });
                 hookInstanceMethod(fmClass,
-                                   @selector(containerURLForSecurityApplicationGroupIdentifier:),
-                                   groupImp, method_getTypeEncoding(groupMethod));
-                NSLog(@"[PrivacyHook] ✓ Hooked App Group container access");
+                    @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                    imp, method_getTypeEncoding(m));
             }
         }
 
-        NSLog(@"[PrivacyHook] v2 All hooks installed. Fingerprint + login state isolated.");
+        // ============================================================
+        // 8. NSBundle bundleIdentifier — return original for main bundle
+        //    This is the KEY payment fix: payment SDKs check bundleIdentifier
+        //    to verify it's the genuine app.
+        // ============================================================
+        {
+            static NSString *origBundleID = nil;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                const char parts[] = {99,111,109,46,98,97,105,100,117,46,
+                                      66,97,105,100,117,77,111,98,105,108,101,0};
+                origBundleID = rtStr(parts);
+            });
+
+            Class bundleClass = objc_getClass("NSBundle");
+            if (bundleClass) {
+                Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
+                if (m) {
+                    static IMP orig_bundleID = NULL;
+                    orig_bundleID = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        if (s == [NSBundle mainBundle]) {
+                            return origBundleID;
+                        }
+                        return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
+                    });
+                    hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
+                                       imp, method_getTypeEncoding(m));
+                }
+            }
+        }
+
+        // ============================================================
+        // 9. UIApplication canOpenURL — hide TrollStore URL scheme
+        // ============================================================
+        Class uiAppClass = objc_getClass("UIApplication");
+        if (uiAppClass) {
+            __block NSString *scheme1 = rtConcat("apple-magnifier-", "enable");
+            __block NSString *scheme2 = rtConcat("troll", "store");
+            __block NSString *scheme3 = rtStr("ts");
+
+            Method m = class_getInstanceMethod(uiAppClass, @selector(canOpenURL:));
+            if (m) {
+                static IMP orig_canOpenURL = NULL;
+                orig_canOpenURL = method_getImplementation(m);
+                IMP imp = imp_implementationWithBlock(^BOOL(id s, NSURL *url) {
+                    NSString *scheme = [url scheme];
+                    if (scheme) {
+                        if ([scheme isEqualToString:scheme1] ||
+                            [scheme isEqualToString:scheme2] ||
+                            [scheme hasPrefix:scheme3]) {
+                            return NO;
+                        }
+                    }
+                    return ((BOOL(*)(id, SEL, NSURL *))orig_canOpenURL)(s, @selector(canOpenURL:), url);
+                });
+                hookInstanceMethod(uiAppClass, @selector(canOpenURL:),
+                                   imp, method_getTypeEncoding(m));
+            }
+        }
     }
 }
+
+// ============================================================
+// DYLD Interposing for C functions
+// ============================================================
+typedef struct {
+    const void *replacement;
+    const void *original;
+} interpose_t;
+
+// Interposed sysctlbyname — with nil safety
+static int interposed_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                                    void *newp, size_t newlen) {
+    if (name && g_initialized && oldp && oldlenp) {
+        NSString *nsName = [NSString stringWithUTF8String:name];
+
+        if ([nsName isEqualToString:@"hw.serialnumber"]) {
+            const char *serial = [_spoofedSerialNumber UTF8String];
+            if (serial) {
+                size_t len = strlen(serial) + 1;
+                if (*oldlenp >= len) {
+                    memcpy(oldp, serial, len);
+                    *oldlenp = len - 1;
+                    return 0;
+                }
+            }
+        }
+
+        if ([nsName isEqualToString:@"hw.uuid"]) {
+            const char *uuid = [_spoofedUDID UTF8String];
+            if (uuid) {
+                size_t len = strlen(uuid) + 1;
+                if (*oldlenp >= len) {
+                    memcpy(oldp, uuid, len);
+                    *oldlenp = len - 1;
+                    return 0;
+                }
+            }
+        }
+    }
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// Interposed getifaddrs — with nil safety
+static int interposed_getifaddrs(struct ifaddrs **ifap) {
+    int result = getifaddrs(ifap);
+    if (result == 0 && ifap && *ifap && g_initialized) {
+        struct ifaddrs *ifa = *ifap;
+        while (ifa) {
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_LINK) {
+                struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+                if (sdl->sdl_alen > 0 && _spoofedMAC) {
+                    char *macBytes = (char *)(sdl->sdl_data + sdl->sdl_nlen);
+                    const char *spoofedMAC = [_spoofedMAC UTF8String];
+                    unsigned int mac[6];
+                    if (sscanf(spoofedMAC, "%x:%x:%x:%x:%x:%x",
+                               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                        for (int i = 0; i < 6 && i < sdl->sdl_alen; i++) {
+                            macBytes[i] = (char)mac[i];
+                        }
+                    }
+                }
+            }
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+                if (sin->sin_addr.s_addr != htonl(INADDR_LOOPBACK) && sin->sin_addr.s_addr != 0 && _spoofedLocalIP) {
+                    const char *ipStr = [_spoofedLocalIP UTF8String];
+                    struct in_addr addr;
+                    if (inet_pton(AF_INET, ipStr, &addr) == 1) {
+                        sin->sin_addr = addr;
+                    }
+                }
+            }
+            ifa = ifa->ifa_next;
+        }
+    }
+    return result;
+}
+
+// ============================================================
+// Interpose arrays
+// ============================================================
+__attribute__((used))
+static const interpose_t _interpose_sysctlbyname
+__attribute__((section("__DATA,__interpose"))) = {
+    (const void *)interposed_sysctlbyname,
+    (const void *)sysctlbyname
+};
+
+__attribute__((used))
+static const interpose_t _interpose_getifaddrs
+__attribute__((section("__DATA,__interpose"))) = {
+    (const void *)interposed_getifaddrs,
+    (const void *)getifaddrs
+};

@@ -42,9 +42,10 @@ FAT_CIGAM      = 0xBEBAFECA   # Fat binary (swapped)
 FAT_MAGIC_64   = 0xCAFEBABF   # Fat binary 64-bit
 FAT_CIGAM_64   = 0xBFBAFECA   # Fat binary 64-bit (swapped)
 
-LC_SEGMENT     = 0x01         # 32-bit segment
-LC_SEGMENT_64  = 0x19         # 64-bit segment
-LC_LOAD_DYLIB  = 0x0C         # Load a dynamic library
+LC_SEGMENT         = 0x01     # 32-bit segment
+LC_SEGMENT_64      = 0x19     # 64-bit segment
+LC_LOAD_DYLIB      = 0x0C     # Load a dynamic library
+LC_CODE_SIGNATURE  = 0x1D     # Code signature
 
 
 # ============================================================
@@ -243,9 +244,113 @@ def _find_min_data_offset(data: bytearray, macho_off: int, is_64: bool,
     return min_offset
 
 
+def _remove_code_signature(data: bytearray, macho_off: int, is_64: bool,
+                            header_size: int, ncmds: int, sizeofcmds: int) -> tuple:
+    """
+    Find and remove the LC_CODE_SIGNATURE load command.
+    Also:
+      - Update __LINKEDIT segment filesize to exclude signature data
+      - Truncate the file to remove the dead signature bytes
+      - Zero out the freed load command space
+
+    Returns (new_ncmds, new_sizeofcmds).
+    """
+    pos = macho_off + header_size
+    end = pos + sizeofcmds
+    cs_cmd_off = -1
+    cs_cmd_size = 0
+    cs_data_off = 0
+    cs_data_size = 0
+    linkedit_cmd_off = -1
+    linkedit_fileoff = 0
+    linkedit_filesize = 0
+
+    # Walk load commands to find LC_CODE_SIGNATURE and __LINKEDIT
+    while pos < end:
+        if pos + 8 > len(data):
+            break
+        cmd_id = struct.unpack_from("<I", data, pos)[0]
+        cmdsize = struct.unpack_from("<I", data, pos + 4)[0]
+        if cmdsize == 0:
+            break
+
+        if cmd_id == LC_CODE_SIGNATURE:
+            cs_cmd_off = pos
+            cs_cmd_size = cmdsize
+            cs_data_off = struct.unpack_from("<I", data, pos + 8)[0]
+            cs_data_size = struct.unpack_from("<I", data, pos + 12)[0]
+            print(f"  Found LC_CODE_SIGNATURE: cmdsize={cmdsize}, "
+                  f"data_off={cs_data_off}, data_size={cs_data_size}")
+
+        elif cmd_id == LC_SEGMENT_64:
+            # segment_command_64: segname at +8, fileoff at +40, filesize at +48
+            segname = data[pos + 8 : pos + 24].split(b'\x00')[0].decode('utf-8', errors='replace')
+            if segname == '__LINKEDIT':
+                linkedit_cmd_off = pos
+                linkedit_fileoff = struct.unpack_from('<Q', data, pos + 40)[0]
+                linkedit_filesize = struct.unpack_from('<Q', data, pos + 48)[0]
+                print(f"  Found __LINKEDIT: fileoff={linkedit_fileoff}, filesize={linkedit_filesize}")
+
+        elif cmd_id == LC_SEGMENT:
+            # segment_command: segname at +8, fileoff at +28, filesize at +32
+            segname = data[pos + 8 : pos + 24].split(b'\x00')[0].decode('utf-8', errors='replace')
+            if segname == '__LINKEDIT':
+                linkedit_cmd_off = pos
+                linkedit_fileoff = struct.unpack_from('<I', data, pos + 28)[0]
+                linkedit_filesize = struct.unpack_from('<I', data, pos + 32)[0]
+                print(f"  Found __LINKEDIT: fileoff={linkedit_fileoff}, filesize={linkedit_filesize}")
+
+        pos += cmdsize
+
+    if cs_cmd_off < 0:
+        # No code signature found
+        return ncmds, sizeofcmds
+
+    # --- Update __LINKEDIT filesize to exclude signature data ---
+    # The code signature sits at the very end of __LINKEDIT.
+    # New filesize = old_filesize - cs_data_size
+    if linkedit_cmd_off >= 0 and cs_data_off >= linkedit_fileoff:
+        new_linkedit_filesize = cs_data_off - linkedit_fileoff
+        if is_64:
+            struct.pack_into('<Q', data, linkedit_cmd_off + 48, new_linkedit_filesize)
+        else:
+            struct.pack_into('<I', data, linkedit_cmd_off + 32, new_linkedit_filesize)
+        print(f"  Updated __LINKEDIT filesize: {linkedit_filesize} -> {new_linkedit_filesize}")
+
+    # --- Remove the LC_CODE_SIGNATURE load command ---
+    # Shift subsequent commands back
+    shift_src = cs_cmd_off + cs_cmd_size
+    shift_dst = cs_cmd_off
+    shift_len = (macho_off + header_size + sizeofcmds) - shift_src
+
+    if shift_len > 0:
+        data[shift_dst : shift_dst + shift_len] = data[shift_src : shift_src + shift_len]
+
+    # Zero out the freed space at the end of load commands
+    freed_start = macho_off + header_size + sizeofcmds - cs_cmd_size
+    for i in range(freed_start, freed_start + cs_cmd_size):
+        data[i] = 0
+
+    # --- Truncate the file to remove dead signature data ---
+    # Only for single-arch (macho_off == 0); truncating a fat binary's
+    # slice in the middle of the file would corrupt other slices.
+    if macho_off == 0 and cs_data_off > 0 and cs_data_off < len(data):
+        original_len = len(data)
+        del data[cs_data_off:]
+        print(f"  Truncated file: {original_len} -> {len(data)} bytes "
+              f"(removed {original_len - len(data)} bytes)")
+
+    new_ncmds = ncmds - 1
+    new_sizeofcmds = sizeofcmds - cs_cmd_size
+
+    print(f"  Removed LC_CODE_SIGNATURE ({cs_cmd_size}B freed)")
+    return new_ncmds, new_sizeofcmds
+
+
 def _inject_into_slice(data: bytearray, macho_off: int, dylib_name: str) -> bool:
     """
     Inject LC_LOAD_DYLIB into a single Mach-O slice within `data`.
+    First removes any existing LC_CODE_SIGNATURE to ensure ldid can re-sign cleanly.
     `macho_off` is the absolute offset of this slice in the file.
     Returns True on success.
     """
@@ -268,9 +373,18 @@ def _inject_into_slice(data: bytearray, macho_off: int, dylib_name: str) -> bool
     ncmds = struct.unpack_from("<I", data, macho_off + 16)[0]
     sizeofcmds = struct.unpack_from("<I", data, macho_off + 20)[0]
 
+    # --- Step 1: Remove existing code signature ---
+    ncmds, sizeofcmds = _remove_code_signature(
+        data, macho_off, is_64, header_size, ncmds, sizeofcmds
+    )
+
+    # Update header with new ncmds/sizeofcmds after removing code sig
+    struct.pack_into("<I", data, macho_off + 16, ncmds)
+    struct.pack_into("<I", data, macho_off + 20, sizeofcmds)
+
     end_of_cmds = macho_off + header_size + sizeofcmds
 
-    # Build the load command
+    # --- Step 2: Add LC_LOAD_DYLIB ---
     cmd_bytes = _build_load_dylib_command(dylib_name)
     cmdsize = len(cmd_bytes)
 
@@ -289,7 +403,7 @@ def _inject_into_slice(data: bytearray, macho_off: int, dylib_name: str) -> bool
     struct.pack_into("<I", data, macho_off + 16, ncmds + 1)
     struct.pack_into("<I", data, macho_off + 20, sizeofcmds + cmdsize)
 
-    print(f"  [offset {macho_off}] Injected LC_LOAD_DYLIB ({cmdsize}B) → "
+    print(f"  [offset {macho_off}] Injected LC_LOAD_DYLIB ({cmdsize}B) -> "
           f"@executable_path/{dylib_name}")
     return True
 
@@ -369,6 +483,10 @@ Examples:
         help='New display name (default: original + " 2")',
     )
     parser.add_argument(
+        "--dylib-name", default=None,
+        help="Rename the dylib inside the .app bundle (anti-detection)",
+    )
+    parser.add_argument(
         "--output", default=None,
         help="Output IPA path (default: <input>_modified.ipa)",
     )
@@ -388,7 +506,7 @@ Examples:
         base, ext = os.path.splitext(args.ipa)
         args.output = f"{base}_modified{ext}"
 
-    dylib_name = os.path.basename(args.dylib)
+    dylib_name = args.dylib_name or os.path.basename(args.dylib)
 
     print("=" * 60)
     print("  IPA Modifier - Bundle ID + Dylib Injection")
@@ -396,6 +514,8 @@ Examples:
     print("=" * 60)
     print(f"  Input IPA : {args.ipa}")
     print(f"  Dylib     : {args.dylib}")
+    if args.dylib_name:
+        print(f"  Renamed   : {args.dylib_name} (anti-detection)")
     print(f"  Output    : {args.output}")
     print()
 
@@ -436,10 +556,10 @@ Examples:
         # --- Step 4: Inject dylib ---
         print("[4/5] Injecting dylib...")
 
-        # Copy dylib into .app bundle
+        # Copy dylib into .app bundle (optionally renamed)
         dest_dylib = os.path.join(app_path, dylib_name)
         shutil.copy2(args.dylib, dest_dylib)
-        print(f"  Copied {dylib_name} -> {app_name}/{dylib_name}")
+        print(f"  Copied {os.path.basename(args.dylib)} -> {app_name}/{dylib_name}")
 
         # Find main executable
         # Re-read Info.plist (we modified it)
