@@ -572,7 +572,6 @@ static void initPrivacyHook(void) {
 
             Class bundleClass = objc_getClass("NSBundle");
             if (bundleClass) {
-                // 8a. bundleIdentifier method
                 Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
                 if (m) {
                     static IMP orig_bundleID = NULL;
@@ -584,24 +583,6 @@ static void initPrivacyHook(void) {
                         return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
                     });
                     hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
-                                       imp, method_getTypeEncoding(m));
-                }
-
-                // 8b. objectForInfoDictionaryKey: — intercept CFBundleIdentifier only
-                //     Safe: only affects CFBundleIdentifier queries, not icon/config reading
-                m = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
-                if (m) {
-                    static IMP orig_infoKey = NULL;
-                    orig_infoKey = method_getImplementation(m);
-                    IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
-                        if (s == [NSBundle mainBundle] && key &&
-                            [key isEqualToString:@"CFBundleIdentifier"]) {
-                            return origBundleID;
-                        }
-                        return ((id(*)(id, SEL, NSString *))orig_infoKey)(
-                            s, @selector(objectForInfoDictionaryKey:), key);
-                    });
-                    hookInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:),
                                        imp, method_getTypeEncoding(m));
                 }
             }
