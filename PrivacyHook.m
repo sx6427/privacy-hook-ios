@@ -329,81 +329,14 @@ static void initPrivacyHook(void) {
         // ============================================================
         clearSharedCookies();
 
-        // ============================================================
-        // 7. App Group container blocked
-        // ============================================================
-        Class fmClass = objc_getClass("NSFileManager");
-        if (fmClass) {
-            Method m = class_getInstanceMethod(fmClass,
-                @selector(containerURLForSecurityApplicationGroupIdentifier:));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *g) { return nil; });
-                hookInstanceMethod(fmClass,
-                    @selector(containerURLForSecurityApplicationGroupIdentifier:),
-                    imp, method_getTypeEncoding(m));
-            }
-        }
-
-        // ============================================================
-        // 8. NSBundle bundleIdentifier — return original for main bundle
-        //    This is the KEY payment fix: payment SDKs check bundleIdentifier
-        //    to verify it's the genuine app.
-        // ============================================================
-        {
-            static NSString *origBundleID = nil;
-            static dispatch_once_t onceToken;
-            dispatch_once(&onceToken, ^{
-                const char parts[] = {99,111,109,46,98,97,105,100,117,46,
-                                      66,97,105,100,117,77,111,98,105,108,101,0};
-                origBundleID = rtStr(parts);
-            });
-
-            Class bundleClass = objc_getClass("NSBundle");
-            if (bundleClass) {
-                Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
-                if (m) {
-                    static IMP orig_bundleID = NULL;
-                    orig_bundleID = method_getImplementation(m);
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        if (s == [NSBundle mainBundle]) {
-                            return origBundleID;
-                        }
-                        return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
-                    });
-                    hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
-                                       imp, method_getTypeEncoding(m));
-                }
-            }
-        }
-
-        // ============================================================
-        // 9. UIApplication canOpenURL — hide TrollStore URL scheme
-        // ============================================================
-        Class uiAppClass = objc_getClass("UIApplication");
-        if (uiAppClass) {
-            __block NSString *scheme1 = rtConcat("apple-magnifier-", "enable");
-            __block NSString *scheme2 = rtConcat("troll", "store");
-            __block NSString *scheme3 = rtStr("ts");
-
-            Method m = class_getInstanceMethod(uiAppClass, @selector(canOpenURL:));
-            if (m) {
-                static IMP orig_canOpenURL = NULL;
-                orig_canOpenURL = method_getImplementation(m);
-                IMP imp = imp_implementationWithBlock(^BOOL(id s, NSURL *url) {
-                    NSString *scheme = [url scheme];
-                    if (scheme) {
-                        if ([scheme isEqualToString:scheme1] ||
-                            [scheme isEqualToString:scheme2] ||
-                            [scheme hasPrefix:scheme3]) {
-                            return NO;
-                        }
-                    }
-                    return ((BOOL(*)(id, SEL, NSURL *))orig_canOpenURL)(s, @selector(canOpenURL:), url);
-                });
-                hookInstanceMethod(uiAppClass, @selector(canOpenURL:),
-                                   imp, method_getTypeEncoding(m));
-            }
-        }
+        // NOTE: bundleIdentifier, canOpenURL, and app group hooks REMOVED.
+        // The bundleIdentifier hook created a mismatch between the runtime
+        // bundleIdentifier (returning original com.baidu.BaiduMobile) and
+        // infoDictionary[@"CFBundleIdentifier"] (returning the real modified
+        // Bundle ID). Payment SDKs compare these two values and detect the
+        // mismatch as "non-genuine app". Without the hook, both values are
+        // consistent (com.baidu.BaiduMobile.BaiduBoxAppA1), which the payment
+        // SDK accepts.
     }
 }
 
