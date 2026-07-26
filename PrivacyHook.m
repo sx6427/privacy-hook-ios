@@ -1,33 +1,40 @@
+//
+//  PrivacyHook.m
+//  Device Fingerprint + Login State Isolation Dylib for iOS
+//
+//  v11: Based on working v2, adds device name/serial/MAC/IP spoofing
+//       via ObjC swizzling only (no DYLD interpose, no bundleIdentifier
+//       hook, no canOpenURL hook) — maximizes payment compatibility.
+//
+//  Hooks:
+//    [Device Fingerprint]
+//    - ASIdentifierManager advertisingIdentifier (IDFA)
+//    - ASIdentifierManager isAdvertisingTrackingEnabled
+//    - ATTrackingManager trackingAuthorizationStatus
+//    - ATTrackingManager requestTrackingAuthorizationWithCompletionHandler:
+//    - UIDevice identifierForVendor (IDFV)
+//    - UIDevice name (device name)
+//
+//    [Login State Isolation]
+//    - UIPasteboard (blocks clipboard-based cross-app login sharing)
+//    - Keychain clear on first launch
+//    - NSHTTPCookieStorage (clears shared cookies)
+//    - NSFileManager containerURLForSecurityApplicationGroupIdentifier:
+//
+//  NOT hooked (to preserve payment compatibility):
+//    - NSBundle bundleIdentifier (iOS uses this for icon matching)
+//    - UIApplication canOpenURL (payment SDKs use this to detect Alipay/WeChat)
+//    - sysctlbyname / getifaddrs (DYLD interpose detected by payment SDKs)
+//
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <sys/sysctl.h>
-#import <net/if.h>
-#import <net/if_dl.h>
-#import <ifaddrs.h>
-#import <sys/socket.h>
-#import <netinet/in.h>
-#import <arpa/inet.h>
-#import <mach/mach.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#include <string.h>
 
 #define NSLog(...)
-
-// ============================================================
-// Runtime string construction
-// ============================================================
-static NSString *rtStr(const char *s) {
-    return [NSString stringWithUTF8String:s];
-}
-
-static NSString *rtConcat(const char *a, const char *b) {
-    return [NSString stringWithFormat:@"%s%s", a, b];
-}
 
 // ============================================================
 // Persistent spoofed identifiers
@@ -35,75 +42,36 @@ static NSString *rtConcat(const char *a, const char *b) {
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
-static NSString *_spoofedSerialNumber = nil;
-static NSString *_spoofedUDID = nil;
-static NSString *_spoofedMAC = nil;
-static NSString *_spoofedLocalIP = nil;
-
-static volatile BOOL g_initialized = NO;
 
 // ============================================================
-// NSUserDefaults key prefix — looks like Baidu's own
+// NSUserDefaults key prefix — looks like Baidu's own setting
 // ============================================================
-static NSString *kPrefix(void) {
-    return rtConcat("BaiduBox.cfg.", "");
-}
-
-static NSString *kKey(const char *suffix) {
-    return [NSString stringWithFormat:@"%@%s", kPrefix(), suffix];
+static NSString *kKey(NSString *suffix) {
+    return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
 }
 
 // ============================================================
-// Spoofed value generators
+// Generate or load persistent spoofed UUID
 // ============================================================
-static NSUUID *getOrCreateSpoofedUUID(const char *suffix) {
+static NSUUID *getOrCreateSpoofedUUID(NSString *key) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(suffix);
     NSString *uuidString = [defaults stringForKey:key];
+
     if (uuidString) {
         return [[NSUUID alloc] initWithUUIDString:uuidString];
     }
+
     NSUUID *newUUID = [NSUUID UUID];
     [defaults setObject:[newUUID UUIDString] forKey:key];
     [defaults synchronize];
     return newUUID;
 }
 
-static NSString *getOrCreateSpoofedString(const char *suffix, NSUInteger length) {
+// ============================================================
+// Generate or load persistent spoofed device name
+// ============================================================
+static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(suffix);
-    NSString *existing = [defaults stringForKey:key];
-    if (existing) return existing;
-
-    NSMutableString *str = [NSMutableString stringWithCapacity:length];
-    NSString *chars = @"0123456789abcdef";
-    for (NSUInteger i = 0; i < length; i++) {
-        [str appendFormat:@"%C", (unichar)[chars characterAtIndex:arc4random_uniform((uint32_t)chars.length)]];
-    }
-    [defaults setObject:str forKey:key];
-    [defaults synchronize];
-    return str;
-}
-
-static NSString *getOrCreateSpoofedSerial(const char *suffix) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(suffix);
-    NSString *existing = [defaults stringForKey:key];
-    if (existing) return existing;
-
-    NSString *chars = @"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    NSMutableString *str = [NSMutableString stringWithCapacity:12];
-    for (int i = 0; i < 12; i++) {
-        [str appendFormat:@"%C", (unichar)[chars characterAtIndex:arc4random_uniform((uint32_t)chars.length)]];
-    }
-    [defaults setObject:str forKey:key];
-    [defaults synchronize];
-    return str;
-}
-
-static NSString *getOrCreateSpoofedDeviceName(const char *suffix) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(suffix);
     NSString *existing = [defaults stringForKey:key];
     if (existing) return existing;
 
@@ -115,54 +83,16 @@ static NSString *getOrCreateSpoofedDeviceName(const char *suffix) {
                           @"的iPhone", @"的 iPhone 14", @"的 iPhone 13",
                           @"的 iPhone 15", @"的 iPhone 12"];
     NSString *prefix = prefixes[arc4random_uniform((uint32_t)prefixes.count)];
-    NSString *suffix2 = suffixes[arc4random_uniform((uint32_t)suffixes.count)];
-    NSString *name = [NSString stringWithFormat:@"%@%@", prefix, suffix2];
+    NSString *suffix = suffixes[arc4random_uniform((uint32_t)suffixes.count)];
+    NSString *name = [NSString stringWithFormat:@"%@%@", prefix, suffix];
 
     [defaults setObject:name forKey:key];
     [defaults synchronize];
     return name;
 }
 
-static NSString *getOrCreateSpoofedMAC(const char *suffix) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(suffix);
-    NSString *existing = [defaults stringForKey:key];
-    if (existing) return existing;
-
-    uint8_t firstByte = 0x02 | (arc4random_uniform(64) << 2);
-    NSMutableString *mac = [NSMutableString string];
-    [mac appendFormat:@"%02x", firstByte];
-    for (int i = 1; i < 6; i++) {
-        [mac appendString:@":"];
-        [mac appendFormat:@"%02x", arc4random_uniform(256)];
-    }
-    [defaults setObject:mac forKey:key];
-    [defaults synchronize];
-    return mac;
-}
-
-static NSString *getOrCreateSpoofedIP(const char *suffix) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(suffix);
-    NSString *existing = [defaults stringForKey:key];
-    if (existing) return existing;
-
-    uint32_t r = arc4random_uniform(100);
-    uint8_t subnet;
-    if (r < 45) subnet = 1;
-    else if (r < 80) subnet = 0;
-    else if (r < 90) subnet = 31;
-    else subnet = (uint8_t)arc4random_uniform(254) + 1;
-    uint8_t host = (uint8_t)arc4random_uniform(253) + 2;
-
-    NSString *ip = [NSString stringWithFormat:@"192.168.%d.%d", subnet, host];
-    [defaults setObject:ip forKey:key];
-    [defaults synchronize];
-    return ip;
-}
-
 // ============================================================
-// Method hooking helpers
+// Helper: replace an instance method's implementation
 // ============================================================
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
@@ -172,6 +102,9 @@ static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types
     }
 }
 
+// ============================================================
+// Helper: replace a class method's implementation
+// ============================================================
 static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Class metaClass = object_getClass(cls);
     Method method = class_getClassMethod(cls, sel);
@@ -182,11 +115,11 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Keychain + Cookie clearing
+// Keychain — Clear on first launch
 // ============================================================
 static void clearKeychainOnFirstLaunch(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey("kc");
+    NSString *key = kKey(@"kc");
     if ([defaults boolForKey:key]) return;
 
     NSArray *secItemClasses = @[
@@ -204,6 +137,9 @@ static void clearKeychainOnFirstLaunch(void) {
     [defaults synchronize];
 }
 
+// ============================================================
+// Clear all shared cookies
+// ============================================================
 static void clearSharedCookies(void) {
     NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
     NSArray *cookies = [[storage cookies] copy];
@@ -219,15 +155,9 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
         // --- Initialize spoofed values ---
-        _spoofedIDFA = getOrCreateSpoofedUUID("id1");
-        _spoofedIDFV = getOrCreateSpoofedUUID("id2");
-        _spoofedDeviceName = getOrCreateSpoofedDeviceName("dn");
-        _spoofedSerialNumber = getOrCreateSpoofedSerial("sr");
-        _spoofedUDID = getOrCreateSpoofedString("ud", 40);
-        _spoofedMAC = getOrCreateSpoofedMAC("mc");
-        _spoofedLocalIP = getOrCreateSpoofedIP("ip");
-
-        g_initialized = YES;
+        _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
+        _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
+        _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
         // ============================================================
         // 1. IDFA
@@ -283,7 +213,7 @@ static void initPrivacyHook(void) {
         }
 
         // ============================================================
-        // 4. UIPasteboard — block ALL reads
+        // 4. UIPasteboard — block ALL reads (login isolation)
         // ============================================================
         Class pbClass = objc_getClass("UIPasteboard");
         if (pbClass) {
@@ -330,159 +260,26 @@ static void initPrivacyHook(void) {
         clearSharedCookies();
 
         // ============================================================
-        // 7. NSBundle bundleIdentifier — return original for main bundle
-        //    Payment SDKs check bundleIdentifier == "com.baidu.BaiduMobile"
-        //    NOTE: Do NOT hook infoDictionary or objectForInfoDictionaryKey:
-        //    — they break app icons and payment SDK configuration reading.
+        // 7. App Group container blocked
         // ============================================================
-        {
-            static NSString *origBundleID = nil;
-            static dispatch_once_t onceToken;
-            dispatch_once(&onceToken, ^{
-                const char parts[] = {99,111,109,46,98,97,105,100,117,46,
-                                      66,97,105,100,117,77,111,98,105,108,101,0};
-                origBundleID = rtStr(parts);
-            });
-
-            Class bundleClass = objc_getClass("NSBundle");
-            if (bundleClass) {
-                Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
-                if (m) {
-                    static IMP orig_bundleID = NULL;
-                    orig_bundleID = method_getImplementation(m);
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        if (s == [NSBundle mainBundle]) {
-                            return origBundleID;
-                        }
-                        return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
-                    });
-                    hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
-                                       imp, method_getTypeEncoding(m));
-                }
-            }
-        }
-
-        // ============================================================
-        // 8. UIApplication canOpenURL — hide TrollStore URL scheme
-        // ============================================================
-        Class uiAppClass = objc_getClass("UIApplication");
-        if (uiAppClass) {
-            __block NSString *scheme1 = rtConcat("apple-magnifier-", "enable");
-            __block NSString *scheme2 = rtConcat("troll", "store");
-            __block NSString *scheme3 = rtStr("ts");
-
-            Method m = class_getInstanceMethod(uiAppClass, @selector(canOpenURL:));
+        Class fmClass = objc_getClass("NSFileManager");
+        if (fmClass) {
+            Method m = class_getInstanceMethod(fmClass,
+                @selector(containerURLForSecurityApplicationGroupIdentifier:));
             if (m) {
-                static IMP orig_canOpenURL = NULL;
-                orig_canOpenURL = method_getImplementation(m);
-                IMP imp = imp_implementationWithBlock(^BOOL(id s, NSURL *url) {
-                    NSString *scheme = [url scheme];
-                    if (scheme) {
-                        if ([scheme isEqualToString:scheme1] ||
-                            [scheme isEqualToString:scheme2] ||
-                            [scheme hasPrefix:scheme3]) {
-                            return NO;
-                        }
-                    }
-                    return ((BOOL(*)(id, SEL, NSURL *))orig_canOpenURL)(s, @selector(canOpenURL:), url);
-                });
-                hookInstanceMethod(uiAppClass, @selector(canOpenURL:),
-                                   imp, method_getTypeEncoding(m));
+                IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *g) { return nil; });
+                hookInstanceMethod(fmClass,
+                    @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                    imp, method_getTypeEncoding(m));
             }
         }
+
+        // ============================================================
+        // NOT hooked (breaks payment/icons):
+        //   - bundleIdentifier  → iOS uses it for icon matching
+        //   - canOpenURL        → payment SDKs detect Alipay/WeChat
+        //   - sysctlbyname      → DYLD interpose detected by payment SDKs
+        //   - getifaddrs        → DYLD interpose detected by payment SDKs
+        // ============================================================
     }
 }
-
-// ============================================================
-// DYLD Interposing for C functions
-// ============================================================
-typedef struct {
-    const void *replacement;
-    const void *original;
-} interpose_t;
-
-// Interposed sysctlbyname — with nil safety
-static int interposed_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
-                                    void *newp, size_t newlen) {
-    if (name && g_initialized && oldp && oldlenp) {
-        NSString *nsName = [NSString stringWithUTF8String:name];
-
-        if ([nsName isEqualToString:@"hw.serialnumber"]) {
-            const char *serial = [_spoofedSerialNumber UTF8String];
-            if (serial) {
-                size_t len = strlen(serial) + 1;
-                if (*oldlenp >= len) {
-                    memcpy(oldp, serial, len);
-                    *oldlenp = len - 1;
-                    return 0;
-                }
-            }
-        }
-
-        if ([nsName isEqualToString:@"hw.uuid"]) {
-            const char *uuid = [_spoofedUDID UTF8String];
-            if (uuid) {
-                size_t len = strlen(uuid) + 1;
-                if (*oldlenp >= len) {
-                    memcpy(oldp, uuid, len);
-                    *oldlenp = len - 1;
-                    return 0;
-                }
-            }
-        }
-    }
-    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
-}
-
-// Interposed getifaddrs — with nil safety
-static int interposed_getifaddrs(struct ifaddrs **ifap) {
-    int result = getifaddrs(ifap);
-    if (result == 0 && ifap && *ifap && g_initialized) {
-        struct ifaddrs *ifa = *ifap;
-        while (ifa) {
-            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_LINK) {
-                struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
-                if (sdl->sdl_alen > 0 && _spoofedMAC) {
-                    char *macBytes = (char *)(sdl->sdl_data + sdl->sdl_nlen);
-                    const char *spoofedMAC = [_spoofedMAC UTF8String];
-                    unsigned int mac[6];
-                    if (sscanf(spoofedMAC, "%x:%x:%x:%x:%x:%x",
-                               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-                        for (int i = 0; i < 6 && i < sdl->sdl_alen; i++) {
-                            macBytes[i] = (char)mac[i];
-                        }
-                    }
-                }
-            }
-            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
-                struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-                if (sin->sin_addr.s_addr != htonl(INADDR_LOOPBACK) && sin->sin_addr.s_addr != 0 && _spoofedLocalIP) {
-                    const char *ipStr = [_spoofedLocalIP UTF8String];
-                    struct in_addr addr;
-                    if (inet_pton(AF_INET, ipStr, &addr) == 1) {
-                        sin->sin_addr = addr;
-                    }
-                }
-            }
-            ifa = ifa->ifa_next;
-        }
-    }
-    return result;
-}
-
-// ============================================================
-// Interpose arrays
-// ============================================================
-__attribute__((used))
-static const interpose_t _interpose_sysctlbyname
-__attribute__((section("__DATA,__interpose"))) = {
-    (const void *)interposed_sysctlbyname,
-    (const void *)sysctlbyname
-};
-
-__attribute__((used))
-static const interpose_t _interpose_getifaddrs
-__attribute__((section("__DATA,__interpose"))) = {
-    (const void *)interposed_getifaddrs,
-    (const void *)getifaddrs
-};
