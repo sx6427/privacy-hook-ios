@@ -551,7 +551,45 @@ static void initPrivacyHook(void) {
         }
 
         // ============================================================
-        // 8. fishhook — rebind sysctlbyname + getifaddrs
+        // 8. NSBundle bundleIdentifier — return ORIGINAL Bundle ID
+        //    Payment SDKs (Alipay/WeChat) check bundleIdentifier ==
+        //    "com.baidu.BaiduMobile". Our IPA has a different Bundle ID
+        //    for multi-instance, so we must hook this method.
+        //
+        //    NOTE: iOS matches icons via Info.plist at install time,
+        //    NOT via runtime bundleIdentifier calls. So this hook
+        //    does NOT affect icon display.
+        //    DO NOT hook infoDictionary — that breaks icon/config reading.
+        // ============================================================
+        {
+            static NSString *origBundleID = nil;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                const char parts[] = {99,111,109,46,98,97,105,100,117,46,
+                                      66,97,105,100,117,77,111,98,105,108,101,0};
+                origBundleID = [NSString stringWithUTF8String:parts];
+            });
+
+            Class bundleClass = objc_getClass("NSBundle");
+            if (bundleClass) {
+                Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
+                if (m) {
+                    static IMP orig_bundleID = NULL;
+                    orig_bundleID = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        if (s == [NSBundle mainBundle]) {
+                            return origBundleID;
+                        }
+                        return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
+                    });
+                    hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
+                                       imp, method_getTypeEncoding(m));
+                }
+            }
+        }
+
+        // ============================================================
+        // 9. fishhook — rebind sysctlbyname + getifaddrs
         //    No __DATA,__interpose section — invisible to payment SDKs
         // ============================================================
         struct rebinding rebindings[] = {
