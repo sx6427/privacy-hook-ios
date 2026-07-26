@@ -79,11 +79,11 @@ static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindin
         const uint8_t *ptr = (const uint8_t *)header;
         uint32_t ncmds;
         if (is64) {
-            ncmds = ((mach_header_64 *)header)->ncmds;
-            ptr += sizeof(mach_header_64);
+            ncmds = ((struct mach_header_64 *)header)->ncmds;
+            ptr += sizeof(struct mach_header_64);
         } else {
-            ncmds = ((mach_header *)header)->ncmds;
-            ptr += sizeof(mach_header);
+            ncmds = ((struct mach_header *)header)->ncmds;
+            ptr += sizeof(struct mach_header);
         }
 
         // Find __LINKEDIT, symtab, dysymtab, and __la_symbol_ptr sections
@@ -146,7 +146,7 @@ static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindin
             if (symtab_index == 0 || symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL) continue;
 
             struct nlist_64 *sym = &symbols[symtab_index];
-            const char *sym_name = strtab + sym->n_strx;
+            const char *sym_name = strtab + sym->n_un.n_strx;
             if (!sym_name || sym_name[0] == '\0') continue;
 
             // Check if this symbol matches any of our rebindings
