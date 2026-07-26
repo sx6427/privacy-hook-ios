@@ -55,143 +55,14 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 
 struct rebinding {
     const char *name;
     void *replacement;
     void **replaced;
 };
-
-typedef struct {
-    uint32_t cmd;
-    uint32_t cmdsize;
-} load_command;
-
-typedef struct {
-    uint32_t magic;
-    uint32_t nfat_arch;
-} fat_header;
-
-typedef struct {
-    uint32_t cputype;
-    uint32_t cpusubtype;
-    uint32_t offset;
-    uint32_t size;
-    uint32_t align;
-} fat_arch;
-
-typedef struct {
-    uint32_t magic;
-    cpu_type_t cputype;
-    cpu_subtype_t cpusubtype;
-    uint32_t filetype;
-    uint32_t ncmds;
-    uint32_t sizeofcmds;
-    uint32_t flags;
-} mach_header;
-
-typedef struct {
-    uint32_t magic;
-    cpu_type_t cputype;
-    cpu_subtype_t cpusubtype;
-    uint32_t filetype;
-    uint32_t ncmds;
-    uint32_t sizeofcmds;
-    uint32_t flags;
-    uint32_t reserved;
-} mach_header_64;
-
-typedef struct {
-    char     segname[16];
-    uint32_t   nsects;
-} segment_command_generic;
-
-// nlist structures for symbol table parsing
-struct nlist {
-    uint32_t n_strx;
-    uint8_t  n_type;
-    uint8_t  n_sect;
-    int16_t  n_desc;
-    uint32_t n_value;
-};
-
-struct nlist_64 {
-    uint32_t  n_strx;
-    uint8_t   n_type;
-    uint8_t   n_sect;
-    int16_t   n_desc;
-    uint64_t  n_value;
-};
-
-// section_64 for finding __la_symbol_ptr
-struct section_64 {
-    char      sectname[16];
-    char      segname[16];
-    uint64_t  addr;
-    uint64_t  size;
-    uint32_t  offset;
-    uint32_t  align;
-    uint32_t  reloff;
-    uint32_t  nreloc;
-    uint32_t  flags;
-    uint32_t  reserved1;
-    uint32_t  reserved2;
-    uint32_t  reserved3;
-};
-
-// segment_command_64
-struct segment_command_64_m {
-    uint32_t  cmd;
-    uint32_t  cmdsize;
-    char      segname[16];
-    uint64_t  vmaddr;
-    uint64_t  vmsize;
-    uint64_t  fileoff;
-    uint64_t  filesize;
-    int32_t   maxprot;
-    int32_t   initprot;
-    uint32_t  nsects;
-    uint32_t  flags;
-};
-
-// symtab_command
-struct symtab_command_m {
-    uint32_t cmd;
-    uint32_t cmdsize;
-    uint32_t symoff;
-    uint32_t nsyms;
-    uint32_t stroff;
-    uint32_t strsize;
-};
-
-// dysymtab_command
-struct dysymtab_command_m {
-    uint32_t cmd;
-    uint32_t cmdsize;
-    uint32_t ilocalsym;
-    uint32_t nlocalsym;
-    uint32_t iextdefsym;
-    uint32_t nextdefsym;
-    uint32_t iundefsym;
-    uint32_t nundefsym;
-    uint32_t tocoff;
-    uint32_t ntoc;
-    uint32_t modtaboff;
-    uint32_t nmodtab;
-    uint32_t extrefsymoff;
-    uint32_t nextrefsyms;
-    uint32_t indirectsymoff;
-    uint32_t nindirectsyms;
-    uint32_t extreloff;
-    uint32_t nextrel;
-    uint32_t locreloff;
-    uint32_t nlocrel;
-};
-
-#define SEG_DATA        "__DATA"
-#define SEG_DATA_CONST  "__DATA_DIRTY"
-#define SECT_LA_SYMBOL_PTR  "__la_symbol_ptr"
-#define SECT_NL_SYMBOL_PTR  "__nl_symbol_ptr"
 
 static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindings_nel) {
     // Iterate all loaded images
@@ -217,22 +88,21 @@ static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindin
 
         // Find __LINKEDIT, symtab, dysymtab, and __la_symbol_ptr sections
         uint64_t linkedit_fileoff = 0, linkedit_vmaddr = 0;
-        struct symtab_command_m symtab = {0};
-        struct dysymtab_command_m dysymtab = {0};
+        struct symtab_command symtab = {0};
+        struct dysymtab_command dysymtab = {0};
         uint64_t la_symbol_ptr_addr = 0, la_symbol_ptr_size = 0;
         BOOL found_la = NO;
 
         for (uint32_t c = 0; c < ncmds; c++) {
-            const load_command *lc = (const load_command *)ptr;
+            const struct load_command *lc = (const struct load_command *)ptr;
             if (lc->cmd == 0 || lc->cmdsize == 0) break;
 
-            if (is64 && lc->cmd == 0x19) { // LC_SEGMENT_64
-                struct segment_command_64_m *seg = (struct segment_command_64_m *)ptr;
+            if (is64 && lc->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
                 if (strcmp(seg->segname, SEG_DATA) == 0) {
-                    // Find __la_symbol_ptr section
-                    const struct section_64 *sects = (const struct section_64 *)(ptr + sizeof(struct segment_command_64_m));
+                    const struct section_64 *sects = (const struct section_64 *)(ptr + sizeof(struct segment_command_64));
                     for (uint32_t s = 0; s < seg->nsects; s++) {
-                        if (strcmp(sects[s].sectname, SECT_LA_SYMBOL_PTR) == 0) {
+                        if (strcmp(sects[s].sectname, "__la_symbol_ptr") == 0) {
                             la_symbol_ptr_addr = sects[s].addr;
                             la_symbol_ptr_size = sects[s].size;
                             found_la = YES;
@@ -243,16 +113,13 @@ static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindin
                     linkedit_fileoff = seg->fileoff;
                     linkedit_vmaddr = seg->vmaddr;
                 }
-            } else if (!is64 && lc->cmd == 0x01) { // LC_SEGMENT
-                // 32-bit — similar but we focus on 64-bit (modern iOS)
-                // Skip for simplicity, all modern devices are 64-bit
             }
 
-            if (lc->cmd == 2) { // LC_SYMTAB
-                memcpy(&symtab, ptr, sizeof(struct symtab_command_m));
+            if (lc->cmd == LC_SYMTAB) {
+                memcpy(&symtab, ptr, sizeof(struct symtab_command));
             }
-            if (lc->cmd == 11) { // LC_DYSYMTAB
-                memcpy(&dysymtab, ptr, sizeof(struct dysymtab_command_m));
+            if (lc->cmd == LC_DYSYMTAB) {
+                memcpy(&dysymtab, ptr, sizeof(struct dysymtab_command));
             }
 
             ptr += lc->cmdsize;
@@ -270,9 +137,7 @@ static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindin
         // Indirect symbol table
         const uint32_t *indirect_sym = (const uint32_t *)(linkedit_base + dysymtab.indirectsymoff);
 
-        // __la_symbol_ptr section
-        uint32_t *ptr_table = (uint32_t *)(slide + la_symbol_ptr_addr);
-        // For 64-bit, pointers are 8 bytes
+        // __la_symbol_ptr section (64-bit: 8 bytes per pointer)
         uint64_t *ptr_table_64 = (uint64_t *)(slide + la_symbol_ptr_addr);
         uint32_t ptr_count = (uint32_t)(la_symbol_ptr_size / sizeof(void *));
 
@@ -302,9 +167,6 @@ static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindin
         }
     }
 }
-
-#define INDIRECT_SYMBOL_ABS   0x80000000
-#define INDIRECT_SYMBOL_LOCAL 0x40000000
 
 // ============================================================
 // Persistent spoofed identifiers
