@@ -330,10 +330,10 @@ static void initPrivacyHook(void) {
         clearSharedCookies();
 
         // ============================================================
-        // 7. NSBundle — return ORIGINAL Bundle ID for payment compatibility
+        // 7. NSBundle bundleIdentifier — return original for main bundle
         //    Payment SDKs check bundleIdentifier == "com.baidu.BaiduMobile"
-        //    Must hook ALL access paths: bundleIdentifier, infoDictionary,
-        //    objectForInfoDictionaryKey: — all return com.baidu.BaiduMobile
+        //    NOTE: Do NOT hook infoDictionary or objectForInfoDictionaryKey:
+        //    — they break app icons and payment SDK configuration reading.
         // ============================================================
         {
             static NSString *origBundleID = nil;
@@ -346,7 +346,6 @@ static void initPrivacyHook(void) {
 
             Class bundleClass = objc_getClass("NSBundle");
             if (bundleClass) {
-                // 7a. bundleIdentifier method
                 Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
                 if (m) {
                     static IMP orig_bundleID = NULL;
@@ -358,42 +357,6 @@ static void initPrivacyHook(void) {
                         return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
                     });
                     hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
-                                       imp, method_getTypeEncoding(m));
-                }
-
-                // 7b. objectForInfoDictionaryKey: — intercept CFBundleIdentifier
-                m = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
-                if (m) {
-                    static IMP orig_infoKey = NULL;
-                    orig_infoKey = method_getImplementation(m);
-                    IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
-                        if (s == [NSBundle mainBundle] && key &&
-                            [key isEqualToString:@"CFBundleIdentifier"]) {
-                            return origBundleID;
-                        }
-                        return ((id(*)(id, SEL, NSString *))orig_infoKey)(
-                            s, @selector(objectForInfoDictionaryKey:), key);
-                    });
-                    hookInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:),
-                                       imp, method_getTypeEncoding(m));
-                }
-
-                // 7c. infoDictionary — replace CFBundleIdentifier in returned dict
-                m = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
-                if (m) {
-                    static IMP orig_infoDict = NULL;
-                    orig_infoDict = method_getImplementation(m);
-                    IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) {
-                        NSDictionary *result = ((NSDictionary *(*)(id, SEL))orig_infoDict)(
-                            s, @selector(infoDictionary));
-                        if (s == [NSBundle mainBundle] && result) {
-                            NSMutableDictionary *mut = [result mutableCopy];
-                            mut[@"CFBundleIdentifier"] = origBundleID;
-                            return mut;
-                        }
-                        return result;
-                    });
-                    hookInstanceMethod(bundleClass, @selector(infoDictionary),
                                        imp, method_getTypeEncoding(m));
                 }
             }

@@ -127,19 +127,11 @@ def modify_info_plist(app_path: str, new_bundle_id: str, new_display_name: str) 
                 new_groups.append(group)
         info["keychain-access-groups"] = new_groups
 
-    # --- URL schemes ---
-    if "CFBundleURLTypes" in info:
-        for url_type in info["CFBundleURLTypes"]:
-            if "CFBundleURLSchemes" in url_type:
-                new_schemes = []
-                for scheme in url_type["CFBundleURLSchemes"]:
-                    if isinstance(scheme, str) and original_bundle_id in scheme:
-                        new_scheme = scheme.replace(original_bundle_id, new_bundle_id)
-                        new_schemes.append(new_scheme)
-                        print(f"  URL scheme: {scheme} -> {new_scheme}")
-                    else:
-                        new_schemes.append(scheme)
-                url_type["CFBundleURLSchemes"] = new_schemes
+    # --- URL schemes: DO NOT modify ---
+    # Payment SDKs (Alipay/WeChat) use URL schemes for callbacks.
+    # Changing them breaks payment flow. Keep original URL schemes.
+    # (Each clone will share the same URL schemes, but only one can be
+    #  the default handler at a time — acceptable for our use case.)
 
     # --- Write back ---
     with open(info_plist_path, "wb") as f:
