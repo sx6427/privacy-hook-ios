@@ -2,9 +2,10 @@
 //  PrivacyHook.m
 //  Device Fingerprint + Login State Isolation Dylib for iOS
 //
-//  v12: v11 + fishhook for sysctlbyname/getifaddrs (serial/MAC/IP spoofing)
-//       fishhook rebinds via __la_symbol_ptr — no __interpose section,
-//       invisible to payment SDK integrity checks.
+//  v14: CRITICAL FIX — fishhook symbol comparison was broken (missing
+//       leading underscore skip), so sysctlbyname/getifaddrs hooks
+//       NEVER worked. Serial/MAC/IP were REAL. Also adds dylib hiding
+//       via fishhook (dyld enumeration + dladdr + filesystem).
 //
 //  Hooks:
 //    [Device Fingerprint — ObjC swizzle]
@@ -19,11 +20,25 @@
 //    - sysctlbyname (hw.serialnumber, hw.uuid)
 //    - getifaddrs (MAC address, local IP)
 //
+//    [Anti-Detection — fishhook rebind]
+//    - _dyld_image_count (hide our dylib from enumeration)
+//    - _dyld_get_image_name (skip our dylib index)
+//    - _dyld_get_image_header (skip our dylib index)
+//    - _dyld_get_image_vmaddr_slide (skip our dylib index)
+//    - dladdr (return 0 for addresses in our dylib)
+//
+//    [Anti-Detection — ObjC swizzle]
+//    - NSFileManager contentsOfDirectoryAtPath:error: (hide dylib file)
+//    - NSBundle pathsForResourcesOfType:inDirectory: (hide dylib file)
+//
 //    [Login State Isolation]
 //    - UIPasteboard (blocks clipboard-based cross-app login sharing)
 //    - Keychain clear on first launch
 //    - NSHTTPCookieStorage (clears shared cookies)
 //    - NSFileManager containerURLForSecurityApplicationGroupIdentifier:
+//
+//    [Payment Compatibility]
+//    - NSBundle bundleIdentifier (return original for payment SDKs)
 //
 
 #import <Foundation/Foundation.h>
@@ -49,7 +64,7 @@
 // ============================================================
 // fishhook — minimal rebind_symbols implementation
 // Based on Facebook's fishhook (simplified, single-file embed)
-// Rebinds C function pointers in __DATA,__la_symbol_ptr
+// Rebinds C function pointers in __DATA,__la_symbol_ptr AND __got
 // without leaving __DATA,__interpose section traces
 // ============================================================
 
@@ -64,107 +79,118 @@ struct rebinding {
     void **replaced;
 };
 
-static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindings_nel) {
-    // Iterate all loaded images
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const struct mach_header *header = _dyld_get_image_header(i);
-        if (!header) continue;
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+static void fishhook_rebind_image(const struct mach_header *header, intptr_t slide,
+                                  const struct rebinding rebindings[], size_t rebindings_nel) {
+    BOOL is64 = (header->magic == 0xFEEDFACF);
+    if (!is64 && header->magic != 0xFEEDFACE) return;
 
-        // Determine if 64-bit
-        BOOL is64 = (header->magic == 0xFEEDFACF);
-        if (!is64 && header->magic != 0xFEEDFACE) continue;
+    const uint8_t *ptr = (const uint8_t *)header;
+    uint32_t ncmds;
+    if (is64) {
+        ncmds = ((struct mach_header_64 *)header)->ncmds;
+        ptr += sizeof(struct mach_header_64);
+    } else {
+        ncmds = ((struct mach_header *)header)->ncmds;
+        ptr += sizeof(struct mach_header);
+    }
 
-        const uint8_t *ptr = (const uint8_t *)header;
-        uint32_t ncmds;
-        if (is64) {
-            ncmds = ((struct mach_header_64 *)header)->ncmds;
-            ptr += sizeof(struct mach_header_64);
-        } else {
-            ncmds = ((struct mach_header *)header)->ncmds;
-            ptr += sizeof(struct mach_header);
-        }
+    uint64_t linkedit_fileoff = 0, linkedit_vmaddr = 0;
+    struct symtab_command symtab = {0};
+    struct dysymtab_command dysymtab = {0};
 
-        // Find __LINKEDIT, symtab, dysymtab, and __la_symbol_ptr sections
-        uint64_t linkedit_fileoff = 0, linkedit_vmaddr = 0;
-        struct symtab_command symtab = {0};
-        struct dysymtab_command dysymtab = {0};
-        uint64_t la_symbol_ptr_addr = 0, la_symbol_ptr_size = 0;
-        BOOL found_la = NO;
+    // Collect ALL indirect symbol pointer sections (__la_symbol_ptr + __got)
+    typedef struct {
+        uint64_t addr;
+        uint64_t size;
+    } ptr_section_t;
+    ptr_section_t ptr_sections[8];
+    int ptr_section_count = 0;
 
-        for (uint32_t c = 0; c < ncmds; c++) {
-            const struct load_command *lc = (const struct load_command *)ptr;
-            if (lc->cmd == 0 || lc->cmdsize == 0) break;
+    for (uint32_t c = 0; c < ncmds; c++) {
+        const struct load_command *lc = (const struct load_command *)ptr;
+        if (lc->cmd == 0 || lc->cmdsize == 0) break;
 
-            if (is64 && lc->cmd == LC_SEGMENT_64) {
-                struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
-                if (strcmp(seg->segname, SEG_DATA) == 0) {
-                    const struct section_64 *sects = (const struct section_64 *)(ptr + sizeof(struct segment_command_64));
-                    for (uint32_t s = 0; s < seg->nsects; s++) {
-                        if (strcmp(sects[s].sectname, "__la_symbol_ptr") == 0) {
-                            la_symbol_ptr_addr = sects[s].addr;
-                            la_symbol_ptr_size = sects[s].size;
-                            found_la = YES;
-                        }
+        if (is64 && lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
+            if (strcmp(seg->segname, SEG_DATA) == 0) {
+                const struct section_64 *sects = (const struct section_64 *)
+                    (ptr + sizeof(struct segment_command_64));
+                for (uint32_t s = 0; s < seg->nsects; s++) {
+                    if ((strcmp(sects[s].sectname, "__la_symbol_ptr") == 0 ||
+                         strcmp(sects[s].sectname, "__got") == 0) &&
+                        ptr_section_count < 8) {
+                        ptr_sections[ptr_section_count].addr = sects[s].addr;
+                        ptr_sections[ptr_section_count].size = sects[s].size;
+                        ptr_section_count++;
                     }
                 }
-                if (strcmp(seg->segname, "__LINKEDIT") == 0) {
-                    linkedit_fileoff = seg->fileoff;
-                    linkedit_vmaddr = seg->vmaddr;
-                }
             }
-
-            if (lc->cmd == LC_SYMTAB) {
-                memcpy(&symtab, ptr, sizeof(struct symtab_command));
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+                linkedit_fileoff = seg->fileoff;
+                linkedit_vmaddr = seg->vmaddr;
             }
-            if (lc->cmd == LC_DYSYMTAB) {
-                memcpy(&dysymtab, ptr, sizeof(struct dysymtab_command));
-            }
-
-            ptr += lc->cmdsize;
         }
 
-        if (!found_la || !symtab.symoff || !dysymtab.indirectsymoff) continue;
+        if (lc->cmd == LC_SYMTAB) {
+            memcpy(&symtab, ptr, sizeof(struct symtab_command));
+        }
+        if (lc->cmd == LC_DYSYMTAB) {
+            memcpy(&dysymtab, ptr, sizeof(struct dysymtab_command));
+        }
 
-        // Calculate base address for __LINKEDIT
-        uintptr_t linkedit_base = (uintptr_t)slide + linkedit_vmaddr - linkedit_fileoff;
+        ptr += lc->cmdsize;
+    }
 
-        // Symbol table
-        struct nlist_64 *symbols = (struct nlist_64 *)(linkedit_base + symtab.symoff);
-        // String table
-        const char *strtab = (const char *)(linkedit_base + symtab.stroff);
-        // Indirect symbol table
-        const uint32_t *indirect_sym = (const uint32_t *)(linkedit_base + dysymtab.indirectsymoff);
+    if (ptr_section_count == 0 || !symtab.symoff || !dysymtab.indirectsymoff) return;
 
-        // __la_symbol_ptr section (64-bit: 8 bytes per pointer)
-        uint64_t *ptr_table_64 = (uint64_t *)(slide + la_symbol_ptr_addr);
-        uint32_t ptr_count = (uint32_t)(la_symbol_ptr_size / sizeof(void *));
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_vmaddr - linkedit_fileoff;
+
+    struct nlist_64 *symbols = (struct nlist_64 *)(linkedit_base + symtab.symoff);
+    const char *strtab = (const char *)(linkedit_base + symtab.stroff);
+    const uint32_t *indirect_sym = (const uint32_t *)(linkedit_base + dysymtab.indirectsymoff);
+
+    for (int si = 0; si < ptr_section_count; si++) {
+        uint64_t *ptr_table = (uint64_t *)(slide + ptr_sections[si].addr);
+        uint32_t ptr_count = (uint32_t)(ptr_sections[si].size / sizeof(void *));
 
         for (uint32_t j = 0; j < ptr_count; j++) {
             uint32_t symtab_index = indirect_sym[j];
-            if (symtab_index == 0 || symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL) continue;
+            if (symtab_index == 0 ||
+                symtab_index == INDIRECT_SYMBOL_ABS ||
+                symtab_index == INDIRECT_SYMBOL_LOCAL) continue;
 
             struct nlist_64 *sym = &symbols[symtab_index];
             const char *sym_name = strtab + sym->n_un.n_strx;
             if (!sym_name || sym_name[0] == '\0') continue;
 
-            // Check if this symbol matches any of our rebindings
+            // CRITICAL FIX: Mach-O symbol names have a leading underscore
+            // Skip it before comparing with our rebinding names
+            const char *cmp_name = (sym_name[0] == '_') ? sym_name + 1 : sym_name;
+
             for (size_t r = 0; r < rebindings_nel; r++) {
-                if (strcmp(sym_name, rebindings[r].name) == 0) {
+                if (strcmp(cmp_name, rebindings[r].name) == 0) {
                     if (rebindings[r].replaced) {
-                        *rebindings[r].replaced = (void *)ptr_table_64[j];
+                        *rebindings[r].replaced = (void *)ptr_table[j];
                     }
-                    // mprotect to make it writable
                     size_t page_size = sysconf(_SC_PAGESIZE);
-                    uintptr_t page_start = (uintptr_t)(&ptr_table_64[j]) & ~(page_size - 1);
+                    uintptr_t page_start = (uintptr_t)(&ptr_table[j]) & ~(page_size - 1);
                     vm_protect(mach_task_self(), (vm_address_t)page_start,
                                page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-                    ptr_table_64[j] = (uint64_t)rebindings[r].replacement;
+                    ptr_table[j] = (uint64_t)rebindings[r].replacement;
                     break;
                 }
             }
         }
+    }
+}
+
+static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindings_nel) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *header = _dyld_get_image_header(i);
+        if (!header) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        fishhook_rebind_image(header, slide, rebindings, rebindings_nel);
     }
 }
 
@@ -180,6 +206,26 @@ static NSString *_spoofedMAC = nil;
 static NSString *_spoofedLocalIP = nil;
 
 static volatile BOOL g_initialized = NO;
+
+// ============================================================
+// Dylib self-index for hiding from dyld enumeration
+// ============================================================
+static int g_self_dyld_index = -1;
+
+// Runtime-constructed dylib basename (avoid plaintext in binary)
+// "BaiduBoxSys.dylib" = {66,97,105,100,117,66,111,120,83,121,115,46,100,121,108,105,98}
+static const char *getDylibBasename(void) {
+    static char name[32] = {0};
+    if (name[0]) return name;
+    const char parts[] = {66,97,105,100,117,66,111,120,83,121,115,
+                          46,100,121,108,105,98,0};
+    memcpy(name, parts, sizeof(parts));
+    return name;
+}
+
+static NSString *getDylibName(void) {
+    return [NSString stringWithUTF8String:getDylibBasename()];
+}
 
 // ============================================================
 // NSUserDefaults key prefix — looks like Baidu's own setting
@@ -342,10 +388,7 @@ static void clearSharedCookies(void) {
 }
 
 // ============================================================
-// fishhook'd C functions — sysctlbyname + getifaddrs
-// These replace DYLD interpose (which left __interpose section
-// traces detectable by payment SDKs). fishhook modifies
-// __la_symbol_ptr which is much harder to detect.
+// fishhook'd C functions — Device Fingerprint
 // ============================================================
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
 
@@ -404,7 +447,8 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
             }
             if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
                 struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-                if (sin->sin_addr.s_addr != htonl(INADDR_LOOPBACK) && sin->sin_addr.s_addr != 0 && _spoofedLocalIP) {
+                if (sin->sin_addr.s_addr != htonl(INADDR_LOOPBACK) &&
+                    sin->sin_addr.s_addr != 0 && _spoofedLocalIP) {
                     const char *ipStr = [_spoofedLocalIP UTF8String];
                     struct in_addr addr;
                     if (inet_pton(AF_INET, ipStr, &addr) == 1) {
@@ -419,11 +463,70 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 }
 
 // ============================================================
+// fishhook'd C functions — Anti-Detection (dylib hiding)
+// Hide our dylib from _dyld_image_count / _dyld_get_image_name
+// enumeration and dladdr lookups
+// ============================================================
+static uint32_t (*orig_dyld_image_count)(void);
+static uint32_t hook_dyld_image_count(void) {
+    uint32_t count = orig_dyld_image_count();
+    if (g_self_dyld_index >= 0 && count > 0) return count - 1;
+    return count;
+}
+
+static const char *(*orig_dyld_get_image_name)(uint32_t);
+static const char *hook_dyld_get_image_name(uint32_t image_index) {
+    if (g_self_dyld_index >= 0 && image_index >= (uint32_t)g_self_dyld_index) {
+        return orig_dyld_get_image_name(image_index + 1);
+    }
+    return orig_dyld_get_image_name(image_index);
+}
+
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t);
+static const struct mach_header *hook_dyld_get_image_header(uint32_t image_index) {
+    if (g_self_dyld_index >= 0 && image_index >= (uint32_t)g_self_dyld_index) {
+        return orig_dyld_get_image_header(image_index + 1);
+    }
+    return orig_dyld_get_image_header(image_index);
+}
+
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t);
+static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t image_index) {
+    if (g_self_dyld_index >= 0 && image_index >= (uint32_t)g_self_dyld_index) {
+        return orig_dyld_get_image_vmaddr_slide(image_index + 1);
+    }
+    return orig_dyld_get_image_vmaddr_slide(image_index);
+}
+
+static int (*orig_dladdr)(const void *, Dl_info *);
+static int hook_dladdr(const void *addr, Dl_info *info) {
+    int result = orig_dladdr(addr, info);
+    if (result && info && info->dli_fname) {
+        if (strstr(info->dli_fname, getDylibBasename())) {
+            memset(info, 0, sizeof(Dl_info));
+            return 0;
+        }
+    }
+    return result;
+}
+
+// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
+        // --- Find our own dylib index for hiding ---
+        const char *dylibBase = getDylibBasename();
+        uint32_t dyldCount = _dyld_image_count();
+        for (uint32_t i = 0; i < dyldCount; i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (name && strstr(name, dylibBase)) {
+                g_self_dyld_index = (int)i;
+                break;
+            }
+        }
+
         // --- Initialize ALL spoofed values ---
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
@@ -536,7 +639,7 @@ static void initPrivacyHook(void) {
         clearSharedCookies();
 
         // ============================================================
-        // 7. App Group container blocked
+        // 7. App Group container blocked + filesystem hiding
         // ============================================================
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
@@ -547,6 +650,31 @@ static void initPrivacyHook(void) {
                 hookInstanceMethod(fmClass,
                     @selector(containerURLForSecurityApplicationGroupIdentifier:),
                     imp, method_getTypeEncoding(m));
+            }
+
+            // --- Hide our dylib from directory listings ---
+            m = class_getInstanceMethod(fmClass, @selector(contentsOfDirectoryAtPath:error:));
+            if (m) {
+                static IMP orig_contentsOfDir = NULL;
+                orig_contentsOfDir = method_getImplementation(m);
+                IMP imp = imp_implementationWithBlock(^NSArray *(id s, NSString *path, NSError **err) {
+                    NSArray *result = ((NSArray *(*)(id, SEL, NSString *, NSError **))orig_contentsOfDir)(
+                        s, @selector(contentsOfDirectoryAtPath:error:), path, err);
+                    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+                    if (path && [path hasPrefix:bundlePath]) {
+                        NSString *dylibName = getDylibName();
+                        NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+                        for (NSString *item in result) {
+                            if (![item isEqualToString:dylibName]) {
+                                [filtered addObject:item];
+                            }
+                        }
+                        return filtered;
+                    }
+                    return result;
+                });
+                hookInstanceMethod(fmClass, @selector(contentsOfDirectoryAtPath:error:),
+                                   imp, method_getTypeEncoding(m));
             }
         }
 
@@ -585,17 +713,50 @@ static void initPrivacyHook(void) {
                     hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
                                        imp, method_getTypeEncoding(m));
                 }
+
+                // --- Hide dylib from pathsForResourcesOfType: ---
+                m = class_getInstanceMethod(bundleClass, @selector(pathsForResourcesOfType:inDirectory:));
+                if (m) {
+                    static IMP orig_paths = NULL;
+                    orig_paths = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSArray *(id s, NSString *ext, NSString *dir) {
+                        NSArray *result = ((NSArray *(*)(id, SEL, NSString *, NSString *))orig_paths)(
+                            s, @selector(pathsForResourcesOfType:inDirectory:), ext, dir);
+                        if (ext && [ext isEqualToString:@"dylib"]) {
+                            NSString *dylibName = getDylibName();
+                            NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:result.count];
+                            for (NSString *p in result) {
+                                if (![[p lastPathComponent] isEqualToString:dylibName]) {
+                                    [filtered addObject:p];
+                                }
+                            }
+                            return filtered;
+                        }
+                        return result;
+                    });
+                    hookInstanceMethod(bundleClass, @selector(pathsForResourcesOfType:inDirectory:),
+                                       imp, method_getTypeEncoding(m));
+                }
             }
         }
 
         // ============================================================
-        // 9. fishhook — rebind sysctlbyname + getifaddrs
+        // 9. fishhook — rebind ALL C functions
         //    No __DATA,__interpose section — invisible to payment SDKs
+        //    CRITICAL: symbol names in rebindings do NOT include the
+        //    leading underscore (fishhook skips it internally)
         // ============================================================
         struct rebinding rebindings[] = {
-            { "sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname },
-            { "getifaddrs",   (void *)hook_getifaddrs,   (void **)&orig_getifaddrs   },
+            // Device fingerprint
+            { "sysctlbyname",              (void *)hook_sysctlbyname,              (void **)&orig_sysctlbyname },
+            { "getifaddrs",                (void *)hook_getifaddrs,                (void **)&orig_getifaddrs },
+            // Anti-detection: dylib hiding
+            { "_dyld_image_count",         (void *)hook_dyld_image_count,          (void **)&orig_dyld_image_count },
+            { "_dyld_get_image_name",      (void *)hook_dyld_get_image_name,       (void **)&orig_dyld_get_image_name },
+            { "_dyld_get_image_header",    (void *)hook_dyld_get_image_header,     (void **)&orig_dyld_get_image_header },
+            { "_dyld_get_image_vmaddr_slide", (void *)hook_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide },
+            { "dladdr",                    (void *)hook_dladdr,                    (void **)&orig_dladdr },
         };
-        fishhook_rebind(rebindings, 2);
+        fishhook_rebind(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
     }
 }
