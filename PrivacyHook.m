@@ -2,27 +2,25 @@
 //  PrivacyHook.m
 //  Device Fingerprint + Login State Isolation Dylib for iOS
 //
-//  v16: COMPLETELY REMOVE fishhook. ObjC swizzle ONLY.
+//  v17: v16 + infoDictionary & objectForInfoDictionaryKey hooks.
 //
-//  Rationale: On iOS, regular apps CANNOT access serial number,
-//  MAC address, or hw.uuid — these are protected by entitlements.
-//  sysctlbyname("hw.serialnumber") returns empty for non-system apps.
-//  MAC addresses are zeroed since iOS 7. So fishhook on these was
-//  unnecessary and only added detection vectors.
+//  Payment SDK reads CFBundleIdentifier via THREE paths:
+//  1. [NSBundle mainBundle].bundleIdentifier  → hooked (v13+)
+//  2. [NSBundle mainBundle].infoDictionary[@"CFBundleIdentifier"]  → NOT hooked
+//  3. [NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleIdentifier"]  → NOT hooked
 //
-//  Baidu can only identify devices via:
-//  1. IDFA → ObjC swizzle (we hook this)
-//  2. IDFV → different Bundle ID = naturally different IDFV
-//  3. Device name → ObjC swizzle (we hook this)
-//  4. Public IP → server-side, cannot be hooked
+//  v13 "worked" sometimes because the SDK check is probabilistic.
+//  After v14's aggressive hooks, the server risk score increased to 100% fail.
+//  v17 hooks ALL THREE paths to make client-side check consistently pass,
+//  allowing server risk score to decrease over time.
 //
-//  v13 "worked" because fishhook was broken (symbols never matched).
-//  v14 banned accounts because aggressive hooks modified system
-//  function pointers, detected by payment SDK integrity checks.
-//  v16 = v13's effective behavior, but clean and intentional.
+//  infoDictionary hook: returns a CACHED mutable copy with ONLY
+//  CFBundleIdentifier changed. All other keys (icons, config, etc.)
+//  are preserved exactly. This avoids the icon disappearance issue
+//  that v9 had (which likely returned a fresh dict each time or
+//  modified other keys).
 //
-//  NO C function hooks. NO function pointer modifications.
-//  Only ObjC method swizzling — much harder to detect.
+//  NO fishhook. NO C function hooks. ObjC swizzle ONLY.
 //
 //  Hooks:
 //    [Device Fingerprint — ObjC swizzle]
@@ -280,15 +278,16 @@ static void initPrivacyHook(void) {
         }
 
         // ============================================================
-        // 8. NSBundle bundleIdentifier — return ORIGINAL Bundle ID
-        //    Payment SDKs (Alipay/WeChat) check bundleIdentifier ==
-        //    "com.baidu.BaiduMobile". Our IPA has a different Bundle ID
-        //    for multi-instance, so we must hook this method.
+        // 8. NSBundle — return ORIGINAL Bundle ID via ALL paths
+        //    Payment SDKs read CFBundleIdentifier through:
+        //    a) bundleIdentifier method
+        //    b) infoDictionary[@"CFBundleIdentifier"]
+        //    c) objectForInfoDictionaryKey:@"CFBundleIdentifier"]
+        //    We must hook ALL THREE to ensure consistency.
         //
-        //    NOTE: iOS matches icons via Info.plist at install time,
-        //    NOT via runtime bundleIdentifier calls. So this hook
-        //    does NOT affect icon display.
-        //    DO NOT hook infoDictionary — that breaks icon/config reading.
+        //    infoDictionary: returns a CACHED mutable copy with ONLY
+        //    CFBundleIdentifier changed. All other keys preserved.
+        //    This avoids icon/config issues that v9 had.
         // ============================================================
         {
             static NSString *origBundleID = nil;
@@ -301,6 +300,7 @@ static void initPrivacyHook(void) {
 
             Class bundleClass = objc_getClass("NSBundle");
             if (bundleClass) {
+                // 8a. bundleIdentifier method
                 Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
                 if (m) {
                     static IMP orig_bundleID = NULL;
@@ -312,6 +312,52 @@ static void initPrivacyHook(void) {
                         return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
                     });
                     hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
+                                       imp, method_getTypeEncoding(m));
+                }
+
+                // 8b. objectForInfoDictionaryKey: — intercept CFBundleIdentifier only
+                m = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
+                if (m) {
+                    static IMP orig_infoKey = NULL;
+                    orig_infoKey = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
+                        if (s == [NSBundle mainBundle] && key &&
+                            [key isEqualToString:@"CFBundleIdentifier"]) {
+                            return origBundleID;
+                        }
+                        return ((id(*)(id, SEL, NSString *))orig_infoKey)(
+                            s, @selector(objectForInfoDictionaryKey:), key);
+                    });
+                    hookInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:),
+                                       imp, method_getTypeEncoding(m));
+                }
+
+                // 8c. infoDictionary — return cached copy with CFBundleIdentifier changed
+                //     ONLY this key is modified. All other keys (icons, display name,
+                //     URL schemes, etc.) are preserved exactly.
+                //     The result is cached so the same object is always returned
+                //     (avoids pointer-equality checks failing).
+                m = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
+                if (m) {
+                    static IMP orig_infoDict = NULL;
+                    orig_infoDict = method_getImplementation(m);
+                    static NSDictionary *cachedModifiedDict = nil;
+                    IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        if (s != [NSBundle mainBundle]) {
+                            return ((NSDictionary *(*)(id, SEL))orig_infoDict)(
+                                s, @selector(infoDictionary));
+                        }
+                        static dispatch_once_t dictOnce;
+                        dispatch_once(&dictOnce, ^{
+                            NSDictionary *orig = ((NSDictionary *(*)(id, SEL))orig_infoDict)(
+                                s, @selector(infoDictionary));
+                            NSMutableDictionary *mut = [NSMutableDictionary dictionaryWithDictionary:orig];
+                            mut[@"CFBundleIdentifier"] = origBundleID;
+                            cachedModifiedDict = [NSDictionary dictionaryWithDictionary:mut];
+                        });
+                        return cachedModifiedDict;
+                    });
+                    hookInstanceMethod(bundleClass, @selector(infoDictionary),
                                        imp, method_getTypeEncoding(m));
                 }
             }
