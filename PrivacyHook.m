@@ -1,13 +1,12 @@
 //
-//  PrivacyHook.m — Step 6: DYLD_INTERPOSE for sysctlbyname
+//  PrivacyHook.m — Step 7: Step6 + IOKit hook (IOPlatformUUID)
 //
-//  Step5 crashed because fishhook modifies the symbol table at runtime,
-//  which corrupts sysctlbyname calls during early init.
+//  Step6 doesn't crash but Baidu still recognizes the device.
+//  Missing piece: IOPlatformUUID — hardware-level unique ID that
+//  survives factory reset. Baidu reads it via IOKit.
 //
-//  DYLD_INTERPOSE is a compile-time directive: dyld itself replaces the
-//  symbol when loading the dylib. No runtime patching = no crash.
-//
-//  Everything else identical to Step5.
+//  Hook IORegistryEntryCreateCFProperty via DYLD_INTERPOSE.
+//  Return fake UUID/serial when those keys are requested.
 //
 
 #import <Foundation/Foundation.h>
@@ -19,6 +18,8 @@
 #import <objc/message.h>
 #import <sys/sysctl.h>
 #import <string.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <IOKit/IOKitLib.h>
 
 #define NSLog(...)
 
@@ -43,9 +44,13 @@ static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
 static NSString *_spoofedSysVersion = nil;
 
-// C strings for sysctl hook (no ObjC in hook!)
+// C strings for sysctl hook (no ObjC!)
 static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
+
+// C strings for IOKit hook (no ObjC!)
+static char _c_platformUUID[64] = {0};    // e.g. "A1B2C3D4-..."
+static char _c_platformSerial[32] = {0};  // e.g. "F2LXY1234ABCDEFG"
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -121,6 +126,37 @@ static void initSpoofedHWInfoC(void) {
         strlcpy(_c_machine, [parts[0] UTF8String], sizeof(_c_machine));
         strlcpy(_c_hwmodel, [parts[1] UTF8String], sizeof(_c_hwmodel));
     }
+}
+
+// Generate fake IOPlatformUUID + serial number
+static void initSpoofedIOKitInfo(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+    // UUID
+    NSString *uuidKey = kKey(@"iouuid");
+    NSString *savedUUID = [defaults stringForKey:uuidKey];
+    if (!savedUUID) {
+        // Generate a random UUID string
+        savedUUID = [[NSUUID UUID] UUIDString];
+        [defaults setObject:savedUUID forKey:uuidKey];
+        [defaults synchronize];
+    }
+    strlcpy(_c_platformUUID, [savedUUID UTF8String], sizeof(_c_platformUUID));
+
+    // Serial number — random 12-char alphanumeric
+    NSString *serialKey = kKey(@"iosn");
+    NSString *savedSerial = [defaults stringForKey:serialKey];
+    if (!savedSerial) {
+        const char *chars = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+        char serial[13] = {0};
+        for (int i = 0; i < 12; i++) {
+            serial[i] = chars[arc4random_uniform(33)];
+        }
+        savedSerial = [NSString stringWithUTF8String:serial];
+        [defaults setObject:savedSerial forKey:serialKey];
+        [defaults synchronize];
+    }
+    strlcpy(_c_platformSerial, [savedSerial UTF8String], sizeof(_c_platformSerial));
 }
 
 // ============================================================
@@ -212,27 +248,9 @@ static void clearWebViewData(void) {
 // ============================================================
 // DYLD_INTERPOSE: sysctlbyname — PURE C
 // ============================================================
-// The replacement function. dyld replaces ALL calls to sysctlbyname
-// with this function at load time. No runtime patching needed.
-//
-// IMPORTANT: We must call the real sysctlbyname via a pointer that
-// dyld provides. With DYLD_INTERPOSE, the real function is still
-// accessible because interposing only affects OTHER modules' calls,
-// not our own. So we can call sysctlbyname() directly here.
-//
-// Wait — that's wrong. DYLD_INTERPOSE replaces globally, including
-// in our own dylib. We need a way to call the original.
-// Solution: use dlsym(RTLD_NEXT, "sysctlbyname") — no, that returns
-// our interposed version too.
-//
-// Actually: DYLD_INTERPOSE does NOT interpose within the same image.
-// Calls to sysctlbyname from within this dylib still go to the real one.
-// This is documented Apple behavior. So we're safe!
-
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp,
                             size_t newlen) {
-    // Only intercept reads
     if (name && newp == NULL && newlen == 0) {
 
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
@@ -260,14 +278,57 @@ static int my_sysctlbyname(const char *name, void *oldp,
                 return 0;
             }
         }
+
+        // Also intercept hw.serialnumber and hw.memsize
+        if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
+            size_t need = strlen(_c_platformSerial) + 1;
+            if (oldp == NULL) {
+                if (oldlenp) *oldlenp = need;
+                return 0;
+            }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_platformSerial, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
     }
 
-    // Call real sysctlbyname (not interposed within our own image)
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
-// Register the interpose
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
+
+// ============================================================
+// DYLD_INTERPOSE: IORegistryEntryCreateCFProperty
+// ============================================================
+// Hook IOKit to fake IOPlatformUUID and IOPlatformSerialNumber.
+// These are the #1 hardware identifiers used by device fingerprinting.
+// Uses CoreFoundation only (no ObjC) for safety.
+
+static CFTypeRef my_IORegistryEntryCreateCFProperty(
+    io_registry_entry_t entry,
+    CFStringRef key,
+    CFAllocatorRef allocator,
+    IOOptionBits options) {
+
+    if (key && _c_platformUUID[0] != 0) {
+        // IOPlatformUUID
+        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
+            return CFStringCreateWithCString(allocator, _c_platformUUID,
+                                             kCFStringEncodingUTF8);
+        }
+        // IOPlatformSerialNumber
+        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
+            return CFStringCreateWithCString(allocator, _c_platformSerial,
+                                             kCFStringEncodingUTF8);
+        }
+    }
+
+    return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+}
+
+DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
 
 // ============================================================
 // Constructor
@@ -275,12 +336,13 @@ DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        // --- Init spoofed values FIRST ---
+        // --- Init ALL spoofed values FIRST ---
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
         _spoofedSysVersion = getOrCreateSpoofedSysVersion();
         initSpoofedHWInfoC();
+        initSpoofedIOKitInfo();
 
         // --- Clear stored data ---
         clearKeychainOnce();
