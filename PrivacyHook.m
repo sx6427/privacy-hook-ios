@@ -1,15 +1,16 @@
 //
-//  PrivacyHook.m — Step 13b: DYLD_INTERPOSE fix — direct call, no orig pointer
+//  PrivacyHook.m — Step 14: DYLD_INTERPOSE for ALL C functions
 //
-//  Step13 crashed (10s freeze + crash) because orig_sysctlbyname was NULL.
-//  All sysctlbyname calls returned -1 → system init failed.
+//  Step13b PROVEN: DYLD_INTERPOSE works, no crash!
+//  But sysctlbyname only called 1 time → Baidu uses other methods.
 //
-//  Fix: In the hook function, call sysctlbyname() directly.
-//  DYLD_INTERPOSE does NOT interpose calls within the defining library,
-//  so this won't cause recursion.
+//  Step14: Add interpose for:
+//    - sysctlbyname ✅ (from Step13b)
+//    - sysctl (numeric ID) — NEW
+//    - IORegistryEntryCreateCFProperty (UUID/Serial) — NEW
+//    - getifaddrs (MAC address) — NEW
 //
-//  During early system init (before our constructor), _c_machine is empty,
-//  so the hook just passes through to the real sysctlbyname. Safe.
+//  All use direct call (no orig pointer) — proven safe in Step13b.
 //
 
 #import <Foundation/Foundation.h>
@@ -22,14 +23,27 @@
 #import <sys/sysctl.h>
 #import <string.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <IOKit/IOKitLib.h>
+#import <ifaddrs.h>
+#import <net/if.h>
 #import <mach-o/dyld.h>
-#import <dlfcn.h>
 
 #define NSLog(...)
 
-static volatile int diag_sb_called = 0;
-static volatile int diag_sb_intercepted = 0;  // Actually intercepted hw.machine/hw.model
+// ============================================================
+// Diagnostic counters
+// ============================================================
+static volatile int diag_sbn_called = 0;    // sysctlbyname
+static volatile int diag_sbn_intercepted = 0;
+static volatile int diag_sc_called = 0;     // sysctl (numeric)
+static volatile int diag_sc_intercepted = 0;
+static volatile int diag_iok_called = 0;    // IORegistryEntry
+static volatile int diag_iok_intercepted = 0;
+static volatile int diag_gifa_called = 0;   // getifaddrs
 
+// ============================================================
+// Spoofed values
+// ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
@@ -39,44 +53,12 @@ static NSString *_spoofedWebKitUA = nil;
 
 static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
+static char _c_platformUUID[64] = {0};
+static char _c_platformSerial[32] = {0};
 
 // ============================================================
-// DYLD_INTERPOSE
+// DYLD_INTERPOSE macros
 // ============================================================
-
-// Hook function — calls sysctlbyname() directly for passthrough.
-// In the defining library, DYLD_INTERPOSE does NOT interpose,
-// so sysctlbyname() here calls the REAL function. No recursion.
-static int my_sysctlbyname(const char *name, void *oldp,
-                            size_t *oldlenp, void *newp, size_t newlen) {
-    diag_sb_called++;
-
-    if (name && newp == NULL && newlen == 0) {
-        if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
-            diag_sb_intercepted++;
-            size_t need = strlen(_c_machine) + 1;
-            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_machine, need);
-                *oldlenp = need;
-                return 0;
-            }
-        }
-        if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
-            diag_sb_intercepted++;
-            size_t need = strlen(_c_hwmodel) + 1;
-            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_hwmodel, need);
-                *oldlenp = need;
-                return 0;
-            }
-        }
-    }
-    // Direct call — NOT interposed in defining library
-    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
-}
-
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
       const void *replacement; \
@@ -87,7 +69,119 @@ static int my_sysctlbyname(const char *name, void *oldp,
       (const void *)(unsigned long)&_replacee, \
   };
 
+// ============================================================
+// Hook: sysctlbyname (string name)
+// ============================================================
+static int my_sysctlbyname(const char *name, void *oldp,
+                            size_t *oldlenp, void *newp, size_t newlen) {
+    diag_sbn_called++;
+
+    if (name && newp == NULL && newlen == 0) {
+        if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
+            diag_sbn_intercepted++;
+            size_t need = strlen(_c_machine) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_machine, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
+            diag_sbn_intercepted++;
+            size_t need = strlen(_c_hwmodel) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_hwmodel, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
+            diag_sbn_intercepted++;
+            size_t need = strlen(_c_platformSerial) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_platformSerial, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+    }
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
+
+// ============================================================
+// Hook: sysctl (numeric ID)
+// ============================================================
+static int my_sysctl(int *name, u_int namelen, void *oldp,
+                     size_t *oldlenp, void *newp, size_t newlen) {
+    diag_sc_called++;
+
+    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
+        // CTL_HW = 6
+        if (name[0] == 6) {
+            // HW_MACHINE = 1
+            if (name[1] == 1 && _c_machine[0] != 0) {
+                diag_sc_intercepted++;
+                size_t need = strlen(_c_machine) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_machine, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+            // HW_MODEL = 2
+            if (name[1] == 2 && _c_hwmodel[0] != 0) {
+                diag_sc_intercepted++;
+                size_t need = strlen(_c_hwmodel) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_hwmodel, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+        }
+    }
+    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(my_sysctl, sysctl);
+
+// ============================================================
+// Hook: IORegistryEntryCreateCFProperty
+// ============================================================
+static CFTypeRef my_IORegistryEntryCreateCFProperty(
+    io_registry_entry_t entry, CFStringRef key,
+    CFAllocatorRef allocator, IOOptionBits options) {
+    diag_iok_called++;
+
+    if (key && _c_platformUUID[0] != 0) {
+        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
+            diag_iok_intercepted++;
+            return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
+        }
+        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
+            diag_iok_intercepted++;
+            return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
+        }
+    }
+    return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+}
+DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
+
+// ============================================================
+// Hook: getifaddrs (MAC address)
+// ============================================================
+static int my_getifaddrs(struct ifaddrs **ifap) {
+    diag_gifa_called++;
+    // Return empty list — no MAC address leak
+    *ifap = NULL;
+    return 0;
+}
+DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
 
 // ============================================================
 // Spoofed value initialization
@@ -155,6 +249,29 @@ static void initSpoofedHWInfoC(void) {
         strlcpy(_c_machine, [parts[0] UTF8String], sizeof(_c_machine));
         strlcpy(_c_hwmodel, [parts[1] UTF8String], sizeof(_c_hwmodel));
     }
+}
+
+static void initSpoofedIOKitInfo(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *uuidKey = kKey(@"iouuid");
+    NSString *savedUUID = [defaults stringForKey:uuidKey];
+    if (!savedUUID) {
+        savedUUID = [[NSUUID UUID] UUIDString];
+        [defaults setObject:savedUUID forKey:uuidKey];
+        [defaults synchronize];
+    }
+    strlcpy(_c_platformUUID, [savedUUID UTF8String], sizeof(_c_platformUUID));
+    NSString *serialKey = kKey(@"iosn");
+    NSString *savedSerial = [defaults stringForKey:serialKey];
+    if (!savedSerial) {
+        const char *chars = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+        char serial[13] = {0};
+        for (int i = 0; i < 12; i++) serial[i] = chars[arc4random_uniform(33)];
+        savedSerial = [NSString stringWithUTF8String:serial];
+        [defaults setObject:savedSerial forKey:serialKey];
+        [defaults synchronize];
+    }
+    strlcpy(_c_platformSerial, [savedSerial UTF8String], sizeof(_c_platformSerial));
 }
 
 static void initSpoofedUserAgent(void) {
@@ -230,33 +347,30 @@ static void clearWebViewData(void) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    // Get real hw.machine using dlsym to bypass interpose
-    typedef int (*sysctlbyname_t)(const char *, void *, size_t *, void *, size_t);
-    sysctlbyname_t real_sysctlbyname = (sysctlbyname_t)dlsym(RTLD_NEXT, "sysctlbyname");
-    char realMachine[32] = {0};
-    size_t size = sizeof(realMachine);
-    if (real_sysctlbyname) {
-        real_sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
-    }
-
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step13b 诊断 ===\n\n"
-        @"方法: DYLD_INTERPOSE (直接调用)\n\n"
+        @"=== Step14 诊断 ===\n\n"
         @"sysctlbyname:\n"
-        @"  被调用次数: %d\n"
-        @"  拦截次数: %d\n"
-        @"  伪造: %s\n"
-        @"  真实: %s\n\n"
+        @"  调用:%d 拦截:%d\n"
+        @"  伪造: %s\n\n"
+        @"sysctl(数字ID):\n"
+        @"  调用:%d 拦截:%d\n\n"
+        @"IORegistryEntry:\n"
+        @"  调用:%d 拦截:%d\n"
+        @"  伪造UUID: %s\n\n"
+        @"getifaddrs:\n"
+        @"  调用:%d\n\n"
         @"ObjC: 已生效\n"
-        @"设备名: %@\n"
-        @"系统版本: %@",
-        diag_sb_called, diag_sb_intercepted,
+        @"设备名: %@\n系统版本: %@",
+        diag_sbn_called, diag_sbn_intercepted,
         _c_machine[0] ? _c_machine : "(空)",
-        realMachine[0] ? realMachine : "(空)",
+        diag_sc_called, diag_sc_intercepted,
+        diag_iok_called, diag_iok_intercepted,
+        _c_platformUUID[0] ? _c_platformUUID : "(空)",
+        diag_gifa_called,
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step13b"
+        alertControllerWithTitle:@"Step14 全interpose"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -313,6 +427,7 @@ static void initPrivacyHook(void) {
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
         _spoofedSysVersion = getOrCreateSpoofedSysVersion();
         initSpoofedHWInfoC();
+        initSpoofedIOKitInfo();
         initSpoofedUserAgent();
 
         clearKeychainOnce();
