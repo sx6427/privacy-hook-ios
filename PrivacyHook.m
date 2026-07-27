@@ -406,8 +406,10 @@ static void clearWebViewData(void) {
 // Without wiping these, Baidu recognizes the same device across
 // reinstalls because UserDefaults persists with the same Bundle ID.
 // ============================================================
-static void clearBaiduUserDefaults(void) {
+static void clearBaiduUserDefaultsOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *flagKey = kKey(@"ud_cleaned");
+    if ([defaults boolForKey:flagKey]) return;  // already cleaned
 
     // Save our own config keys
     NSMutableDictionary *myConfig = [NSMutableDictionary dictionary];
@@ -440,8 +442,8 @@ static void clearBaiduUserDefaults(void) {
         [defaults setObject:myConfig[key] forKey:key];
     }
 
-    // Reset the keychain clear flag so it runs again
-    [defaults setBool:NO forKey:cfgPrefix ? @"BaiduBox.cfg.kc23" : @"x"];
+    // Mark as cleaned — don't wipe again so user stays logged in
+    [defaults setBool:YES forKey:flagKey];
     [defaults synchronize];
 }
 
@@ -555,12 +557,18 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 // This removes any device IDs stored in SQLite DBs, plist files,
 // or any other persistence mechanism Baidu might use.
 // ============================================================
-static void nukeSandbox(void) {
+static void nukeSandboxOnce(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *flagKey = kKey(@"sandbox_nuked");
+    if ([defaults boolForKey:flagKey]) {
+        // Already nuked — keep user's data intact
+        return;
+    }
+
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *home = NSHomeDirectory();
 
     // Save our own config first
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSMutableDictionary *savedConfig = [NSMutableDictionary dictionary];
     NSDictionary *allDict = [defaults dictionaryRepresentation];
     for (NSString *key in allDict) {
@@ -603,8 +611,8 @@ static void nukeSandbox(void) {
     for (NSString *key in savedConfig) {
         [defaults setObject:savedConfig[key] forKey:key];
     }
-    // Reset keychain clear flag
-    [defaults setBool:NO forKey:@"BaiduBox.cfg.kc23"];
+    // Set flag so we never nuke again — user data persists across launches
+    [defaults setBool:YES forKey:flagKey];
     [defaults synchronize];
 }
 
@@ -674,12 +682,22 @@ static void initPrivacyHook(void) {
         initSpoofedIOKitInfo();
         initSpoofedUserAgent();
 
-        clearKeychainOnce();
-        clearSharedCookies();
-        clearURLCache();
-        clearWebViewData();
-        clearBaiduUserDefaults();
-        nukeSandbox();
+        // === First-launch-only cleanup ===
+        // These all run ONLY on the very first launch after install.
+        // Subsequent launches preserve user data (login, cookies, etc).
+        // This prevents needing verification code on every launch.
+        NSUserDefaults *_ud = [NSUserDefaults standardUserDefaults];
+        BOOL isFirstLaunch = ![_ud boolForKey:kKey(@"first_launch_done")];
+        if (isFirstLaunch) {
+            clearKeychainOnce();
+            clearSharedCookies();
+            clearURLCache();
+            clearWebViewData();
+            clearBaiduUserDefaultsOnce();
+            nukeSandboxOnce();
+            [_ud setBool:YES forKey:kKey(@"first_launch_done")];
+            [_ud synchronize];
+        }
 
         // === ObjC hooks ===
 
