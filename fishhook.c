@@ -13,8 +13,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
-#include <mach/vm_protect.h>
-#include <mach/mach_init.h>
+#include <mach/mach.h>
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
