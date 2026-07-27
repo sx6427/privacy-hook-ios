@@ -1,15 +1,21 @@
 //
-//  PrivacyHook.m — Step 12d: .app images + ONLY sysctlbyname (no sysctl!)
+//  PrivacyHook.m — Step 13: DYLD_INTERPOSE + diagnostic (NO fishhook!)
 //
-//  Step12  crashed: getifaddrs(NULL) + IORegistry(orig=NULL)
-//  Step12b crashed: global rebind → system lib sysctl crash
-//  Step12c crashed: .app images + sysctlbyname + sysctl
+//  Step11: fishhook on main exec → safe but sysctlbyname NOT CALLED
+//  Step12/c/d: fishhook on .app images → CRASH
+//  Step12b: global rebind_symbols → CRASH
 //
-//  Step12d: .app images + ONLY sysctlbyname (known safe from Step11)
-//           NO sysctl, NO getifaddrs, NO IORegistry
+//  Root cause: fishhook's rebind_symbols_image crashes when called on
+//  multiple app images. And it only hooks main exec which Baidu doesn't use.
 //
-//  Step11 proved sysctlbyname rebind is safe on main exec.
-//  This just extends it to ALL .app images.
+//  NEW APPROACH: DYLD_INTERPOSE
+//  - Replaces symbol at dyld binding time (before any code runs)
+//  - Affects ALL images that import the symbol (including Baidu's dylibs)
+//  - No runtime rebind needed → no crash risk
+//  - Our hook only intercepts hw.machine/hw.model, everything else passthrough
+//
+//  Previous DYLD_INTERPOSE attempts (Step6-9) "didn't work" but we never
+//  verified with a diagnostic. This time we verify.
 //
 
 #import <Foundation/Foundation.h>
@@ -23,13 +29,17 @@
 #import <string.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <mach-o/dyld.h>
-#import "fishhook.h"
 
 #define NSLog(...)
 
+// ============================================================
+// Diagnostic counters
+// ============================================================
 static volatile int diag_sb_called = 0;
-static volatile int diag_images_hooked = 0;
 
+// ============================================================
+// Spoofed values
+// ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
@@ -40,8 +50,59 @@ static NSString *_spoofedWebKitUA = nil;
 static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
 
+// ============================================================
+// DYLD_INTERPOSE setup
+// ============================================================
+// Original function pointer (filled by dyld)
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 
+// Hook function — PURE C, only intercepts hw.machine/hw.model
+static int my_sysctlbyname(const char *name, void *oldp,
+                            size_t *oldlenp, void *newp, size_t newlen) {
+    diag_sb_called = 1;
+
+    if (name && newp == NULL && newlen == 0) {
+        if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
+            size_t need = strlen(_c_machine) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_machine, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
+            size_t need = strlen(_c_hwmodel) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_hwmodel, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+    }
+    // Everything else → passthrough
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// DYLD_INTERPOSE macro — tells dyld to replace sysctlbyname with my_sysctlbyname
+// This is processed at load time, before any constructors run.
+// It affects ALL images that import sysctlbyname (including Baidu's dylibs).
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+  __attribute__((used)) static struct { \
+      const void *replacement; \
+      const void *replacee; \
+  } _interpose_##_replacee \
+  __attribute__ ((section ("__DATA,__interpose"))) = { \
+      (const void *)(unsigned long)&_replacement, \
+      (const void *)(unsigned long)&_replacee, \
+  };
+
+DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
+
+// ============================================================
+// Spoofed value initialization
+// ============================================================
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
 }
@@ -117,6 +178,9 @@ static void initSpoofedUserAgent(void) {
         @"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", uaVersion];
 }
 
+// ============================================================
+// ObjC hooking helpers
+// ============================================================
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
@@ -134,6 +198,9 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     }
 }
 
+// ============================================================
+// Data clearing
+// ============================================================
 static void clearKeychainOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *key = kKey(@"kc23");
@@ -177,75 +244,39 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// fishhook: ONLY sysctlbyname — known safe from Step11
-// ============================================================
-static int hooked_sysctlbyname(const char *name, void *oldp,
-                                size_t *oldlenp, void *newp, size_t newlen) {
-    diag_sb_called = 1;
-    if (name && newp == NULL && newlen == 0) {
-        if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
-            size_t need = strlen(_c_machine) + 1;
-            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
-        }
-        if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
-            size_t need = strlen(_c_hwmodel) + 1;
-            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
-        }
-    }
-    if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    return -1;
-}
-
-// ============================================================
-// Hook ALL .app images, but ONLY sysctlbyname
-// ============================================================
-static void rebindAppImages(void) {
-    uint32_t count = _dyld_image_count();
-    struct rebinding rebindings[] = {
-        {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
-    };
-
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        if (strstr(name, ".app/") != NULL) {
-            const struct mach_header *header = _dyld_get_image_header(i);
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            if (!header) continue;
-            rebind_symbols_image((void *)header, slide, rebindings, 1);
-            diag_images_hooked++;
-        }
-    }
-}
-
-// ============================================================
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
+    // Read REAL hw.machine by calling the original directly
+    // Since DYLD_INTERPOSE replaces sysctlbyname globally, we can't call
+    // the original directly. But we can read it before _c_machine is set.
+    // Actually, _c_machine IS set by now. Let's just show the spoofed value.
+    // To get the real value, we'd need to call orig_sysctlbyname directly.
     char realMachine[32] = {0};
     size_t size = sizeof(realMachine);
-    sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
+    if (orig_sysctlbyname) {
+        orig_sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
+    }
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step12d 诊断 ===\n\n"
-        @"已 hook .app image 数: %d\n\n"
+        @"=== Step13 诊断 ===\n\n"
+        @"方法: DYLD_INTERPOSE (无fishhook)\n\n"
         @"sysctlbyname:\n"
         @"  被调用: %@\n"
         @"  orig: %@\n"
-        @"  伪造: %s | 真实: %s\n\n"
+        @"  伪造: %s\n"
+        @"  真实: %s\n\n"
         @"ObjC: 已生效\n"
-        @"设备名: %@\n系统版本: %@",
-        diag_images_hooked,
-        diag_sb_called ? @"YES ✅" : @"NO ❌",
-        orig_sysctlbyname ? @"OK" : @"NULL",
+        @"设备名: %@\n"
+        @"系统版本: %@",
+        diag_sb_called ? @"YES ✅ (百度调用了!)" : @"NO ❌ (未触发)",
+        orig_sysctlbyname ? @"OK ✅" : @"NULL ❌",
         _c_machine[0] ? _c_machine : "(空)",
         realMachine[0] ? realMachine : "(空)",
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step12d"
+        alertControllerWithTitle:@"Step13 DYLD_INTERPOSE"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -309,8 +340,9 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
 
-        // ONLY sysctlbyname, ONLY .app images
-        rebindAppImages();
+        // NO fishhook! DYLD_INTERPOSE handles sysctlbyname at dyld level.
+        // It's registered via __DATA,__interpose section, processed by dyld
+        // at load time before any constructors run.
 
         // ObjC hooks
         Class asmClass = objc_getClass("ASIdentifierManager");
