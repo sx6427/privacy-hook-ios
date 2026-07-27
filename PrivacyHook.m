@@ -273,7 +273,7 @@ static void my_defaults_set_object(id self, SEL _cmd, id value, NSString *key) {
             } else if ([value isKindOfClass:[NSNumber class]]) {
                 valStr = [value stringValue];
             } else {
-                valStr = [value className];
+                valStr = NSStringFromClass([value class]);
             }
             NSString *entry = [NSString stringWithFormat:@"%@ = %@", key, valStr];
             @synchronized(diag_defaults) {
