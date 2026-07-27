@@ -553,28 +553,58 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
+    // Read ALL UserDefaults keys after Baidu has had time to write
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDictionary *allDict = [defaults dictionaryRepresentation];
+
+    NSMutableArray *baiduKeys = [NSMutableArray array];
+    for (NSString *key in allDict) {
+        // Skip system and our own keys
+        if ([key hasPrefix:@"AKService"]) continue;
+        if ([key hasPrefix:@"Apple"]) continue;
+        if ([key hasPrefix:@"NS"]) continue;
+        if ([key hasPrefix:@"com.apple"]) continue;
+        if ([key hasPrefix:@"ITF"]) continue;
+        if ([key hasPrefix:@"MSV"]) continue;
+        if ([key hasPrefix:@"WebKit"]) continue;
+        if ([key hasPrefix:@"CFUser"]) continue;
+        if ([key hasPrefix:@"pkc"]) continue;
+        if ([key hasPrefix:@"BaiduBox.cfg"]) continue;
+
+        id val = allDict[key];
+        NSString *valStr;
+        if ([val isKindOfClass:[NSString class]]) {
+            valStr = val;
+            if (valStr.length > 60) valStr = [valStr substringToIndex:60];
+        } else if ([val isKindOfClass:[NSNumber class]]) {
+            valStr = [val stringValue];
+        } else {
+            valStr = [NSString stringWithFormat:@"%@", [val class]];
+        }
+        NSString *entry = [NSString stringWithFormat:@"%@ = %@", key, valStr];
+        if (entry.length > 100) entry = [entry substringToIndex:100];
+        [baiduKeys addObject:entry];
+    }
+
+    NSString *report = baiduKeys.count > 0 ?
+        [baiduKeys componentsJoinedByString:@"\n"] : @"(empty)";
+
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step23 清理UD ===\n\n"
-        @"设备: %s\n"
-        @"内存: %lluGB  CPU: %d核\n"
-        @"磁盘: %lluGB/%lluGB\n"
-        @"系统: %@\n"
-        @"设备名: %@\n"
-        @"IDFA: %@\n"
-        @"IDFV: %@",
+        @"=== Step24 UD诊断 ===\n\n"
+        @"清理后百度写入的key(%d):\n%@\n\n"
+        @"设备: %s\n系统: %@",
+        (int)baiduKeys.count, report,
         _c_machine[0] ? _c_machine : "(空)",
-        _spoof_physicalMemory / (1024*1024*1024), (int)_spoof_processorCount,
-        _spoof_diskTotal / (1024*1024*1024), _spoof_diskFree / (1024*1024*1024),
-        _spoofedSysVersion, _spoofedDeviceName,
-        _spoofedIDFA, _spoofedIDFV];
+        _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step23"
+        alertControllerWithTitle:@"Step24"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+    // 15 second delay — let Baidu write its keys first
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
