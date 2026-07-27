@@ -1,16 +1,15 @@
 //
-//  PrivacyHook.m — Step 14: DYLD_INTERPOSE for ALL C functions
+//  PrivacyHook.m — Step 15: Keychain spy + all interpose
 //
-//  Step13b PROVEN: DYLD_INTERPOSE works, no crash!
-//  But sysctlbyname only called 1 time → Baidu uses other methods.
+//  Step14 result: ALL C functions 0 calls!
+//  sysctlbyname=0, sysctl=0, IORegistry=0, getifaddrs=0
 //
-//  Step14: Add interpose for:
-//    - sysctlbyname ✅ (from Step13b)
-//    - sysctl (numeric ID) — NEW
-//    - IORegistryEntryCreateCFProperty (UUID/Serial) — NEW
-//    - getifaddrs (MAC address) — NEW
+//  Baidu does NOT use C functions for device ID.
+//  Most likely: Baidu stores its own device_id in Keychain.
 //
-//  All use direct call (no orig pointer) — proven safe in Step13b.
+//  Step15: Hook SecItemAdd/SecItemCopyMatching/SecItemUpdate
+//  to see what Baidu reads/writes from keychain.
+//  Also hook NSUserDefaults to see what device IDs are stored.
 //
 
 #import <Foundation/Foundation.h>
@@ -25,7 +24,6 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <IOKit/IOKitLib.h>
 #import <ifaddrs.h>
-#import <net/if.h>
 #import <mach-o/dyld.h>
 
 #define NSLog(...)
@@ -33,13 +31,17 @@
 // ============================================================
 // Diagnostic counters
 // ============================================================
-static volatile int diag_sbn_called = 0;    // sysctlbyname
-static volatile int diag_sbn_intercepted = 0;
-static volatile int diag_sc_called = 0;     // sysctl (numeric)
-static volatile int diag_sc_intercepted = 0;
-static volatile int diag_iok_called = 0;    // IORegistryEntry
-static volatile int diag_iok_intercepted = 0;
-static volatile int diag_gifa_called = 0;   // getifaddrs
+static volatile int diag_sbn_called = 0;
+static volatile int diag_sc_called = 0;
+static volatile int diag_iok_called = 0;
+static volatile int diag_gifa_called = 0;
+static volatile int diag_sec_add = 0;
+static volatile int diag_sec_copy = 0;
+static volatile int diag_sec_update = 0;
+static volatile int diag_sec_delete = 0;
+
+static NSMutableArray *diag_keychain_keys = nil;
+static NSMutableArray *diag_defaults_keys = nil;
 
 // ============================================================
 // Spoofed values
@@ -57,7 +59,7 @@ static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
 // ============================================================
-// DYLD_INTERPOSE macros
+// DYLD_INTERPOSE
 // ============================================================
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
@@ -70,118 +72,108 @@ static char _c_platformSerial[32] = {0};
   };
 
 // ============================================================
-// Hook: sysctlbyname (string name)
+// C function hooks (same as Step14, keep for completeness)
 // ============================================================
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp, size_t newlen) {
     diag_sbn_called++;
-
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
-            diag_sbn_intercepted++;
             size_t need = strlen(_c_machine) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_machine, need);
-                *oldlenp = need;
-                return 0;
-            }
+            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
         }
         if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
-            diag_sbn_intercepted++;
             size_t need = strlen(_c_hwmodel) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_hwmodel, need);
-                *oldlenp = need;
-                return 0;
-            }
-        }
-        if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
-            diag_sbn_intercepted++;
-            size_t need = strlen(_c_platformSerial) + 1;
-            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_platformSerial, need);
-                *oldlenp = need;
-                return 0;
-            }
+            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
         }
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
-// ============================================================
-// Hook: sysctl (numeric ID)
-// ============================================================
 static int my_sysctl(int *name, u_int namelen, void *oldp,
                      size_t *oldlenp, void *newp, size_t newlen) {
     diag_sc_called++;
-
-    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
-        // CTL_HW = 6
-        if (name[0] == 6) {
-            // HW_MACHINE = 1
-            if (name[1] == 1 && _c_machine[0] != 0) {
-                diag_sc_intercepted++;
-                size_t need = strlen(_c_machine) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_machine, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-            }
-            // HW_MODEL = 2
-            if (name[1] == 2 && _c_hwmodel[0] != 0) {
-                diag_sc_intercepted++;
-                size_t need = strlen(_c_hwmodel) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_hwmodel, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-            }
-        }
-    }
     return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctl, sysctl);
 
-// ============================================================
-// Hook: IORegistryEntryCreateCFProperty
-// ============================================================
 static CFTypeRef my_IORegistryEntryCreateCFProperty(
     io_registry_entry_t entry, CFStringRef key,
     CFAllocatorRef allocator, IOOptionBits options) {
     diag_iok_called++;
-
     if (key && _c_platformUUID[0] != 0) {
-        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
-            diag_iok_intercepted++;
+        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo)
             return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
-        }
-        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
-            diag_iok_intercepted++;
+        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo)
             return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
-        }
     }
     return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
 }
 DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
 
-// ============================================================
-// Hook: getifaddrs (MAC address)
-// ============================================================
 static int my_getifaddrs(struct ifaddrs **ifap) {
     diag_gifa_called++;
-    // Return empty list — no MAC address leak
     *ifap = NULL;
     return 0;
 }
 DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
+
+// ============================================================
+// Keychain spy hooks — see what Baidu reads/writes
+// ============================================================
+static OSStatus my_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    diag_sec_add++;
+    if (attributes && diag_keychain_keys) {
+        CFStringRef acct = CFDictionaryGetValue(attributes, kSecAttrAccount);
+        CFStringRef svc = CFDictionaryGetValue(attributes, kSecAttrService);
+        CFStringRef label = CFDictionaryGetValue(attributes, kSecAttrLabel);
+        NSString *key = [NSString stringWithFormat:@"ADD: acct=%@ svc=%@ label=%@",
+                         acct ? (__bridge NSString *)acct : @"(null)",
+                         svc ? (__bridge NSString *)svc : @"(null)",
+                         label ? (__bridge NSString *)label : @"(null)"];
+        @synchronized(diag_keychain_keys) { [diag_keychain_keys addObject:key]; }
+    }
+    return SecItemAdd(attributes, result);
+}
+DYLD_INTERPOSE(my_SecItemAdd, SecItemAdd);
+
+static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    diag_sec_copy++;
+    if (query && diag_keychain_keys) {
+        CFStringRef acct = CFDictionaryGetValue(query, kSecAttrAccount);
+        CFStringRef svc = CFDictionaryGetValue(query, kSecAttrService);
+        CFStringRef label = CFDictionaryGetValue(query, kSecAttrLabel);
+        NSString *key = [NSString stringWithFormat:@"READ: acct=%@ svc=%@",
+                         acct ? (__bridge NSString *)acct : @"*",
+                         svc ? (__bridge NSString *)svc : @"*"];
+        @synchronized(diag_keychain_keys) { [diag_keychain_keys addObject:key]; }
+    }
+    return SecItemCopyMatching(query, result);
+}
+DYLD_INTERPOSE(my_SecItemCopyMatching, SecItemCopyMatching);
+
+static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    diag_sec_update++;
+    if (query && diag_keychain_keys) {
+        CFStringRef acct = CFDictionaryGetValue(query, kSecAttrAccount);
+        CFStringRef svc = CFDictionaryGetValue(query, kSecAttrService);
+        NSString *key = [NSString stringWithFormat:@"UPD: acct=%@ svc=%@",
+                         acct ? (__bridge NSString *)acct : @"*",
+                         svc ? (__bridge NSString *)svc : @"*"];
+        @synchronized(diag_keychain_keys) { [diag_keychain_keys addObject:key]; }
+    }
+    return SecItemUpdate(query, attributesToUpdate);
+}
+DYLD_INTERPOSE(my_SecItemUpdate, SecItemUpdate);
+
+static OSStatus my_SecItemDelete(CFDictionaryRef query) {
+    diag_sec_delete++;
+    return SecItemDelete(query);
+}
+DYLD_INTERPOSE(my_SecItemDelete, SecItemDelete);
 
 // ============================================================
 // Spoofed value initialization
@@ -301,20 +293,10 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     }
 }
 
-static void clearKeychainOnce(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"kc23");
-    if ([defaults boolForKey:key]) return;
-    NSArray *secItemClasses = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
-        (__bridge id)kSecClassKey, (__bridge id)kSecClassCertificate, (__bridge id)kSecClassIdentity];
-    for (id secItemClass in secItemClasses) {
-        NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
-        SecItemDelete((__bridge CFDictionaryRef)query);
-    }
-    [defaults setBool:YES forKey:key];
-    [defaults synchronize];
-}
-
+// ============================================================
+// Data clearing — DON'T clear keychain this time!
+// We want to see what's in it via the spy hooks.
+// ============================================================
 static void clearSharedCookies(void) {
     NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
     NSArray *cookies = [[storage cookies] copy];
@@ -347,35 +329,39 @@ static void clearWebViewData(void) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
+    NSString *kcReport = @"(none)";
+    if (diag_keychain_keys && diag_keychain_keys.count > 0) {
+        @synchronized(diag_keychain_keys) {
+            // Show up to 15 entries
+            NSInteger max = MIN(diag_keychain_keys.count, 15);
+            kcReport = [[diag_keychain_keys subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
+            if (diag_keychain_keys.count > max) {
+                kcReport = [kcReport stringByAppendingFormat:@"\n... +%d more", (int)(diag_keychain_keys.count - max)];
+            }
+        }
+    }
+
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step14 诊断 ===\n\n"
-        @"sysctlbyname:\n"
-        @"  调用:%d 拦截:%d\n"
-        @"  伪造: %s\n\n"
-        @"sysctl(数字ID):\n"
-        @"  调用:%d 拦截:%d\n\n"
-        @"IORegistryEntry:\n"
-        @"  调用:%d 拦截:%d\n"
-        @"  伪造UUID: %s\n\n"
-        @"getifaddrs:\n"
-        @"  调用:%d\n\n"
+        @"=== Step15 Keychain Spy ===\n\n"
+        @"C函数: sbn=%d sc=%d iok=%d gifa=%d\n\n"
+        @"Keychain操作:\n"
+        @"  Add: %d  Read: %d\n"
+        @"  Update: %d  Delete: %d\n\n"
+        @"Keychain记录:\n%@\n\n"
         @"ObjC: 已生效\n"
         @"设备名: %@\n系统版本: %@",
-        diag_sbn_called, diag_sbn_intercepted,
-        _c_machine[0] ? _c_machine : "(空)",
-        diag_sc_called, diag_sc_intercepted,
-        diag_iok_called, diag_iok_intercepted,
-        _c_platformUUID[0] ? _c_platformUUID : "(空)",
-        diag_gifa_called,
+        diag_sbn_called, diag_sc_called, diag_iok_called, diag_gifa_called,
+        diag_sec_add, diag_sec_copy, diag_sec_update, diag_sec_delete,
+        kcReport,
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step14 全interpose"
+        alertControllerWithTitle:@"Step15"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -422,6 +408,8 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
+        diag_keychain_keys = [NSMutableArray new];
+
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
@@ -430,7 +418,8 @@ static void initPrivacyHook(void) {
         initSpoofedIOKitInfo();
         initSpoofedUserAgent();
 
-        clearKeychainOnce();
+        // DON'T clear keychain — we want to spy on it!
+        // clearKeychainOnce();
         clearSharedCookies();
         clearURLCache();
         clearWebViewData();
