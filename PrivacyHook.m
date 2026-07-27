@@ -1,9 +1,14 @@
 //
-//  PrivacyHook.m — Step 22: Network interceptor
+//  PrivacyHook.m — Step 19: Complete device fingerprint spoofing
 //
-//  Based on Step19 (all ObjC hooks, proven safe)
-//  Adds: NSURLProtocol to intercept ALL HTTP requests
-//  Purpose: See what device info Baidu sends in request headers/body
+//  Based on Step14 (proven safe, no crash)
+//  Adds: UIScreen, NSProcessInfo, NSFileManager hooks
+//
+//  Problem: We spoofed device model (e.g. iPhone14,5) but screen resolution,
+//  RAM, disk size still showed real device values (iPhone11,2).
+//  Baidu sees mismatch → same device.
+//
+//  Fix: Spoof ALL ObjC-accessible device info to match the fake model.
 //
 
 #import <Foundation/Foundation.h>
@@ -38,6 +43,7 @@ static char _c_hwmodel[32] = {0};
 static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
+// Screen + hardware specs (must match spoofed device model)
 static CGFloat _spoof_boundsW = 0, _spoof_boundsH = 0;
 static CGFloat _spoof_nativeW = 0, _spoof_nativeH = 0;
 static CGFloat _spoof_scale = 0, _spoof_nativeScale = 0;
@@ -48,13 +54,7 @@ static uint64_t _spoof_diskTotal = 0;
 static uint64_t _spoof_diskFree = 0;
 
 // ============================================================
-// Network request capture
-// ============================================================
-static NSMutableArray *capturedUrls = nil;
-static NSMutableArray *capturedHeaders = nil;
-
-// ============================================================
-// DYLD_INTERPOSE (kept from Step14, works for our own calls)
+// DYLD_INTERPOSE macros (kept from Step14, works for our own calls)
 // ============================================================
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
@@ -66,43 +66,100 @@ static NSMutableArray *capturedHeaders = nil;
       (const void *)(unsigned long)&_replacee, \
   };
 
+// ============================================================
+// Hook: sysctlbyname
+// ============================================================
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp, size_t newlen) {
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_machine, need);
+                *oldlenp = need;
+                return 0;
+            }
         }
         if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
             size_t need = strlen(_c_hwmodel) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_hwmodel, need);
+                *oldlenp = need;
+                return 0;
+            }
         }
         if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
             size_t need = strlen(_c_platformSerial) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_platformSerial, need); *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_platformSerial, need);
+                *oldlenp = need;
+                return 0;
+            }
         }
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
+// ============================================================
+// Hook: sysctl (numeric ID)
+// ============================================================
+static int my_sysctl(int *name, u_int namelen, void *oldp,
+                     size_t *oldlenp, void *newp, size_t newlen) {
+    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
+        if (name[0] == 6) {  // CTL_HW
+            if (name[1] == 1 && _c_machine[0] != 0) {  // HW_MACHINE
+                size_t need = strlen(_c_machine) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_machine, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+            if (name[1] == 2 && _c_hwmodel[0] != 0) {  // HW_MODEL
+                size_t need = strlen(_c_hwmodel) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_hwmodel, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+        }
+    }
+    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(my_sysctl, sysctl);
+
+// ============================================================
+// Hook: IORegistryEntryCreateCFProperty
+// ============================================================
 static CFTypeRef my_IORegistryEntryCreateCFProperty(
     io_registry_entry_t entry, CFStringRef key,
     CFAllocatorRef allocator, IOOptionBits options) {
     if (key && _c_platformUUID[0] != 0) {
-        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo)
+        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
             return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
-        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo)
+        }
+        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
             return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
+        }
     }
     return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
 }
 DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
 
-static int my_getifaddrs(struct ifaddrs **ifap) { *ifap = NULL; return 0; }
+// ============================================================
+// Hook: getifaddrs
+// ============================================================
+static int my_getifaddrs(struct ifaddrs **ifap) {
+    *ifap = NULL;
+    return 0;
+}
 DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
 
 // ============================================================
@@ -151,75 +208,102 @@ static NSString *getOrCreateSpoofedSysVersion(void) {
     return v;
 }
 
+// Device specs table: machine|boundsW|boundsH|nativeW|nativeH|scale|nativeScale|maxFps|memGB|cpuCount
 static void initSpoofedHWInfoC(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *key = kKey(@"hw");
     NSString *saved = [defaults stringForKey:key];
     if (!saved) {
-        NSArray *models = @[@"iPhone14,5", @"iPhone14,2", @"iPhone14,3",
-            @"iPhone14,7", @"iPhone14,8", @"iPhone15,2", @"iPhone15,3",
-            @"iPhone15,4", @"iPhone15,5", @"iPhone16,1", @"iPhone16,2"];
+        NSArray *models = @[
+            @"iPhone14,5", @"iPhone14,2", @"iPhone14,3",
+            @"iPhone14,7", @"iPhone14,8", @"iPhone15,2",
+            @"iPhone15,3", @"iPhone15,4", @"iPhone15,5",
+            @"iPhone16,1", @"iPhone16,2",
+        ];
         saved = models[arc4random_uniform((uint32_t)models.count)];
         [defaults setObject:saved forKey:key];
         [defaults synchronize];
     }
     strlcpy(_c_machine, [saved UTF8String], sizeof(_c_machine));
 
-    typedef struct { const char *machine; CGFloat bw, bh, nw, nh, scale, nscale; NSInteger fps; uint64_t memGB; NSUInteger cpu; } DeviceSpec;
+    // Lookup screen + hardware specs for this device model
+    typedef struct {
+        const char *machine;
+        CGFloat bw, bh, nw, nh, scale, nscale;
+        NSInteger fps;
+        uint64_t memGB;
+        NSUInteger cpu;
+    } DeviceSpec;
+
     DeviceSpec specs[] = {
-        {"iPhone14,5", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},
-        {"iPhone14,2", 390, 844, 1170, 2533, 3.0, 3.0, 120, 6, 6},
-        {"iPhone14,3", 428, 926, 1284, 2778, 3.0, 3.0, 120, 6, 6},
-        {"iPhone14,7", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},
-        {"iPhone14,8", 428, 926, 1284, 2778, 3.0, 3.0, 60, 4, 6},
-        {"iPhone15,2", 393, 852, 1179, 2556, 3.0, 3.0, 120, 6, 6},
-        {"iPhone15,3", 430, 932, 1290, 2796, 3.0, 3.0, 120, 6, 6},
-        {"iPhone15,4", 393, 852, 1179, 2556, 3.0, 3.0, 60, 6, 6},
-        {"iPhone15,5", 430, 932, 1290, 2796, 3.0, 3.0, 60, 6, 6},
-        {"iPhone16,1", 393, 852, 1179, 2556, 3.0, 3.0, 120, 8, 6},
-        {"iPhone16,2", 430, 932, 1290, 2796, 3.0, 3.0, 120, 8, 6},
+        {"iPhone14,5", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},   // iPhone 13
+        {"iPhone14,2", 390, 844, 1170, 2533, 3.0, 3.0, 120, 6, 6},  // iPhone 13 Pro
+        {"iPhone14,3", 428, 926, 1284, 2778, 3.0, 3.0, 120, 6, 6},  // iPhone 13 Pro Max
+        {"iPhone14,7", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},   // iPhone 14
+        {"iPhone14,8", 428, 926, 1284, 2778, 3.0, 3.0, 60, 4, 6},   // iPhone 14 Plus
+        {"iPhone15,2", 393, 852, 1179, 2556, 3.0, 3.0, 120, 6, 6},  // iPhone 14 Pro
+        {"iPhone15,3", 430, 932, 1290, 2796, 3.0, 3.0, 120, 6, 6},  // iPhone 14 Pro Max
+        {"iPhone15,4", 393, 852, 1179, 2556, 3.0, 3.0, 60, 6, 6},   // iPhone 15
+        {"iPhone15,5", 430, 932, 1290, 2796, 3.0, 3.0, 60, 6, 6},   // iPhone 15 Plus
+        {"iPhone16,1", 393, 852, 1179, 2556, 3.0, 3.0, 120, 8, 6},  // iPhone 15 Pro
+        {"iPhone16,2", 430, 932, 1290, 2796, 3.0, 3.0, 120, 8, 6},  // iPhone 15 Pro Max
     };
+
     const char *machine = [saved UTF8String];
     BOOL found = NO;
     for (int i = 0; i < sizeof(specs)/sizeof(specs[0]); i++) {
         if (strcmp(machine, specs[i].machine) == 0) {
-            _spoof_boundsW = specs[i].bw; _spoof_boundsH = specs[i].bh;
-            _spoof_nativeW = specs[i].nw; _spoof_nativeH = specs[i].nh;
-            _spoof_scale = specs[i].scale; _spoof_nativeScale = specs[i].nscale;
+            _spoof_boundsW = specs[i].bw;
+            _spoof_boundsH = specs[i].bh;
+            _spoof_nativeW = specs[i].nw;
+            _spoof_nativeH = specs[i].nh;
+            _spoof_scale = specs[i].scale;
+            _spoof_nativeScale = specs[i].nscale;
             _spoof_maxFps = specs[i].fps;
             _spoof_physicalMemory = specs[i].memGB * 1024ULL * 1024ULL * 1024ULL;
             _spoof_processorCount = specs[i].cpu;
-            found = YES; break;
+            found = YES;
+            break;
         }
     }
     if (!found) {
-        _spoof_boundsW = 393; _spoof_boundsH = 852; _spoof_nativeW = 1179; _spoof_nativeH = 2556;
-        _spoof_scale = 3.0; _spoof_nativeScale = 3.0; _spoof_maxFps = 120;
-        _spoof_physicalMemory = 6ULL * 1024 * 1024 * 1024; _spoof_processorCount = 6;
+        _spoof_boundsW = 393; _spoof_boundsH = 852;
+        _spoof_nativeW = 1179; _spoof_nativeH = 2556;
+        _spoof_scale = 3.0; _spoof_nativeScale = 3.0;
+        _spoof_maxFps = 120;
+        _spoof_physicalMemory = 6ULL * 1024 * 1024 * 1024;
+        _spoof_processorCount = 6;
     }
 
+    // hw.model
     NSString *hwmodelKey = kKey(@"hwm");
     NSString *hwmodel = [defaults stringForKey:hwmodelKey];
     if (!hwmodel) {
-        NSArray *models = @[@"D27AP", @"D63AP", @"D64AP", @"D37AP", @"D38AP", @"D83AP", @"D84AP", @"D93AP", @"D94AP"];
+        NSArray *models = @[@"D27AP", @"D63AP", @"D64AP", @"D37AP", @"D38AP",
+                            @"D83AP", @"D84AP", @"D93AP", @"D94AP"];
         hwmodel = models[arc4random_uniform((uint32_t)models.count)];
-        [defaults setObject:hwmodel forKey:hwmodelKey]; [defaults synchronize];
+        [defaults setObject:hwmodel forKey:hwmodelKey];
+        [defaults synchronize];
     }
     strlcpy(_c_hwmodel, [hwmodel UTF8String], sizeof(_c_hwmodel));
 
+    // Disk size: random 128/256/512 GB
     NSString *diskKey = kKey(@"disk");
     uint64_t savedDisk = [[defaults stringForKey:diskKey] longLongValue];
     if (savedDisk == 0) {
         uint64_t sizes[] = {128, 256, 512};
         savedDisk = sizes[arc4random_uniform(3)];
-        [defaults setObject:[NSString stringWithFormat:@"%llu", savedDisk] forKey:diskKey]; [defaults synchronize];
+        [defaults setObject:[NSString stringWithFormat:@"%llu", savedDisk] forKey:diskKey];
+        [defaults synchronize];
     }
     _spoof_diskTotal = savedDisk * 1024ULL * 1024 * 1024;
+    // Random free space: 30%-80% of total
     NSString *diskFreeKey = kKey(@"diskf");
     uint64_t savedFree = [[defaults stringForKey:diskFreeKey] longLongValue];
     if (savedFree == 0) {
         savedFree = _spoof_diskTotal * (30 + arc4random_uniform(50)) / 100;
-        [defaults setObject:[NSString stringWithFormat:@"%llu", savedFree] forKey:diskFreeKey]; [defaults synchronize];
+        [defaults setObject:[NSString stringWithFormat:@"%llu", savedFree] forKey:diskFreeKey];
+        [defaults synchronize];
     }
     _spoof_diskFree = savedFree;
 }
@@ -228,7 +312,11 @@ static void initSpoofedIOKitInfo(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *uuidKey = kKey(@"iouuid");
     NSString *savedUUID = [defaults stringForKey:uuidKey];
-    if (!savedUUID) { savedUUID = [[NSUUID UUID] UUIDString]; [defaults setObject:savedUUID forKey:uuidKey]; [defaults synchronize]; }
+    if (!savedUUID) {
+        savedUUID = [[NSUUID UUID] UUIDString];
+        [defaults setObject:savedUUID forKey:uuidKey];
+        [defaults synchronize];
+    }
     strlcpy(_c_platformUUID, [savedUUID UTF8String], sizeof(_c_platformUUID));
     NSString *serialKey = kKey(@"iosn");
     NSString *savedSerial = [defaults stringForKey:serialKey];
@@ -237,7 +325,8 @@ static void initSpoofedIOKitInfo(void) {
         char serial[13] = {0};
         for (int i = 0; i < 12; i++) serial[i] = chars[arc4random_uniform(33)];
         savedSerial = [NSString stringWithUTF8String:serial];
-        [defaults setObject:savedSerial forKey:serialKey]; [defaults synchronize];
+        [defaults setObject:savedSerial forKey:serialKey];
+        [defaults synchronize];
     }
     strlcpy(_c_platformSerial, [savedSerial UTF8String], sizeof(_c_platformSerial));
 }
@@ -254,13 +343,19 @@ static void initSpoofedUserAgent(void) {
 
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
-    if (method) { const char *t = types ?: method_getTypeEncoding(method); class_replaceMethod(cls, sel, newImp, t); }
+    if (method) {
+        const char *existingTypes = types ?: method_getTypeEncoding(method);
+        class_replaceMethod(cls, sel, newImp, existingTypes);
+    }
 }
 
 static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Class metaClass = object_getClass(cls);
     Method method = class_getClassMethod(cls, sel);
-    if (method) { const char *t = types ?: method_getTypeEncoding(method); class_replaceMethod(metaClass, sel, newImp, t); }
+    if (method) {
+        const char *existingTypes = types ?: method_getTypeEncoding(method);
+        class_replaceMethod(metaClass, sel, newImp, existingTypes);
+    }
 }
 
 static void clearKeychainOnce(void) {
@@ -273,7 +368,8 @@ static void clearKeychainOnce(void) {
         NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
         SecItemDelete((__bridge CFDictionaryRef)query);
     }
-    [defaults setBool:YES forKey:key]; [defaults synchronize];
+    [defaults setBool:YES forKey:key];
+    [defaults synchronize];
 }
 
 static void clearSharedCookies(void) {
@@ -305,88 +401,77 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// NSURLProtocol — intercept ALL HTTP requests
+// Wipe Baidu's stored identifiers from UserDefaults
+// CRITICAL: Baidu stores device_id, cuid, etc in UserDefaults.
+// Without wiping these, Baidu recognizes the same device across
+// reinstalls because UserDefaults persists with the same Bundle ID.
 // ============================================================
-@interface SpyURLProtocol : NSURLProtocol
-@end
+static void clearBaiduUserDefaults(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 
-@implementation SpyURLProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSURL *url = request.URL;
-    if (!url || !url.host) return NO;
-    NSString *host = url.host.lowercaseString;
-    // Only capture baidu-related requests
-    if ([host containsString:@"baidu"] || [host containsString:@"bdstatic"] ||
-        [host containsString:@"bdimg"] || [host containsString:@"bdturing"] ||
-        [host containsString:@"hm.baidu"]) {
-        @synchronized(capturedUrls) {
-            if (capturedUrls.count < 20) {
-                NSString *entry = [NSString stringWithFormat:@"%@ %@",
-                                   request.HTTPMethod ?: @"GET",
-                                   url.absoluteString];
-                if (entry.length > 200) entry = [entry substringToIndex:200];
-                [capturedUrls addObject:entry];
-
-                // Capture interesting headers
-                NSDictionary *headers = request.allHTTPHeaderFields;
-                if (headers) {
-                    NSMutableArray *interestingHeaders = [NSMutableArray array];
-                    for (NSString *key in headers) {
-                        NSString *lk = key.lowercaseString;
-                        // Capture device-related headers
-                        if ([lk containsString:@"device"] || [lk containsString:@"ua"] ||
-                            [lk containsString:@"idfa"] || [lk containsString:@"idfv"] ||
-                            [lk containsString:@"mac"] || [lk containsString:@"imei"] ||
-                            [lk containsString:@"android"] || [lk containsString:@"model"] ||
-                            [lk containsString:@"brand"] || [lk containsString:@"version"] ||
-                            [lk containsString:@"user-agent"] || [lk containsString:@"x-"] ||
-                            [lk containsString:@"bd-"] || [lk containsString:@"cuid"] ||
-                            [lk containsString:@"channel"]) {
-                            NSString *val = headers[key];
-                            if (val.length > 80) val = [val substringToIndex:80];
-                            [interestingHeaders addObject:[NSString stringWithFormat:@"%@: %@", key, val]];
-                        }
-                    }
-                    if (interestingHeaders.count > 0) {
-                        [capturedUrls addObjectsFromArray:interestingHeaders];
-                    }
-                }
-            }
+    // Save our own config keys
+    NSMutableDictionary *myConfig = [NSMutableDictionary dictionary];
+    NSString *cfgPrefix = @"BaiduBox.cfg.";
+    NSDictionary *allDict = [defaults dictionaryRepresentation];
+    for (NSString *key in allDict) {
+        if ([key hasPrefix:cfgPrefix]) {
+            myConfig[key] = allDict[key];
         }
     }
-    return NO; // Don't actually intercept, just observe
-}
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
+    // Remove ALL keys from UserDefaults
+    // This removes Baidu's stored device_id, cuid, bduss, login tokens, etc.
+    for (NSString *key in allDict) {
+        // Skip system keys
+        if ([key hasPrefix:@"AKService"]) continue;
+        if ([key hasPrefix:@"Apple"]) continue;
+        if ([key hasPrefix:@"NS"]) continue;
+        if ([key hasPrefix:@"com.apple"]) continue;
+        if ([key hasPrefix:@"ITF"]) continue;
+        if ([key hasPrefix:@"MSV"]) continue;
+        if ([key hasPrefix:@"WebKit"]) continue;
+        if ([key hasPrefix:@"CFUser"]) continue;
+        if ([key hasPrefix:@"pkc"]) continue;
+        [defaults removeObjectForKey:key];
+    }
 
-@end
+    // Restore our own config
+    for (NSString *key in myConfig) {
+        [defaults setObject:myConfig[key] forKey:key];
+    }
+
+    // Reset the keychain clear flag so it runs again
+    [defaults setBool:NO forKey:cfgPrefix ? @"BaiduBox.cfg.kc23" : @"x"];
+    [defaults synchronize];
+}
 
 // ============================================================
-// UIScreen hooks
+// UIScreen hooks — screen resolution spoofing
 // ============================================================
 static IMP orig_screen_bounds = NULL;
 static CGRect my_screen_bounds(id self, SEL _cmd) {
     if (_spoof_boundsW > 0) return CGRectMake(0, 0, _spoof_boundsW, _spoof_boundsH);
     return ((CGRect(*)(id, SEL))orig_screen_bounds)(self, _cmd);
 }
+
 static IMP orig_screen_nativeBounds = NULL;
 static CGRect my_screen_nativeBounds(id self, SEL _cmd) {
     if (_spoof_nativeW > 0) return CGRectMake(0, 0, _spoof_nativeW, _spoof_nativeH);
     return ((CGRect(*)(id, SEL))orig_screen_nativeBounds)(self, _cmd);
 }
+
 static IMP orig_screen_scale = NULL;
 static CGFloat my_screen_scale(id self, SEL _cmd) {
     if (_spoof_scale > 0) return _spoof_scale;
     return ((CGFloat(*)(id, SEL))orig_screen_scale)(self, _cmd);
 }
+
 static IMP orig_screen_nativeScale = NULL;
 static CGFloat my_screen_nativeScale(id self, SEL _cmd) {
     if (_spoof_nativeScale > 0) return _spoof_nativeScale;
     return ((CGFloat(*)(id, SEL))orig_screen_nativeScale)(self, _cmd);
 }
+
 static IMP orig_screen_maxFps = NULL;
 static NSInteger my_screen_maxFps(id self, SEL _cmd) {
     if (_spoof_maxFps > 0) return _spoof_maxFps;
@@ -394,7 +479,7 @@ static NSInteger my_screen_maxFps(id self, SEL _cmd) {
 }
 
 // ============================================================
-// NSProcessInfo hooks
+// NSProcessInfo hooks — RAM, CPU, OS version
 // ============================================================
 static IMP orig_pi_osVersion = NULL;
 static NSOperatingSystemVersion my_pi_osVersion(id self, SEL _cmd) {
@@ -408,11 +493,13 @@ static NSOperatingSystemVersion my_pi_osVersion(id self, SEL _cmd) {
     }
     return ((NSOperatingSystemVersion(*)(id, SEL))orig_pi_osVersion)(self, _cmd);
 }
+
 static IMP orig_pi_physMem = NULL;
 static uint64_t my_pi_physMem(id self, SEL _cmd) {
     if (_spoof_physicalMemory > 0) return _spoof_physicalMemory;
     return ((uint64_t(*)(id, SEL))orig_pi_physMem)(self, _cmd);
 }
+
 static IMP orig_pi_procCount = NULL;
 static NSUInteger my_pi_procCount(id self, SEL _cmd) {
     if (_spoof_processorCount > 0) return _spoof_processorCount;
@@ -420,7 +507,7 @@ static NSUInteger my_pi_procCount(id self, SEL _cmd) {
 }
 
 // ============================================================
-// NSFileManager hooks — disk space
+// NSFileManager hooks — disk space spoofing
 // ============================================================
 static IMP orig_fm_attrs = NULL;
 static NSDictionary *my_fm_attrs(id self, SEL _cmd, NSString *path, NSError **error) {
@@ -455,6 +542,7 @@ static id my_wk_init_coder(id self, SEL _cmd, id coder) {
 }
 
 static IMP orig_setValue = NULL;
+
 static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
     if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame && _spoofedUserAgent)
         value = _spoofedUserAgent;
@@ -462,31 +550,35 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 }
 
 // ============================================================
-// Diagnostic popup — 20s delay for network capture
+// Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    NSString *urlReport = @"(none)";
-    if (capturedUrls.count > 0) {
-        @synchronized(capturedUrls) {
-            urlReport = [capturedUrls componentsJoinedByString:@"\n"];
-        }
-    }
-
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step22 网络抓包 ===\n\n"
-        @"捕获百度请求(%d):\n%@\n\n"
-        @"设备: %s\n系统: %@",
-        (int)capturedUrls.count, urlReport,
+        @"=== Step23 清理UD ===\n\n"
+        @"设备: %s\n"
+        @"屏幕: %.0fx%.0f (native %.0fx%.0f)\n"
+        @"缩放: %.1f/%.1f  FPS: %d\n"
+        @"内存: %lluGB  CPU: %d核\n"
+        @"磁盘: %lluGB/%lluGB\n"
+        @"系统: %@\n"
+        @"设备名: %@\n"
+        @"IDFA: %@\n"
+        @"IDFV: %@",
         _c_machine[0] ? _c_machine : "(空)",
-        _spoofedSysVersion];
+        _spoof_boundsW, _spoof_boundsH, _spoof_nativeW, _spoof_nativeH,
+        _spoof_scale, _spoof_nativeScale, (int)_spoof_maxFps,
+        _spoof_physicalMemory / (1024*1024*1024), (int)_spoof_processorCount,
+        _spoof_diskTotal / (1024*1024*1024), _spoof_diskFree / (1024*1024*1024),
+        _spoofedSysVersion, _spoofedDeviceName,
+        _spoofedIDFA, _spoofedIDFV];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step22"
+        alertControllerWithTitle:@"Step23"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -505,8 +597,6 @@ static void showDiagnosticPopup(void) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        capturedUrls = [NSMutableArray new];
-
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
@@ -519,13 +609,11 @@ static void initPrivacyHook(void) {
         clearSharedCookies();
         clearURLCache();
         clearWebViewData();
-
-        // === Register NSURLProtocol to intercept ALL HTTP requests ===
-        // This intercepts NSURLSession, NSURLConnection, and UIWebView
-        [NSURLProtocol registerClass:[SpyURLProtocol class]];
+        clearBaiduUserDefaults();
 
         // === ObjC hooks ===
 
+        // ASIdentifierManager (IDFA)
         Class asmClass = objc_getClass("ASIdentifierManager");
         if (asmClass) {
             Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
@@ -534,12 +622,14 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; }); hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled), imp, method_getTypeEncoding(m)); }
         }
 
+        // ATTrackingManager
         Class attClass = objc_getClass("ATTrackingManager");
         if (attClass) {
             Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
             if (m) { IMP imp = imp_implementationWithBlock(^NSInteger(id s) { return 3; }); hookClassMethod(attClass, @selector(trackingAuthorizationStatus), imp, method_getTypeEncoding(m)); }
         }
 
+        // UIDevice
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
@@ -554,6 +644,7 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; }); hookInstanceMethod(uiDeviceClass, @selector(localizedModel), imp, method_getTypeEncoding(m)); }
         }
 
+        // UIScreen — screen resolution
         Class screenClass = objc_getClass("UIScreen");
         if (screenClass) {
             Method m = class_getInstanceMethod(screenClass, @selector(bounds));
@@ -568,6 +659,7 @@ static void initPrivacyHook(void) {
             if (m) { orig_screen_maxFps = method_getImplementation(m); class_replaceMethod(screenClass, @selector(maximumFramesPerSecond), (IMP)my_screen_maxFps, method_getTypeEncoding(m)); }
         }
 
+        // NSProcessInfo — RAM, CPU, OS version
         Class piClass = objc_getClass("NSProcessInfo");
         if (piClass) {
             Method m = class_getInstanceMethod(piClass, @selector(operatingSystemVersion));
@@ -578,12 +670,14 @@ static void initPrivacyHook(void) {
             if (m) { orig_pi_procCount = method_getImplementation(m); class_replaceMethod(piClass, @selector(processorCount), (IMP)my_pi_procCount, method_getTypeEncoding(m)); }
         }
 
+        // NSFileManager — disk space
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
             Method m = class_getInstanceMethod(fmClass, @selector(attributesOfFileSystemForPath:error:));
             if (m) { orig_fm_attrs = method_getImplementation(m); class_replaceMethod(fmClass, @selector(attributesOfFileSystemForPath:error:), (IMP)my_fm_attrs, method_getTypeEncoding(m)); }
         }
 
+        // UIPasteboard
         Class pbClass = objc_getClass("UIPasteboard");
         if (pbClass) {
             Method m = class_getInstanceMethod(pbClass, @selector(string));
@@ -600,11 +694,13 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^BOOL(id s, NSArray *t) { return NO; }); hookInstanceMethod(pbClass, @selector(containsPasteboardTypes:), imp, method_getTypeEncoding(m)); }
         }
 
+        // NSFileManager containerURL
         if (fmClass) {
             Method m = class_getInstanceMethod(fmClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
             if (m) { IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *g) { return nil; }); hookInstanceMethod(fmClass, @selector(containerURLForSecurityApplicationGroupIdentifier:), imp, method_getTypeEncoding(m)); }
         }
 
+        // WKWebView
         Class wkClass = objc_getClass("WKWebView");
         if (wkClass) {
             Method m = class_getInstanceMethod(wkClass, @selector(customUserAgent));
@@ -615,6 +711,7 @@ static void initPrivacyHook(void) {
             if (m) { orig_wk_init_coder = method_getImplementation(m); class_replaceMethod(wkClass, @selector(initWithCoder:), (IMP)my_wk_init_coder, method_getTypeEncoding(m)); }
         }
 
+        // NSMutableURLRequest User-Agent
         Class reqClass = objc_getClass("NSMutableURLRequest");
         if (reqClass) {
             Method m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
