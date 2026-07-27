@@ -1,11 +1,10 @@
 //
-//  PrivacyHook.m — Step 4: Step3 + fishhook(sysctlbyname) + UIDevice model
+//  PrivacyHook.m — Step 4b: Step3 + UIDevice systemVersion (NO fishhook)
 //
-//  Complete device fingerprint spoofing:
-//    - IDFA, IDFV, device name (Step3)
-//    - sysctlbyname hw.machine / hw.model (fishhook)
-//    - UIDevice model / localizedModel / systemVersion
-//    - Keychain clear, cookie clear, pasteboard, app group (Step3)
+//  Full device fingerprint via ObjC swizzle only:
+//    - IDFA, IDFV, device name, systemVersion
+//    - Keychain clear, cookie clear, pasteboard, app group
+//    - NO fishhook (causes crash when hooking sysctlbyname)
 //    - NO Bundle ID spoof (causes icon disappearance)
 //
 
@@ -15,8 +14,6 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <sys/sysctl.h>
-#import "fishhook.h"
 
 #define NSLog(...)
 
@@ -26,13 +23,7 @@
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
-static NSString *_spoofedModel = nil;       // hw.machine e.g. "iPhone15,2"
-static NSString *_spoofedHWModel = nil;     // hw.model  e.g. "D83AP"
-static NSString *_spoofedSysVersion = nil;  // e.g. "17.4.1"
-
-// Common iPhone models + their hw.model board identifiers
-// Each clone picks a different entry for realistic-looking device diversity
-static NSDictionary *DEVICE_MODELS = nil;
+static NSString *_spoofedSysVersion = nil;
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -65,48 +56,18 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     return name;
 }
 
-// Pick a random device model and persist it per-clone
-static void initSpoofedHWInfo(void) {
+static NSString *getOrCreateSpoofedSysVersion(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(@"sv");
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
 
-    // Already assigned?
-    NSString *saved = [defaults stringForKey:kKey(@"hw")];
-    if (saved) {
-        NSArray *parts = [saved componentsSeparatedByString:@"|"];
-        if (parts.count >= 3) {
-            _spoofedModel = parts[0];
-            _spoofedHWModel = parts[1];
-            _spoofedSysVersion = parts[2];
-            return;
-        }
-    }
-
-    // iPhone models: hw.machine -> hw.model mapping
-    // Format: hw.machine (marketing) | hw.model (board) | typical iOS version
-    NSArray *models = @[
-        @"iPhone14,5|D27AP|17.4.1",   // iPhone 13
-        @"iPhone14,2|D63AP|17.4.1",   // iPhone 13 Pro
-        @"iPhone14,3|D64AP|17.3",     // iPhone 13 Pro Max
-        @"iPhone14,7|D37AP|17.4.1",   // iPhone 14
-        @"iPhone14,8|D38AP|17.4.1",   // iPhone 14 Plus
-        @"iPhone15,2|D83AP|17.4.1",   // iPhone 14 Pro
-        @"iPhone15,3|D84AP|17.4.1",   // iPhone 14 Pro Max
-        @"iPhone15,4|D37AP|17.5.1",   // iPhone 15
-        @"iPhone15,5|D38AP|17.5.1",   // iPhone 15 Plus
-        @"iPhone16,1|D93AP|17.5.1",   // iPhone 15 Pro
-        @"iPhone16,2|D94AP|17.5.1",   // iPhone 15 Pro Max
-    ];
-
-    NSString *chosen = models[arc4random_uniform((uint32_t)models.count)];
-    NSArray *parts = [chosen componentsSeparatedByString:@"|"];
-    _spoofedModel = parts[0];
-    _spoofedHWModel = parts[1];
-    _spoofedSysVersion = parts[2];
-
-    NSString *combined = [NSString stringWithFormat:@"%@|%@|%@",
-                          _spoofedModel, _spoofedHWModel, _spoofedSysVersion];
-    [defaults setObject:combined forKey:kKey(@"hw")];
+    NSArray *versions = @[@"17.4.1", @"17.5.1", @"17.3", @"17.4",
+                          @"16.6.1", @"17.2.1", @"17.5"];
+    NSString *v = versions[arc4random_uniform((uint32_t)versions.count)];
+    [defaults setObject:v forKey:key];
     [defaults synchronize];
+    return v;
 }
 
 // ============================================================
@@ -161,70 +122,18 @@ static void clearSharedCookies(void) {
 }
 
 // ============================================================
-// fishhook: sysctlbyname
-// ============================================================
-
-// Function pointer to original sysctlbyname
-static int (*orig_sysctlbyname)(const char *name, void *oldp,
-                                 size_t *oldlenp, void *newp,
-                                 size_t newlen) = NULL;
-
-static int hooked_sysctlbyname(const char *name, void *oldp,
-                                size_t *oldlenp, void *newp,
-                                size_t newlen) {
-    // Only intercept read-only queries (newp == NULL, newlen == 0)
-    if (name && oldp && oldlenp && newp == NULL && newlen == 0) {
-
-        // hw.machine -> e.g. "iPhone15,2"
-        if (strcmp(name, "hw.machine") == 0) {
-            const char *model = [_spoofedModel UTF8String];
-            size_t modelLen = strlen(model) + 1;
-            if (*oldlenp >= modelLen) {
-                memcpy(oldp, model, modelLen);
-                *oldlenp = modelLen;
-                return 0;
-            }
-        }
-
-        // hw.model -> e.g. "D83AP"
-        if (strcmp(name, "hw.model") == 0) {
-            const char *hwmodel = [_spoofedHWModel UTF8String];
-            size_t hwLen = strlen(hwmodel) + 1;
-            if (*oldlenp >= hwLen) {
-                memcpy(oldp, hwmodel, hwLen);
-                *oldlenp = hwLen;
-                return 0;
-            }
-        }
-    }
-
-    // Pass through to original
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-}
-
-// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        // Initialize spoofed values
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
-        initSpoofedHWInfo();
+        _spoofedSysVersion = getOrCreateSpoofedSysVersion();
 
-        // Clear keychain + cookies
         clearKeychainOnce();
         clearSharedCookies();
-
-        // --- fishhook: sysctlbyname ---
-        struct rebinding r = {
-            "sysctlbyname",
-            (void *)hooked_sysctlbyname,
-            (void **)&orig_sysctlbyname
-        };
-        rebind_symbols(&r, 1);
 
         // --- 1. IDFA ---
         Class asmClass = objc_getClass("ASIdentifierManager");
@@ -251,26 +160,19 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // --- 3. UIDevice: IDFV + name + model + systemVersion ---
+        // --- 3. UIDevice: IDFV + name + systemVersion ---
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
-            // identifierForVendor
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
             if (m) {
                 IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFV; });
                 hookInstanceMethod(uiDeviceClass, @selector(identifierForVendor), imp, method_getTypeEncoding(m));
             }
-            // name
             m = class_getInstanceMethod(uiDeviceClass, @selector(name));
             if (m) {
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; });
                 hookInstanceMethod(uiDeviceClass, @selector(name), imp, method_getTypeEncoding(m));
             }
-            // model — returns "iPhone" for all iPhones, keep as-is
-            // (changing this would be suspicious and could break things)
-            // localizedModel — same
-
-            // systemVersion — spoof to match our fake hw.machine
             m = class_getInstanceMethod(uiDeviceClass, @selector(systemVersion));
             if (m) {
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedSysVersion; });
