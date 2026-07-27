@@ -776,6 +776,6 @@ static void initPrivacyHook(void) {
             if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
         }
 
-        showDiagnosticPopup();
+        // No diagnostic popup in production
     }
 }
