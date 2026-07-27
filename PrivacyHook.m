@@ -25,6 +25,7 @@
 #import <ifaddrs.h>
 #import <net/if.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import "fishhook.h"
 #import <sys/utsname.h>
 
