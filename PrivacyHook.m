@@ -39,8 +39,9 @@ static volatile int diag_sc_called = 0;     // sysctl (numeric)
 static volatile int diag_sc_intercepted = 0;
 static volatile int diag_iok_called = 0;    // IORegistryEntry
 static volatile int diag_iok_intercepted = 0;
-static volatile int diag_gifa_called = 0;
-static NSMutableArray *diag_urls = nil;   // getifaddrs
+static volatile int diag_gifa_called = 0;   // getifaddrs
+static volatile int diag_selftest = 0;       // 0=not run, 1=OK, 2=FAIL
+static char diag_real_machine[32] = {0};     // real hw.machine from self-test
 
 // ============================================================
 // Spoofed values
@@ -348,53 +349,53 @@ static void clearWebViewData(void) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    NSString *urlReport = @"(none)";
-    if (diag_urls && diag_urls.count > 0) {
-        @synchronized(diag_urls) {
-            NSInteger max = MIN(diag_urls.count, 20);
-            urlReport = [[diag_urls subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
-            if (diag_urls.count > max) urlReport = [urlReport stringByAppendingFormat:@"\n...+%d", (int)(diag_urls.count-max)];
-        }
-    }
+    NSString *selftestStr;
+    if (diag_selftest == 1) selftestStr = @"OK(伪装值匹配)";
+    else if (diag_selftest == 2) selftestStr = @"FAIL(拿到真实值!)";
+    else selftestStr = @"未运行";
+
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step17b URL Spy ===\n\nURL(%%d):\n%%@\n\nsbn:%%d dev:%%@/%%@",
-        diag_urls ? (int)diag_urls.count : 0, urlReport,
-        diag_sbn_called, _spoofedDeviceName, _spoofedSysVersion];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Step17b" message:msg preferredStyle:UIAlertControllerStyleAlert];
+        @"=== Step18 interpose ===\n\n"
+        @"自检: %@\n"
+        @"真实设备: %s\n"
+        @"伪造设备: %s\n\n"
+        @"sysctlbyname:\n"
+        @"  调用:%d 拦截:%d\n\n"
+        @"sysctl(数字ID):\n"
+        @"  调用:%d 拦截:%d\n\n"
+        @"IORegistryEntry:\n"
+        @"  调用:%d 拦截:%d\n"
+        @"  伪造UUID: %s\n\n"
+        @"getifaddrs: 调用:%d\n\n"
+        @"ObjC: 已生效\n"
+        @"设备名: %@\n系统版本: %@",
+        selftestStr,
+        diag_real_machine[0] ? diag_real_machine : "(空)",
+        _c_machine[0] ? _c_machine : "(空)",
+        diag_sbn_called, diag_sbn_intercepted,
+        diag_sc_called, diag_sc_intercepted,
+        diag_iok_called, diag_iok_intercepted,
+        _c_platformUUID[0] ? _c_platformUUID : "(空)",
+        diag_gifa_called,
+        _spoofedDeviceName, _spoofedSysVersion];
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Step18"
+                         message:msg
+                  preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if (s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
+            if (s.activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s; break;
+            }
         }
         UIWindow *window = scene ? scene.windows.firstObject : nil;
         if (window) [window.rootViewController presentViewController:alert animated:YES completion:nil];
     });
-}
-
-
-// URL Spy
-static IMP orig_req_init_url = NULL;
-static IMP orig_req_init_url_cache = NULL;
-static id my_req_init_url(id self, SEL _cmd, NSURL *url) {
-    if (url && diag_urls) {
-        NSString *host = url.host ?: @""; NSString *path = url.path ?: @"/";
-        NSString *query = url.query ?: @"";
-        if (query.length > 120) query = [query substringToIndex:120];
-        NSString *entry = [NSString stringWithFormat:@"%@%@?%@", host, path, query];
-        @synchronized(diag_urls) { if (diag_urls.count < 30) [diag_urls addObject:entry]; }
-    }
-    return ((id(*)(id, SEL, NSURL *))orig_req_init_url)(self, _cmd, url);
-}
-static id my_req_init_url_cache(id self, SEL _cmd, NSURL *url, id cp, id to) {
-    if (url && diag_urls) {
-        NSString *host = url.host ?: @""; NSString *path = url.path ?: @"/";
-        NSString *query = url.query ?: @"";
-        if (query.length > 120) query = [query substringToIndex:120];
-        NSString *entry = [NSString stringWithFormat:@"%@%@?%@", host, path, query];
-        @synchronized(diag_urls) { if (diag_urls.count < 30) [diag_urls addObject:entry]; }
-    }
-    return ((id(*)(id, SEL, NSURL *, id, id))orig_req_init_url_cache)(self, _cmd, url, cp, to);
 }
 
 // ============================================================
@@ -438,6 +439,22 @@ static void initPrivacyHook(void) {
         initSpoofedHWInfoC();
         initSpoofedIOKitInfo();
         initSpoofedUserAgent();
+
+        // === Self-test: check if DYLD_INTERPOSE is working ===
+        // Call sysctlbyname directly. If interpose affects our own dylib,
+        // we should get the spoofed value (_c_machine).
+        // If we get the real device model, interpose is NOT working.
+        {
+            char buf[32] = {0};
+            size_t blen = sizeof(buf);
+            sysctlbyname("hw.machine", buf, &blen, NULL, 0);
+            strlcpy(diag_real_machine, buf, sizeof(diag_real_machine));
+            if (_c_machine[0] != 0 && strcmp(buf, _c_machine) == 0) {
+                diag_selftest = 1;  // interpose works on our dylib
+            } else {
+                diag_selftest = 2;  // got real value, interpose NOT working
+            }
+        }
 
         clearKeychainOnce();
         clearSharedCookies();
@@ -505,13 +522,8 @@ static void initPrivacyHook(void) {
         if (reqClass) {
             Method m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
             if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
-            m = class_getInstanceMethod(reqClass, @selector(initWithURL:));
-            if (m) { orig_req_init_url = method_getImplementation(m); class_replaceMethod(reqClass, @selector(initWithURL:), (IMP)my_req_init_url, method_getTypeEncoding(m)); }
-            m = class_getInstanceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:));
-            if (m) { orig_req_init_url_cache = method_getImplementation(m); class_replaceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:), (IMP)my_req_init_url_cache, method_getTypeEncoding(m)); }
         }
 
-        diag_urls = [NSMutableArray new];
         showDiagnosticPopup();
     }
 }
