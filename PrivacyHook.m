@@ -40,8 +40,6 @@ static volatile int diag_sc_intercepted = 0;
 static volatile int diag_iok_called = 0;    // IORegistryEntry
 static volatile int diag_iok_intercepted = 0;
 static volatile int diag_gifa_called = 0;   // getifaddrs
-static volatile int diag_selftest = 0;       // 0=not run, 1=OK, 2=FAIL
-static char diag_real_machine[32] = {0};     // real hw.machine from self-test
 
 // ============================================================
 // Spoofed values
@@ -349,30 +347,22 @@ static void clearWebViewData(void) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    NSString *selftestStr;
-    if (diag_selftest == 1) selftestStr = @"OK(伪装值匹配)";
-    else if (diag_selftest == 2) selftestStr = @"FAIL(拿到真实值!)";
-    else selftestStr = @"未运行";
-
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step18 interpose ===\n\n"
-        @"自检: %@\n"
-        @"真实设备: %s\n"
-        @"伪造设备: %s\n\n"
+        @"=== Step14 诊断 ===\n\n"
         @"sysctlbyname:\n"
-        @"  调用:%d 拦截:%d\n\n"
+        @"  调用:%d 拦截:%d\n"
+        @"  伪造: %s\n\n"
         @"sysctl(数字ID):\n"
         @"  调用:%d 拦截:%d\n\n"
         @"IORegistryEntry:\n"
         @"  调用:%d 拦截:%d\n"
         @"  伪造UUID: %s\n\n"
-        @"getifaddrs: 调用:%d\n\n"
+        @"getifaddrs:\n"
+        @"  调用:%d\n\n"
         @"ObjC: 已生效\n"
         @"设备名: %@\n系统版本: %@",
-        selftestStr,
-        diag_real_machine[0] ? diag_real_machine : "(空)",
-        _c_machine[0] ? _c_machine : "(空)",
         diag_sbn_called, diag_sbn_intercepted,
+        _c_machine[0] ? _c_machine : "(空)",
         diag_sc_called, diag_sc_intercepted,
         diag_iok_called, diag_iok_intercepted,
         _c_platformUUID[0] ? _c_platformUUID : "(空)",
@@ -380,12 +370,12 @@ static void showDiagnosticPopup(void) {
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step18"
+        alertControllerWithTitle:@"Step14 全interpose"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -439,22 +429,6 @@ static void initPrivacyHook(void) {
         initSpoofedHWInfoC();
         initSpoofedIOKitInfo();
         initSpoofedUserAgent();
-
-        // === Self-test: check if DYLD_INTERPOSE is working ===
-        // Call sysctlbyname directly. If interpose affects our own dylib,
-        // we should get the spoofed value (_c_machine).
-        // If we get the real device model, interpose is NOT working.
-        {
-            char buf[32] = {0};
-            size_t blen = sizeof(buf);
-            sysctlbyname("hw.machine", buf, &blen, NULL, 0);
-            strlcpy(diag_real_machine, buf, sizeof(diag_real_machine));
-            if (_c_machine[0] != 0 && strcmp(buf, _c_machine) == 0) {
-                diag_selftest = 1;  // interpose works on our dylib
-            } else {
-                diag_selftest = 2;  // got real value, interpose NOT working
-            }
-        }
 
         clearKeychainOnce();
         clearSharedCookies();
