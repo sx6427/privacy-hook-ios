@@ -553,57 +553,117 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    // Read ALL UserDefaults keys after Baidu has had time to write
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSDictionary *allDict = [defaults dictionaryRepresentation];
+    // Scan App sandbox for files that might contain device IDs
+    NSMutableString *report = [NSMutableString string];
 
-    NSMutableArray *baiduKeys = [NSMutableArray array];
-    for (NSString *key in allDict) {
-        // Skip system and our own keys
-        if ([key hasPrefix:@"AKService"]) continue;
-        if ([key hasPrefix:@"Apple"]) continue;
-        if ([key hasPrefix:@"NS"]) continue;
-        if ([key hasPrefix:@"com.apple"]) continue;
-        if ([key hasPrefix:@"ITF"]) continue;
-        if ([key hasPrefix:@"MSV"]) continue;
-        if ([key hasPrefix:@"WebKit"]) continue;
-        if ([key hasPrefix:@"CFUser"]) continue;
-        if ([key hasPrefix:@"pkc"]) continue;
-        if ([key hasPrefix:@"BaiduBox.cfg"]) continue;
+    // Get sandbox paths
+    NSString *home = NSHomeDirectory();
+    NSArray *dirsToScan = @[
+        [home stringByAppendingPathComponent:@"Documents"],
+        [home stringByAppendingPathComponent:@"Library"],
+        [home stringByAppendingPathComponent:@"tmp"],
+    ];
 
-        id val = allDict[key];
-        NSString *valStr;
-        if ([val isKindOfClass:[NSString class]]) {
-            valStr = val;
-            if (valStr.length > 60) valStr = [valStr substringToIndex:60];
-        } else if ([val isKindOfClass:[NSNumber class]]) {
-            valStr = [val stringValue];
-        } else {
-            valStr = [NSString stringWithFormat:@"%@", [val class]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSInteger fileCount = 0;
+
+    for (NSString *dir in dirsToScan) {
+        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:dir];
+        NSString *file;
+        while ((file = [enumerator nextObject])) {
+            if (fileCount >= 30) break;
+
+            NSString *fullPath = [dir stringByAppendingPathComponent:file];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:fullPath error:nil];
+            NSUInteger fileSize = [[attrs objectForKey:NSFileSize] unsignedLongLongValue];
+
+            // Skip large files (> 100KB) and directories
+            if (fileSize > 100000) continue;
+            if ([[attrs objectForKey:NSFileType] isEqualToString:NSFileTypeDirectory]) continue;
+
+            // Skip common non-interesting files
+            NSString *lname = file.lowercaseString;
+            if ([lname hasSuffix:@".png"] || [lname hasSuffix:@".jpg"] || [lname hasSuffix:@".jpeg"]) continue;
+            if ([lname hasSuffix:@".db-shm"] || [lname hasSuffix:@".db-wal"]) continue;
+            if ([lname containsString:@"snapshots"]) continue;
+            if ([lname containsString:@"cache"]) continue;
+            if ([lname containsString:@"photos"]) continue;
+
+            // Read file content
+            NSData *data = [NSData dataWithContentsOfFile:fullPath options:NSDataReadingMappedIfSafe error:nil];
+            if (!data || data.length == 0 || data.length > 50000) continue;
+
+            // Try to read as string
+            NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!content) {
+                // Try to find readable strings in binary data
+                const char *bytes = data.bytes;
+                NSUInteger len = data.length;
+                NSMutableString *found = [NSMutableString string];
+                NSMutableString *current = [NSMutableString string];
+                for (NSUInteger j = 0; j < len && found.length < 200; j++) {
+                    if (bytes[j] >= 32 && bytes[j] < 127) {
+                        [current appendFormat:@"%c", bytes[j]];
+                    } else {
+                        if (current.length >= 8) {
+                            // Check if this looks like an ID
+                            NSString *s = current;
+                            if ([s containsString:@"cuid"] || [s containsString:@"device"] ||
+                                [s containsString:@"CUID"] || [s containsString:@"DEVICE"] ||
+                                [s containsString:@"uuid"] || [s containsString:@"UUID"] ||
+                                [s containsString:@"idfa"] || [s containsString:@"IDFA"] ||
+                                [s containsString:@"bduss"] || [s containsString:@"BDUSS"] ||
+                                [s containsString:@"machine"] || [s containsString:@"iphone"] ||
+                                [s containsString:@"serial"] || [s containsString:@"token"] ||
+                                [s containsString:@"android_id"] || [s containsString:@"zid"] ||
+                                [s containsString:@"cuid"]) {
+                                [found appendFormat:@"%@ ", s];
+                            }
+                        }
+                        [current setString:@""];
+                    }
+                }
+                if (found.length > 0) {
+                    [report appendFormat:@" %@ (%luB) => %@\n", file, (unsigned long)data.length, found];
+                    fileCount++;
+                }
+            } else {
+                // It's a text file — check for device IDs
+                NSString *lc = content.lowercaseString;
+                if ([lc containsString:@"cuid"] || [lc containsString:@"device"] ||
+                    [lc containsString:@"uuid"] || [lc containsString:@"idfa"] ||
+                    [lc containsString:@"bduss"] || [lc containsString:@"machine"] ||
+                    [lc containsString:@"iphone"] || [lc containsString:@"serial"] ||
+                    [lc containsString:@"token"] || [lc containsString:@"zid"] ||
+                    [lc containsString:@"android_id"] || [lc containsString:@"model"]) {
+                    // Extract just the relevant part
+                    if (content.length > 200) content = [content substringToIndex:200];
+                    [report appendFormat:@" %@ (%luB) => %@\n", file, (unsigned long)data.length, content];
+                    fileCount++;
+                }
+            }
         }
-        NSString *entry = [NSString stringWithFormat:@"%@ = %@", key, valStr];
-        if (entry.length > 100) entry = [entry substringToIndex:100];
-        [baiduKeys addObject:entry];
+        if (fileCount >= 30) break;
     }
 
-    NSString *report = baiduKeys.count > 0 ?
-        [baiduKeys componentsJoinedByString:@"\n"] : @"(empty)";
+    if (fileCount == 0) {
+        [report setString:@"(no device ID files found)"];
+    }
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step24 UD诊断 ===\n\n"
-        @"清理后百度写入的key(%d):\n%@\n\n"
+        @"=== Step25 沙盒扫描 ===\n\n"
+        @"找到含设备ID的文件(%d):\n%@\n\n"
         @"设备: %s\n系统: %@",
-        (int)baiduKeys.count, report,
+        (int)fileCount, report,
         _c_machine[0] ? _c_machine : "(空)",
         _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step24"
+        alertControllerWithTitle:@"Step25"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    // 15 second delay — let Baidu write its keys first
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
