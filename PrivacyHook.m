@@ -1,15 +1,14 @@
 //
-//  PrivacyHook.m — Step 9: Step8 + sysctl hook + getifaddrs hook
+//  PrivacyHook.m — Step 10: fishhook targeting ONLY main executable
 //
-//  Step8 UA spoofing works (iOS 17.4.1 shown) but Baidu still
-//  recognizes same device. Likely cause: Baidu calls sysctl()
-//  directly (by numeric ID) instead of sysctlbyname(), bypassing
-//  our DYLD_INTERPOSE. Also hook getifaddrs for network info.
+//  Step6-9 used DYLD_INTERPOSE but it likely doesn't work on iOS 14.6.
+//  Step4-5 used fishhook on ALL images → crash (system init corrupted).
 //
-//  Fix:
-//    1. Hook WKWebView customUserAgent getter → return spoofed UA
-//    2. Hook WKWebView initWithFrame:configuration: → set customUserAgent on init
-//    3. Hook NSMutableURLRequest setValue:forHTTPHeaderField: → replace User-Agent
+//  NEW APPROACH: Use fishhook's rebind_symbols_image() to ONLY rebind
+//  symbols in the main executable (BaiduBoxApp). System libraries are
+//  untouched → no crash. But Baidu's calls ARE intercepted.
+//
+//  This is the safest way to hook C functions on iOS.
 //
 
 #import <Foundation/Foundation.h>
@@ -21,26 +20,13 @@
 #import <objc/message.h>
 #import <sys/sysctl.h>
 #import <string.h>
-#import <ifaddrs.h>
-#import <net/if.h>
-#import <arpa/inet.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <IOKit/IOKitLib.h>
+#import <ifaddrs.h>
+#import <mach-o/dyld.h>
+#import "fishhook.h"
 
 #define NSLog(...)
-
-// ============================================================
-// DYLD_INTERPOSE macro
-// ============================================================
-#define DYLD_INTERPOSE(_replacement, _replacee) \
-   __attribute__((used)) static struct { \
-       const void *replacement; \
-       const void *replacee; \
-   } _interpose_##_replacee \
-   __attribute__((section("__DATA,__interpose"))) = { \
-       (const void *)(unsigned long)&_replacement, \
-       (const void *)(unsigned long)&_replacee \
-   };
 
 // ============================================================
 // Spoofed values
@@ -56,6 +42,11 @@ static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
 static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
+
+// Original function pointers (filled by fishhook)
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
+static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -154,16 +145,11 @@ static void initSpoofedIOKitInfo(void) {
 }
 
 static void initSpoofedUserAgent(void) {
-    // "17.4.1" -> "17_4_1"
     NSString *uaVersion = [_spoofedSysVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
-
-    // Full WebKit User-Agent (for WKWebView)
     _spoofedWebKitUA = [NSString stringWithFormat:
         @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) "
         @"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         uaVersion];
-
-    // Shorter User-Agent (for HTTP requests)
     _spoofedUserAgent = [NSString stringWithFormat:
         @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) "
         @"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
@@ -252,10 +238,12 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// DYLD_INTERPOSE: sysctlbyname
+// fishhook: hook functions — PURE C, NO ObjC!
 // ============================================================
-static int my_sysctlbyname(const char *name, void *oldp,
-                            size_t *oldlenp, void *newp, size_t newlen) {
+
+// Hook for sysctlbyname — PURE C
+static int hooked_sysctlbyname(const char *name, void *oldp,
+                                size_t *oldlenp, void *newp, size_t newlen) {
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
@@ -279,60 +267,11 @@ static int my_sysctlbyname(const char *name, void *oldp,
             }
         }
     }
-    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
-DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
-// ============================================================
-// DYLD_INTERPOSE: sysctl (numeric ID version)
-// ============================================================
-// Baidu may call sysctl() directly instead of sysctlbyname().
-// sysctl uses numeric IDs: name[0]=CTL_HW(6), name[1]=HW_MACHINE(1) etc.
-static int my_sysctl(int *name, u_int namelen, void *oldp,
-                     size_t *oldlenp, void *newp, size_t newlen) {
-    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
-        // CTL_HW = 6
-        if (name[0] == 6) {
-            // HW_MACHINE = 1
-            if (name[1] == 1 && _c_machine[0] != 0) {
-                size_t need = strlen(_c_machine) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_machine, need); *oldlenp = need; return 0;
-                }
-            }
-            // HW_MODEL = 2
-            if (name[1] == 2 && _c_hwmodel[0] != 0) {
-                size_t need = strlen(_c_hwmodel) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0;
-                }
-            }
-            // HW_MACHINE_ARCH = 3 -> return arm64e (standard, not unique)
-            // HW_MEMSIZE = 24 -> leave original (not unique per device)
-        }
-    }
-    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-}
-DYLD_INTERPOSE(my_sysctl, sysctl);
-
-// ============================================================
-// DYLD_INTERPOSE: getifaddrs — hide network interface info
-// ============================================================
-// Baidu may read network interface MAC address or IP via getifaddrs.
-// Return empty interface list to prevent fingerprinting.
-static int my_getifaddrs(struct ifaddrs **ifap) {
-    // Return success but with empty list
-    *ifap = NULL;
-    return 0;
-}
-DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
-
-// ============================================================
-// DYLD_INTERPOSE: IORegistryEntryCreateCFProperty
-// ============================================================
-static CFTypeRef my_IORegistryEntryCreateCFProperty(
+// Hook for IORegistryEntryCreateCFProperty — PURE C (CoreFoundation only)
+static CFTypeRef hooked_IORegistryEntryCreateCFProperty(
     io_registry_entry_t entry, CFStringRef key,
     CFAllocatorRef allocator, IOOptionBits options) {
     if (key && _c_platformUUID[0] != 0) {
@@ -343,9 +282,42 @@ static CFTypeRef my_IORegistryEntryCreateCFProperty(
             return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
         }
     }
-    return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+    return orig_IORegistryEntryCreateCFProperty(entry, key, allocator, options);
 }
-DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
+
+// Hook for getifaddrs — PURE C
+static int hooked_getifaddrs(struct ifaddrs **ifap) {
+    *ifap = NULL;
+    return 0;
+}
+
+// ============================================================
+// Rebind ONLY the main executable (not system libraries!)
+// This prevents crashes during system init while still
+// intercepting Baidu's calls.
+// ============================================================
+static void rebindMainExecutable(void) {
+    // Image 0 is always the main executable
+    const struct mach_header *main_header = _dyld_get_image_header(0);
+    intptr_t main_slide = _dyld_get_image_vmaddr_slide(0);
+
+    if (!main_header) return;
+
+    struct rebinding rebindings[] = {
+        {"sysctlbyname",
+         (void *)hooked_sysctlbyname,
+         (void **)&orig_sysctlbyname},
+        {"IORegistryEntryCreateCFProperty",
+         (void *)hooked_IORegistryEntryCreateCFProperty,
+         (void **)&orig_IORegistryEntryCreateCFProperty},
+        {"getifaddrs",
+         (void *)hooked_getifaddrs,
+         (void **)&orig_getifaddrs},
+    };
+
+    rebind_symbols_image((void *)main_header, main_slide,
+                         rebindings, sizeof(rebindings)/sizeof(rebindings[0]));
+}
 
 // ============================================================
 // WKWebView hook: save original IMPs
@@ -353,7 +325,6 @@ DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProper
 static IMP orig_wk_init_frame = NULL;
 static IMP orig_wk_init_coder = NULL;
 
-// Replacement for initWithFrame:configuration:
 static id my_wk_init_frame(id self, SEL _cmd, CGRect frame, id config) {
     id instance = ((id(*)(id, SEL, CGRect, id))orig_wk_init_frame)(self, _cmd, frame, config);
     if (instance && _spoofedWebKitUA) {
@@ -363,7 +334,6 @@ static id my_wk_init_frame(id self, SEL _cmd, CGRect frame, id config) {
     return instance;
 }
 
-// Replacement for initWithCoder:
 static id my_wk_init_coder(id self, SEL _cmd, id coder) {
     id instance = ((id(*)(id, SEL, id))orig_wk_init_coder)(self, _cmd, coder);
     if (instance && _spoofedWebKitUA) {
@@ -374,11 +344,10 @@ static id my_wk_init_coder(id self, SEL _cmd, id coder) {
 }
 
 // ============================================================
-// NSMutableURLRequest hook: save original IMP
+// NSMutableURLRequest hook
 // ============================================================
 static IMP orig_setValue = NULL;
 
-// Replacement for setValue:forHTTPHeaderField:
 static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
     if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame && _spoofedUserAgent) {
         value = _spoofedUserAgent;
@@ -406,6 +375,9 @@ static void initPrivacyHook(void) {
         clearSharedCookies();
         clearURLCache();
         clearWebViewData();
+
+        // --- fishhook: rebind ONLY main executable (safe, no crash) ---
+        rebindMainExecutable();
 
         // --- 1. IDFA ---
         Class asmClass = objc_getClass("ASIdentifierManager");
@@ -503,7 +475,6 @@ static void initPrivacyHook(void) {
         // --- 6. WKWebView User-Agent ---
         Class wkClass = objc_getClass("WKWebView");
         if (wkClass) {
-            // Hook customUserAgent getter to always return our value
             Method m = class_getInstanceMethod(wkClass, @selector(customUserAgent));
             if (m) {
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) {
@@ -512,7 +483,6 @@ static void initPrivacyHook(void) {
                 hookInstanceMethod(wkClass, @selector(customUserAgent), imp, method_getTypeEncoding(m));
             }
 
-            // Hook initWithFrame:configuration: — set customUserAgent after init
             m = class_getInstanceMethod(wkClass, @selector(initWithFrame:configuration:));
             if (m) {
                 orig_wk_init_frame = method_getImplementation(m);
@@ -520,7 +490,6 @@ static void initPrivacyHook(void) {
                                     (IMP)my_wk_init_frame, method_getTypeEncoding(m));
             }
 
-            // Hook initWithCoder: — for storyboard-created WKWebViews
             m = class_getInstanceMethod(wkClass, @selector(initWithCoder:));
             if (m) {
                 orig_wk_init_coder = method_getImplementation(m);
