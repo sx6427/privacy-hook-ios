@@ -1,20 +1,12 @@
 //
-//  PrivacyHook.m — Step 12b: global rebind_symbols (no dladdr) + sysctl()
+//  PrivacyHook.m — Step 12c: hook ONLY .app images, ONLY sysctlbyname+sysctl
 //
-//  Step12 crashed because hooking ALL app images was too aggressive.
+//  Step12  crashed: hooking getifaddrs(return NULL) + IORegistry(orig=NULL)
+//  Step12b crashed: global rebind_symbols hooks system libs → crash
 //
-//  Step11 showed: rebind_symbols_image on main exec → orig=OK but NOT CALLED.
-//  Baidu's device info code is in its own dylibs, not main exec.
-//
-//  NEW APPROACH: Use rebind_symbols (GLOBAL, all images) but:
-//    - Only hook sysctlbyname + sysctl (safe, pure C, passthrough)
-//    - Do NOT hook getifaddrs (returning NULL crashes some libs)
-//    - Do NOT hook IORegistryEntryCreateCFProperty (orig=NULL on main exec)
-//    - No dladdr check (Step10 fix)
-//    - Keep diagnostic popup
-//
-//  rebind_symbols = rebind_symbols_image for ALL loaded images.
-//  Our hooks only intercept specific args, everything else passes through.
+//  Step12c: rebind_symbols_image ONLY on .app/ images (not system libs!)
+//           ONLY hook sysctlbyname + sysctl (safe passthrough)
+//           NO getifaddrs, NO IORegistryEntryCreateCFProperty
 //
 
 #import <Foundation/Foundation.h>
@@ -37,8 +29,7 @@
 // ============================================================
 static volatile int diag_sb_called = 0;
 static volatile int diag_sysctl_called = 0;
-static volatile int diag_sb_orig_null = 0;
-static volatile int diag_sysctl_orig_null = 0;
+static volatile int diag_images_hooked = 0;
 
 // ============================================================
 // Spoofed values
@@ -198,8 +189,6 @@ static void clearWebViewData(void) {
 static int hooked_sysctlbyname(const char *name, void *oldp,
                                 size_t *oldlenp, void *newp, size_t newlen) {
     diag_sb_called = 1;
-    if (orig_sysctlbyname == NULL) { diag_sb_orig_null = 1; }
-
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
@@ -212,7 +201,6 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
             if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
         }
     }
-    // EVERYTHING ELSE → passthrough to original
     if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     return -1;
 }
@@ -220,41 +208,47 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
 static int hooked_sysctl(int *name, u_int namelen, void *oldp,
                          size_t *oldlenp, void *newp, size_t newlen) {
     diag_sysctl_called = 1;
-    if (orig_sysctl == NULL) { diag_sysctl_orig_null = 1; }
-
     if (name && namelen >= 2 && newp == NULL && newlen == 0) {
-        // CTL_HW = 6
-        if (name[0] == 6) {
-            // HW_MACHINE = 1
-            if (name[1] == 1 && _c_machine[0] != 0) {
+        if (name[0] == 6) { // CTL_HW
+            if (name[1] == 1 && _c_machine[0] != 0) { // HW_MACHINE
                 size_t need = strlen(_c_machine) + 1;
                 if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
                 if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
             }
-            // HW_MODEL = 2
-            if (name[1] == 2 && _c_hwmodel[0] != 0) {
+            if (name[1] == 2 && _c_hwmodel[0] != 0) { // HW_MODEL
                 size_t need = strlen(_c_hwmodel) + 1;
                 if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
                 if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
             }
         }
     }
-    // EVERYTHING ELSE → passthrough
     if (orig_sysctl) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     return -1;
 }
 
 // ============================================================
-// GLOBAL rebind_symbols — hooks ALL images (system + app)
-// Safe because our hooks only intercept specific args, everything
-// else passes through to the original function.
+// Hook ONLY .app images, ONLY 2 safe functions
 // ============================================================
-static void rebindAllImages(void) {
+static void rebindAppImages(void) {
+    uint32_t count = _dyld_image_count();
     struct rebinding rebindings[] = {
         {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
         {"sysctl",       (void *)hooked_sysctl,       (void **)&orig_sysctl},
     };
-    rebind_symbols(rebindings, sizeof(rebindings)/sizeof(rebindings[0]));
+    int rebind_count = sizeof(rebindings)/sizeof(rebindings[0]);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        // Only hook images inside the app bundle
+        if (strstr(name, ".app/") != NULL) {
+            const struct mach_header *header = _dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            if (!header) continue;
+            rebind_symbols_image((void *)header, slide, rebindings, rebind_count);
+            diag_images_hooked++;
+        }
+    }
 }
 
 // ============================================================
@@ -266,9 +260,9 @@ static void showDiagnosticPopup(void) {
     sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step12b 诊断 ===\n\n"
-        @"全局 rebind_symbols (所有image)\n\n"
-        @"sysctlbyname (字符串名):\n"
+        @"=== Step12c 诊断 ===\n\n"
+        @"已 hook .app image 数: %d\n\n"
+        @"sysctlbyname:\n"
         @"  被调用: %@\n"
         @"  orig: %@\n"
         @"  伪造: %s | 真实: %s\n\n"
@@ -276,8 +270,8 @@ static void showDiagnosticPopup(void) {
         @"  被调用: %@\n"
         @"  orig: %@\n\n"
         @"ObjC: 已生效\n"
-        @"设备名: %@\n"
-        @"系统版本: %@",
+        @"设备名: %@\n系统版本: %@",
+        diag_images_hooked,
         diag_sb_called ? @"YES ✅" : @"NO ❌",
         orig_sysctlbyname ? @"OK" : @"NULL",
         _c_machine[0] ? _c_machine : "(空)",
@@ -287,7 +281,7 @@ static void showDiagnosticPopup(void) {
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step12b 诊断"
+        alertControllerWithTitle:@"Step12c"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -297,14 +291,11 @@ static void showDiagnosticPopup(void) {
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
             if (s.activationState == UISceneActivationStateForegroundActive) {
-                scene = (UIWindowScene *)s;
-                break;
+                scene = (UIWindowScene *)s; break;
             }
         }
         UIWindow *window = scene ? scene.windows.firstObject : nil;
-        if (window) {
-            [window.rootViewController presentViewController:alert animated:YES completion:nil];
-        }
+        if (window) [window.rootViewController presentViewController:alert animated:YES completion:nil];
     });
 }
 
@@ -354,8 +345,8 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
 
-        // GLOBAL rebind — all images, but only 2 safe functions
-        rebindAllImages();
+        // Hook ONLY .app images, ONLY sysctlbyname + sysctl
+        rebindAppImages();
 
         // ObjC hooks
         Class asmClass = objc_getClass("ASIdentifierManager");
