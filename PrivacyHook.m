@@ -1,21 +1,15 @@
 //
-//  PrivacyHook.m — Step 13: DYLD_INTERPOSE + diagnostic (NO fishhook!)
+//  PrivacyHook.m — Step 13b: DYLD_INTERPOSE fix — direct call, no orig pointer
 //
-//  Step11: fishhook on main exec → safe but sysctlbyname NOT CALLED
-//  Step12/c/d: fishhook on .app images → CRASH
-//  Step12b: global rebind_symbols → CRASH
+//  Step13 crashed (10s freeze + crash) because orig_sysctlbyname was NULL.
+//  All sysctlbyname calls returned -1 → system init failed.
 //
-//  Root cause: fishhook's rebind_symbols_image crashes when called on
-//  multiple app images. And it only hooks main exec which Baidu doesn't use.
+//  Fix: In the hook function, call sysctlbyname() directly.
+//  DYLD_INTERPOSE does NOT interpose calls within the defining library,
+//  so this won't cause recursion.
 //
-//  NEW APPROACH: DYLD_INTERPOSE
-//  - Replaces symbol at dyld binding time (before any code runs)
-//  - Affects ALL images that import the symbol (including Baidu's dylibs)
-//  - No runtime rebind needed → no crash risk
-//  - Our hook only intercepts hw.machine/hw.model, everything else passthrough
-//
-//  Previous DYLD_INTERPOSE attempts (Step6-9) "didn't work" but we never
-//  verified with a diagnostic. This time we verify.
+//  During early system init (before our constructor), _c_machine is empty,
+//  so the hook just passes through to the real sysctlbyname. Safe.
 //
 
 #import <Foundation/Foundation.h>
@@ -29,17 +23,13 @@
 #import <string.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 
 #define NSLog(...)
 
-// ============================================================
-// Diagnostic counters
-// ============================================================
 static volatile int diag_sb_called = 0;
+static volatile int diag_sb_intercepted = 0;  // Actually intercepted hw.machine/hw.model
 
-// ============================================================
-// Spoofed values
-// ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
@@ -51,18 +41,19 @@ static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
 
 // ============================================================
-// DYLD_INTERPOSE setup
+// DYLD_INTERPOSE
 // ============================================================
-// Original function pointer (filled by dyld)
-static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 
-// Hook function — PURE C, only intercepts hw.machine/hw.model
+// Hook function — calls sysctlbyname() directly for passthrough.
+// In the defining library, DYLD_INTERPOSE does NOT interpose,
+// so sysctlbyname() here calls the REAL function. No recursion.
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp, size_t newlen) {
-    diag_sb_called = 1;
+    diag_sb_called++;
 
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
+            diag_sb_intercepted++;
             size_t need = strlen(_c_machine) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp && *oldlenp >= need) {
@@ -72,6 +63,7 @@ static int my_sysctlbyname(const char *name, void *oldp,
             }
         }
         if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
+            diag_sb_intercepted++;
             size_t need = strlen(_c_hwmodel) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp && *oldlenp >= need) {
@@ -81,13 +73,10 @@ static int my_sysctlbyname(const char *name, void *oldp,
             }
         }
     }
-    // Everything else → passthrough
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    // Direct call — NOT interposed in defining library
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
-// DYLD_INTERPOSE macro — tells dyld to replace sysctlbyname with my_sysctlbyname
-// This is processed at load time, before any constructors run.
-// It affects ALL images that import sysctlbyname (including Baidu's dylibs).
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
       const void *replacement; \
@@ -178,9 +167,6 @@ static void initSpoofedUserAgent(void) {
         @"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", uaVersion];
 }
 
-// ============================================================
-// ObjC hooking helpers
-// ============================================================
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
@@ -198,9 +184,6 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     }
 }
 
-// ============================================================
-// Data clearing
-// ============================================================
 static void clearKeychainOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *key = kKey(@"kc23");
@@ -247,36 +230,33 @@ static void clearWebViewData(void) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    // Read REAL hw.machine by calling the original directly
-    // Since DYLD_INTERPOSE replaces sysctlbyname globally, we can't call
-    // the original directly. But we can read it before _c_machine is set.
-    // Actually, _c_machine IS set by now. Let's just show the spoofed value.
-    // To get the real value, we'd need to call orig_sysctlbyname directly.
+    // Get real hw.machine using dlsym to bypass interpose
+    typedef int (*sysctlbyname_t)(const char *, void *, size_t *, void *, size_t);
+    sysctlbyname_t real_sysctlbyname = (sysctlbyname_t)dlsym(RTLD_NEXT, "sysctlbyname");
     char realMachine[32] = {0};
     size_t size = sizeof(realMachine);
-    if (orig_sysctlbyname) {
-        orig_sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
+    if (real_sysctlbyname) {
+        real_sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
     }
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step13 诊断 ===\n\n"
-        @"方法: DYLD_INTERPOSE (无fishhook)\n\n"
+        @"=== Step13b 诊断 ===\n\n"
+        @"方法: DYLD_INTERPOSE (直接调用)\n\n"
         @"sysctlbyname:\n"
-        @"  被调用: %@\n"
-        @"  orig: %@\n"
+        @"  被调用次数: %d\n"
+        @"  拦截次数: %d\n"
         @"  伪造: %s\n"
         @"  真实: %s\n\n"
         @"ObjC: 已生效\n"
         @"设备名: %@\n"
         @"系统版本: %@",
-        diag_sb_called ? @"YES ✅ (百度调用了!)" : @"NO ❌ (未触发)",
-        orig_sysctlbyname ? @"OK ✅" : @"NULL ❌",
+        diag_sb_called, diag_sb_intercepted,
         _c_machine[0] ? _c_machine : "(空)",
         realMachine[0] ? realMachine : "(空)",
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step13 DYLD_INTERPOSE"
+        alertControllerWithTitle:@"Step13b"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -339,10 +319,6 @@ static void initPrivacyHook(void) {
         clearSharedCookies();
         clearURLCache();
         clearWebViewData();
-
-        // NO fishhook! DYLD_INTERPOSE handles sysctlbyname at dyld level.
-        // It's registered via __DATA,__interpose section, processed by dyld
-        // at load time before any constructors run.
 
         // ObjC hooks
         Class asmClass = objc_getClass("ASIdentifierManager");
