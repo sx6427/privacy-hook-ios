@@ -1,18 +1,15 @@
 #
 # Makefile for building PrivacyHook.dylib
 #
-# Usage (on macOS with Xcode):
-#   make          # Build the dylib
-#   make clean    # Remove build artifacts
-#
-# The dylib is compiled for arm64 (iOS device), targeting iOS 14.0+.
-# It does NOT require Theos — just clang (included with Xcode).
-#
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 DYLIB = PrivacyHook.dylib
 SRC   = PrivacyHook.m
+
+# Also build a minimal test dylib
+MIN_DYLIB = PrivacyHookMin.dylib
+MIN_SRC   = PrivacyHookMin.m
 
 # Compiler flags
 CFLAGS  = -arch arm64 \
@@ -31,25 +28,35 @@ LDFLAGS = -arch arm64 \
           -framework Foundation \
           -framework UIKit \
           -framework AdSupport \
-          -framework AppTrackingTransparency \
           -framework Security \
           -install_name @executable_path/PrivacyHook.dylib \
           -Wl,-weak_framework,AppTrackingTransparency
 
+# Minimal dylib: only links Foundation
+MIN_LDFLAGS = -arch arm64 \
+          -isysroot $(SDKROOT) \
+          -miphoneos-version-min=14.0 \
+          -dynamiclib \
+          -framework Foundation \
+          -install_name @executable_path/PrivacyHookMin.dylib
+
 .PHONY: all clean
 
-all: $(DYLIB)
+all: $(DYLIB) $(MIN_DYLIB)
 
 $(DYLIB): $(SRC)
 	@echo "Building PrivacyHook.dylib..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $<
 	@echo "Done: $(DYLIB)"
-	@echo ""
-	@echo "Verify architecture:"
 	@lipo -info $@ || true
-	@echo ""
-	@echo "Verify load commands:"
+	@otool -L $@ || true
+
+$(MIN_DYLIB): $(MIN_SRC)
+	@echo "Building PrivacyHookMin.dylib..."
+	clang $(CFLAGS) $(MIN_LDFLAGS) -o $@ $<
+	@echo "Done: $(MIN_DYLIB)"
+	@lipo -info $@ || true
 	@otool -L $@ || true
 
 clean:
-	rm -f $(DYLIB)
+	rm -f $(DYLIB) $(MIN_DYLIB)
