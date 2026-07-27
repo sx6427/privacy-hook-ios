@@ -1,12 +1,17 @@
 //
-//  PrivacyHook.m — Step 11: Step10 + diagnostic popup
+//  PrivacyHook.m — Step 12: hook ALL app images + sysctl()
 //
-//  Adds a popup 5 seconds after launch showing:
-//  - Whether fishhook rebind succeeded (orig pointers non-NULL)
-//  - Whether each hook function was actually called
-//  - Values of spoofed C strings
+//  Step11 diagnosis revealed:
+//    - sysctlbyname: rebind OK on main exec, but NOT CALLED
+//    - IORegistryEntryCreateCFProperty: orig=NULL (not in main exec!)
+//    - getifaddrs: rebind OK, but NOT CALLED
 //
-//  This tells us definitively if fishhook works on iOS 14.6.
+//  Root cause: Baidu's device info code is in ITS OWN dylibs,
+//  not in the main executable. We were only hooking image 0.
+//
+//  Fix: Iterate ALL loaded images, hook only those inside the .app bundle.
+//  Also add hook for sysctl() (numeric ID version) in case Baidu
+//  uses that instead of sysctlbyname().
 //
 
 #import <Foundation/Foundation.h>
@@ -29,12 +34,15 @@
 // ============================================================
 // Diagnostic counters
 // ============================================================
-static volatile int diag_sb_called = 0;       // sysctlbyname hook called
-static volatile int diag_iok_called = 0;      // IORegistryEntryCreateCFProperty hook called
-static volatile int diag_gifa_called = 0;     // getifaddrs hook called
-static volatile int diag_sb_orig_null = 0;    // orig_sysctlbyname is NULL
-static volatile int diag_iok_orig_null = 0;   // orig_IORegistryEntryCreateCFProperty is NULL
-static volatile int diag_gifa_orig_null = 0;  // orig_getifaddrs is NULL
+static volatile int diag_sb_called = 0;
+static volatile int diag_sysctl_called = 0;
+static volatile int diag_iok_called = 0;
+static volatile int diag_gifa_called = 0;
+static volatile int diag_images_hooked = 0;
+static volatile int diag_sb_orig_null = 0;
+static volatile int diag_iok_orig_null = 0;
+static volatile int diag_gifa_orig_null = 0;
+static volatile int diag_sysctl_orig_null = 0;
 
 // ============================================================
 // Spoofed values
@@ -51,7 +59,9 @@ static char _c_hwmodel[32] = {0};
 static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
+// Original function pointers
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 
@@ -215,10 +225,11 @@ static void clearWebViewData(void) {
 // ============================================================
 // fishhook hooks — PURE C, with diagnostic counters
 // ============================================================
+
+// Hook for sysctlbyname (string name version)
 static int hooked_sysctlbyname(const char *name, void *oldp,
                                 size_t *oldlenp, void *newp, size_t newlen) {
     diag_sb_called = 1;
-    if (orig_sysctlbyname == NULL) { diag_sb_orig_null = 1; }
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
@@ -237,6 +248,44 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
         }
     }
     if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    return -1;
+}
+
+// Hook for sysctl (numeric ID version) — NEW in Step12!
+// Baidu may use sysctl({CTL_HW, HW_MACHINE}, ...) instead of sysctlbyname("hw.machine")
+static int hooked_sysctl(int *name, u_int namelen, void *oldp,
+                         size_t *oldlenp, void *newp, size_t newlen) {
+    diag_sysctl_called = 1;
+    if (orig_sysctl == NULL) { diag_sysctl_orig_null = 1; }
+
+    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
+        // CTL_HW = 6
+        if (name[0] == 6) {
+            // HW_MACHINE = 1 → equivalent to "hw.machine"
+            if (name[1] == 1 && _c_machine[0] != 0) {
+                size_t need = strlen(_c_machine) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_machine, need); *oldlenp = need; return 0;
+                }
+            }
+            // HW_MODEL = 2 → equivalent to "hw.model"
+            if (name[1] == 2 && _c_hwmodel[0] != 0) {
+                size_t need = strlen(_c_hwmodel) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0;
+                }
+            }
+        }
+        // CTL_KERN = 1
+        if (name[0] == 1) {
+            // KERN_OSVERSION = 2 → "kern.osversion"
+            // KERN_HOSTNAME = 10 → "kern.hostname"
+            // Don't need to spoof these, just let them pass through
+        }
+    }
+    if (orig_sysctl) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     return -1;
 }
 
@@ -263,17 +312,36 @@ static int hooked_getifaddrs(struct ifaddrs **ifap) {
     return 0;
 }
 
-static void rebindMainExecutable(void) {
-    const struct mach_header *main_header = _dyld_get_image_header(0);
-    intptr_t main_slide = _dyld_get_image_vmaddr_slide(0);
-    if (!main_header) return;
+// ============================================================
+// Hook ALL images inside the .app bundle (not just main exec!)
+// ============================================================
+static void rebindAppImages(void) {
+    uint32_t count = _dyld_image_count();
+
     struct rebinding rebindings[] = {
         {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
+        {"sysctl", (void *)hooked_sysctl, (void **)&orig_sysctl},
         {"IORegistryEntryCreateCFProperty", (void *)hooked_IORegistryEntryCreateCFProperty, (void **)&orig_IORegistryEntryCreateCFProperty},
         {"getifaddrs", (void *)hooked_getifaddrs, (void **)&orig_getifaddrs},
     };
-    rebind_symbols_image((void *)main_header, main_slide,
-                         rebindings, sizeof(rebindings)/sizeof(rebindings[0]));
+    int rebind_count = sizeof(rebindings)/sizeof(rebindings[0]);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+
+        // Only hook images inside the app bundle
+        // App bundle images have ".app/" in their path
+        // System libraries have paths like /usr/lib/ or /System/Library/
+        if (strstr(name, ".app/") != NULL) {
+            const struct mach_header *header = _dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            if (!header) continue;
+
+            rebind_symbols_image((void *)header, slide, rebindings, rebind_count);
+            diag_images_hooked++;
+        }
+    }
 }
 
 // ============================================================
@@ -286,40 +354,45 @@ static void showDiagnosticPopup(void) {
     sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== fishhook 诊断 ===\n\n"
-        @"sysctlbyname:\n"
-        @"  hook被调用: %@\n"
-        @"  orig指针: %@\n"
-        @"  伪造值: %s\n"
-        @"  真实值: %s\n\n"
+        @"=== Step12 诊断 ===\n\n"
+        @"已 hook image 数量: %d\n\n"
+        @"sysctlbyname (字符串名):\n"
+        @"  被调用: %@\n"
+        @"  orig: %@\n"
+        @"  伪造: %s | 真实: %s\n\n"
+        @"sysctl (数字ID) — 新增:\n"
+        @"  被调用: %@\n"
+        @"  orig: %@\n\n"
         @"IORegistryEntry:\n"
-        @"  hook被调用: %@\n"
-        @"  orig指针: %@\n"
+        @"  被调用: %@\n"
+        @"  orig: %@\n"
         @"  伪造UUID: %s\n\n"
         @"getifaddrs:\n"
-        @"  hook被调用: %@\n"
-        @"  orig指针: %@\n\n"
-        @"ObjC swizzle: 已生效\n"
+        @"  被调用: %@\n"
+        @"  orig: %@\n\n"
+        @"ObjC: 已生效\n"
         @"设备名: %@\n"
         @"系统版本: %@",
+        diag_images_hooked,
         diag_sb_called ? @"YES ✅" : @"NO ❌",
-        orig_sysctlbyname ? @"OK ✅" : @"NULL ❌",
+        orig_sysctlbyname ? @"OK" : @"NULL",
         _c_machine[0] ? _c_machine : "(空)",
         realMachine[0] ? realMachine : "(空)",
+        diag_sysctl_called ? @"YES ✅" : @"NO ❌",
+        orig_sysctl ? @"OK" : @"NULL",
         diag_iok_called ? @"YES ✅" : @"NO ❌",
-        orig_IORegistryEntryCreateCFProperty ? @"OK ✅" : @"NULL ❌",
+        orig_IORegistryEntryCreateCFProperty ? @"OK" : @"NULL",
         _c_platformUUID[0] ? _c_platformUUID : "(空)",
         diag_gifa_called ? @"YES ✅" : @"NO ❌",
-        orig_getifaddrs ? @"OK ✅" : @"NULL ❌",
+        orig_getifaddrs ? @"OK" : @"NULL",
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step11 诊断"
+        alertControllerWithTitle:@"Step12 诊断"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    // Show on main thread after 5 seconds
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
@@ -337,7 +410,7 @@ static void showDiagnosticPopup(void) {
 }
 
 // ============================================================
-// WKWebView + URLRequest hooks (same as Step10)
+// WKWebView + URLRequest hooks
 // ============================================================
 static IMP orig_wk_init_frame = NULL;
 static IMP orig_wk_init_coder = NULL;
@@ -383,9 +456,10 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
 
-        rebindMainExecutable();
+        // KEY CHANGE: Hook ALL app bundle images, not just main exec!
+        rebindAppImages();
 
-        // ObjC hooks (same as Step10)
+        // ObjC hooks
         Class asmClass = objc_getClass("ASIdentifierManager");
         if (asmClass) {
             Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
@@ -448,7 +522,6 @@ static void initPrivacyHook(void) {
             if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
         }
 
-        // Show diagnostic popup after 5 seconds
         showDiagnosticPopup();
     }
 }
