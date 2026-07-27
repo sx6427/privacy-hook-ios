@@ -1,21 +1,14 @@
 //
-//  PrivacyHook.m — Step 20
+//  PrivacyHook.m — Step 19: Complete device fingerprint spoofing
 //
-//  Based on Step19 (all ObjC hooks + screen/RAM/disk spoofing)
-//  Adds: fishhook GLOBAL rebind_symbols for sysctlbyname ONLY
+//  Based on Step14 (proven safe, no crash)
+//  Adds: UIScreen, NSProcessInfo, NSFileManager hooks
 //
-//  Key insight: DYLD_INTERPOSE doesn't work for Baidu's code because
-//  our dylib loads AFTER Baidu's frameworks. fishhook rebind_symbols
-//  modifies the lazy/non-lazy symbol pointers in ALL images, including
-//  Baidu's frameworks.
+//  Problem: We spoofed device model (e.g. iPhone14,5) but screen resolution,
+//  RAM, disk size still showed real device values (iPhone11,2).
+//  Baidu sees mismatch → same device.
 //
-//  Step12b crashed because it hooked 4 functions (sysctlbyname + sysctl
-//  + IORegistry + getifaddrs). getifaddrs returning NULL crashes network
-//  libs. IORegistry returning fake values crashes system services.
-//
-//  This version hooks ONLY sysctlbyname. The hook function only
-//  intercepts hw.machine/hw.model/hw.serialnumber, everything else
-//  passes through to the original function. System libs are unaffected.
+//  Fix: Spoof ALL ObjC-accessible device info to match the fake model.
 //
 
 #import <Foundation/Foundation.h>
@@ -33,14 +26,9 @@
 #import <net/if.h>
 #import <mach-o/dyld.h>
 #import "fishhook.h"
+#import <sys/utsname.h>
 
 #define NSLog(...)
-
-// ============================================================
-// Diagnostic counters
-// ============================================================
-static volatile int diag_sbn_called = 0;
-static volatile int diag_sbn_intercepted = 0;
 
 // ============================================================
 // Spoofed values
@@ -57,7 +45,7 @@ static char _c_hwmodel[32] = {0};
 static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
-// Screen + hardware specs
+// Screen + hardware specs (must match spoofed device model)
 static CGFloat _spoof_boundsW = 0, _spoof_boundsH = 0;
 static CGFloat _spoof_nativeW = 0, _spoof_nativeH = 0;
 static CGFloat _spoof_scale = 0, _spoof_nativeScale = 0;
@@ -68,14 +56,22 @@ static uint64_t _spoof_diskTotal = 0;
 static uint64_t _spoof_diskFree = 0;
 
 // ============================================================
-// fishhook: sysctlbyname ONLY
+// Diagnostic counters
+// ============================================================
+static volatile int diag_sbn_called = 0;
+static volatile int diag_sbn_intercepted = 0;
+static volatile int diag_uname_called = 0;
+static volatile int diag_uname_intercepted = 0;
+
+
+// ============================================================
+// fishhook: sysctlbyname + uname (global rebind)
 // ============================================================
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 
 static int hooked_sysctlbyname(const char *name, void *oldp,
                                 size_t *oldlenp, void *newp, size_t newlen) {
     diag_sbn_called++;
-
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             diag_sbn_intercepted++;
@@ -108,14 +104,26 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
             }
         }
     }
-
-    // Pass through to original — system libs unaffected
     if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     return -1;
 }
 
+static int (*orig_uname)(struct utsname *) = NULL;
+
+static int hooked_uname(struct utsname *name) {
+    diag_uname_called++;
+    int ret = -1;
+    if (orig_uname) ret = orig_uname(name);
+    if (ret == 0 && _c_machine[0] != 0) {
+        diag_uname_intercepted++;
+        strlcpy(name->machine, _c_machine, sizeof(name->machine));
+        if (_c_hwmodel[0] != 0) strlcpy(name->machine, _c_machine, sizeof(name->machine));
+    }
+    return ret;
+}
+
 // ============================================================
-// DYLD_INTERPOSE for IORegistry + getifaddrs (our own calls only)
+// DYLD_INTERPOSE macros (kept from Step14, works for our own calls)
 // ============================================================
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
@@ -127,6 +135,78 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
       (const void *)(unsigned long)&_replacee, \
   };
 
+// ============================================================
+// Hook: sysctlbyname
+// ============================================================
+static int my_sysctlbyname(const char *name, void *oldp,
+                            size_t *oldlenp, void *newp, size_t newlen) {
+    if (name && newp == NULL && newlen == 0) {
+        if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
+            size_t need = strlen(_c_machine) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_machine, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
+            size_t need = strlen(_c_hwmodel) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_hwmodel, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
+            size_t need = strlen(_c_platformSerial) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_platformSerial, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+    }
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
+
+// ============================================================
+// Hook: sysctl (numeric ID)
+// ============================================================
+static int my_sysctl(int *name, u_int namelen, void *oldp,
+                     size_t *oldlenp, void *newp, size_t newlen) {
+    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
+        if (name[0] == 6) {  // CTL_HW
+            if (name[1] == 1 && _c_machine[0] != 0) {  // HW_MACHINE
+                size_t need = strlen(_c_machine) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_machine, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+            if (name[1] == 2 && _c_hwmodel[0] != 0) {  // HW_MODEL
+                size_t need = strlen(_c_hwmodel) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_hwmodel, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+        }
+    }
+    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(my_sysctl, sysctl);
+
+// ============================================================
+// Hook: IORegistryEntryCreateCFProperty
+// ============================================================
 static CFTypeRef my_IORegistryEntryCreateCFProperty(
     io_registry_entry_t entry, CFStringRef key,
     CFAllocatorRef allocator, IOOptionBits options) {
@@ -142,6 +222,9 @@ static CFTypeRef my_IORegistryEntryCreateCFProperty(
 }
 DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
 
+// ============================================================
+// Hook: getifaddrs
+// ============================================================
 static int my_getifaddrs(struct ifaddrs **ifap) {
     *ifap = NULL;
     return 0;
@@ -194,6 +277,7 @@ static NSString *getOrCreateSpoofedSysVersion(void) {
     return v;
 }
 
+// Device specs table: machine|boundsW|boundsH|nativeW|nativeH|scale|nativeScale|maxFps|memGB|cpuCount
 static void initSpoofedHWInfoC(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *key = kKey(@"hw");
@@ -211,6 +295,7 @@ static void initSpoofedHWInfoC(void) {
     }
     strlcpy(_c_machine, [saved UTF8String], sizeof(_c_machine));
 
+    // Lookup screen + hardware specs for this device model
     typedef struct {
         const char *machine;
         CGFloat bw, bh, nw, nh, scale, nscale;
@@ -220,17 +305,17 @@ static void initSpoofedHWInfoC(void) {
     } DeviceSpec;
 
     DeviceSpec specs[] = {
-        {"iPhone14,5", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},
-        {"iPhone14,2", 390, 844, 1170, 2533, 3.0, 3.0, 120, 6, 6},
-        {"iPhone14,3", 428, 926, 1284, 2778, 3.0, 3.0, 120, 6, 6},
-        {"iPhone14,7", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},
-        {"iPhone14,8", 428, 926, 1284, 2778, 3.0, 3.0, 60, 4, 6},
-        {"iPhone15,2", 393, 852, 1179, 2556, 3.0, 3.0, 120, 6, 6},
-        {"iPhone15,3", 430, 932, 1290, 2796, 3.0, 3.0, 120, 6, 6},
-        {"iPhone15,4", 393, 852, 1179, 2556, 3.0, 3.0, 60, 6, 6},
-        {"iPhone15,5", 430, 932, 1290, 2796, 3.0, 3.0, 60, 6, 6},
-        {"iPhone16,1", 393, 852, 1179, 2556, 3.0, 3.0, 120, 8, 6},
-        {"iPhone16,2", 430, 932, 1290, 2796, 3.0, 3.0, 120, 8, 6},
+        {"iPhone14,5", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},   // iPhone 13
+        {"iPhone14,2", 390, 844, 1170, 2533, 3.0, 3.0, 120, 6, 6},  // iPhone 13 Pro
+        {"iPhone14,3", 428, 926, 1284, 2778, 3.0, 3.0, 120, 6, 6},  // iPhone 13 Pro Max
+        {"iPhone14,7", 390, 844, 1170, 2533, 3.0, 3.0, 60, 4, 6},   // iPhone 14
+        {"iPhone14,8", 428, 926, 1284, 2778, 3.0, 3.0, 60, 4, 6},   // iPhone 14 Plus
+        {"iPhone15,2", 393, 852, 1179, 2556, 3.0, 3.0, 120, 6, 6},  // iPhone 14 Pro
+        {"iPhone15,3", 430, 932, 1290, 2796, 3.0, 3.0, 120, 6, 6},  // iPhone 14 Pro Max
+        {"iPhone15,4", 393, 852, 1179, 2556, 3.0, 3.0, 60, 6, 6},   // iPhone 15
+        {"iPhone15,5", 430, 932, 1290, 2796, 3.0, 3.0, 60, 6, 6},   // iPhone 15 Plus
+        {"iPhone16,1", 393, 852, 1179, 2556, 3.0, 3.0, 120, 8, 6},  // iPhone 15 Pro
+        {"iPhone16,2", 430, 932, 1290, 2796, 3.0, 3.0, 120, 8, 6},  // iPhone 15 Pro Max
     };
 
     const char *machine = [saved UTF8String];
@@ -259,6 +344,7 @@ static void initSpoofedHWInfoC(void) {
         _spoof_processorCount = 6;
     }
 
+    // hw.model
     NSString *hwmodelKey = kKey(@"hwm");
     NSString *hwmodel = [defaults stringForKey:hwmodelKey];
     if (!hwmodel) {
@@ -270,6 +356,7 @@ static void initSpoofedHWInfoC(void) {
     }
     strlcpy(_c_hwmodel, [hwmodel UTF8String], sizeof(_c_hwmodel));
 
+    // Disk size: random 128/256/512 GB
     NSString *diskKey = kKey(@"disk");
     uint64_t savedDisk = [[defaults stringForKey:diskKey] longLongValue];
     if (savedDisk == 0) {
@@ -279,6 +366,7 @@ static void initSpoofedHWInfoC(void) {
         [defaults synchronize];
     }
     _spoof_diskTotal = savedDisk * 1024ULL * 1024 * 1024;
+    // Random free space: 30%-80% of total
     NSString *diskFreeKey = kKey(@"diskf");
     uint64_t savedFree = [[defaults stringForKey:diskFreeKey] longLongValue];
     if (savedFree == 0) {
@@ -382,7 +470,7 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// UIScreen hooks
+// UIScreen hooks — screen resolution spoofing
 // ============================================================
 static IMP orig_screen_bounds = NULL;
 static CGRect my_screen_bounds(id self, SEL _cmd) {
@@ -415,7 +503,7 @@ static NSInteger my_screen_maxFps(id self, SEL _cmd) {
 }
 
 // ============================================================
-// NSProcessInfo hooks
+// NSProcessInfo hooks — RAM, CPU, OS version
 // ============================================================
 static IMP orig_pi_osVersion = NULL;
 static NSOperatingSystemVersion my_pi_osVersion(id self, SEL _cmd) {
@@ -443,7 +531,7 @@ static NSUInteger my_pi_procCount(id self, SEL _cmd) {
 }
 
 // ============================================================
-// NSFileManager hooks — disk space
+// NSFileManager hooks — disk space spoofing
 // ============================================================
 static IMP orig_fm_attrs = NULL;
 static NSDictionary *my_fm_attrs(id self, SEL _cmd, NSString *path, NSError **error) {
@@ -489,22 +577,20 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    // Get real device model by calling original sysctlbyname
+    // Get real device model via orig_sysctlbyname
     char realMachine[32] = {0};
     size_t size = sizeof(realMachine);
-    // This call goes through our hook, so it returns spoofed value
-    // To get real value, we need orig_sysctlbyname
-    if (orig_sysctlbyname) {
-        orig_sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
-    }
+    if (orig_sysctlbyname) orig_sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step20 fishhook ===\n\n"
+        @"=== Step21 fishhook+vm_protect ===\n\n"
         @"sysctlbyname:\n"
         @"  调用:%d 拦截:%d\n"
         @"  orig: %@\n"
         @"  伪造: %s\n"
         @"  真实: %s\n\n"
+        @"uname:\n"
+        @"  调用:%d 拦截:%d\n\n"
         @"设备: %s\n"
         @"屏幕: %.0fx%.0f\n"
         @"内存: %lluGB\n"
@@ -514,13 +600,14 @@ static void showDiagnosticPopup(void) {
         orig_sysctlbyname ? @"OK" : @"NULL",
         _c_machine[0] ? _c_machine : "(空)",
         realMachine[0] ? realMachine : "(空)",
+        diag_uname_called, diag_uname_intercepted,
         _c_machine[0] ? _c_machine : "(空)",
         _spoof_boundsW, _spoof_boundsH,
         _spoof_physicalMemory / (1024*1024*1024),
         _spoofedSysVersion, _spoofedDeviceName];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step20"
+        alertControllerWithTitle:@"Step21"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -557,18 +644,19 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
 
-        // === fishhook: GLOBAL rebind_symbols for sysctlbyname ONLY ===
-        // This modifies lazy/non-lazy symbol pointers in ALL images
-        // (including Baidu's frameworks) to point to our hook.
-        // Only sysctlbyname is hooked — system libs are unaffected for
-        // all other functions.
+        // === fishhook: global rebind for sysctlbyname + uname ===
+        // Save original pointers via dlsym FIRST (before any rebind)
+        orig_sysctlbyname = dlsym(RTLD_DEFAULT, "sysctlbyname");
+        orig_uname = dlsym(RTLD_DEFAULT, "uname");
         struct rebinding rebindings[] = {
             {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
+            {"uname", (void *)hooked_uname, (void **)&orig_uname},
         };
-        rebind_symbols(rebindings, 1);
+        rebind_symbols(rebindings, 2);
 
         // === ObjC hooks ===
 
+        // ASIdentifierManager (IDFA)
         Class asmClass = objc_getClass("ASIdentifierManager");
         if (asmClass) {
             Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
@@ -577,12 +665,14 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; }); hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled), imp, method_getTypeEncoding(m)); }
         }
 
+        // ATTrackingManager
         Class attClass = objc_getClass("ATTrackingManager");
         if (attClass) {
             Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
             if (m) { IMP imp = imp_implementationWithBlock(^NSInteger(id s) { return 3; }); hookClassMethod(attClass, @selector(trackingAuthorizationStatus), imp, method_getTypeEncoding(m)); }
         }
 
+        // UIDevice
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
@@ -597,6 +687,7 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; }); hookInstanceMethod(uiDeviceClass, @selector(localizedModel), imp, method_getTypeEncoding(m)); }
         }
 
+        // UIScreen — screen resolution
         Class screenClass = objc_getClass("UIScreen");
         if (screenClass) {
             Method m = class_getInstanceMethod(screenClass, @selector(bounds));
@@ -611,6 +702,7 @@ static void initPrivacyHook(void) {
             if (m) { orig_screen_maxFps = method_getImplementation(m); class_replaceMethod(screenClass, @selector(maximumFramesPerSecond), (IMP)my_screen_maxFps, method_getTypeEncoding(m)); }
         }
 
+        // NSProcessInfo — RAM, CPU, OS version
         Class piClass = objc_getClass("NSProcessInfo");
         if (piClass) {
             Method m = class_getInstanceMethod(piClass, @selector(operatingSystemVersion));
@@ -621,12 +713,14 @@ static void initPrivacyHook(void) {
             if (m) { orig_pi_procCount = method_getImplementation(m); class_replaceMethod(piClass, @selector(processorCount), (IMP)my_pi_procCount, method_getTypeEncoding(m)); }
         }
 
+        // NSFileManager — disk space
         Class fmClass = objc_getClass("NSFileManager");
         if (fmClass) {
             Method m = class_getInstanceMethod(fmClass, @selector(attributesOfFileSystemForPath:error:));
             if (m) { orig_fm_attrs = method_getImplementation(m); class_replaceMethod(fmClass, @selector(attributesOfFileSystemForPath:error:), (IMP)my_fm_attrs, method_getTypeEncoding(m)); }
         }
 
+        // UIPasteboard
         Class pbClass = objc_getClass("UIPasteboard");
         if (pbClass) {
             Method m = class_getInstanceMethod(pbClass, @selector(string));
@@ -643,11 +737,13 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^BOOL(id s, NSArray *t) { return NO; }); hookInstanceMethod(pbClass, @selector(containsPasteboardTypes:), imp, method_getTypeEncoding(m)); }
         }
 
+        // NSFileManager containerURL
         if (fmClass) {
             Method m = class_getInstanceMethod(fmClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
             if (m) { IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *g) { return nil; }); hookInstanceMethod(fmClass, @selector(containerURLForSecurityApplicationGroupIdentifier:), imp, method_getTypeEncoding(m)); }
         }
 
+        // WKWebView
         Class wkClass = objc_getClass("WKWebView");
         if (wkClass) {
             Method m = class_getInstanceMethod(wkClass, @selector(customUserAgent));
@@ -658,6 +754,7 @@ static void initPrivacyHook(void) {
             if (m) { orig_wk_init_coder = method_getImplementation(m); class_replaceMethod(wkClass, @selector(initWithCoder:), (IMP)my_wk_init_coder, method_getTypeEncoding(m)); }
         }
 
+        // NSMutableURLRequest User-Agent
         Class reqClass = objc_getClass("NSMutableURLRequest");
         if (reqClass) {
             Method m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
