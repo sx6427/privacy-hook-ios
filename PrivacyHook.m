@@ -2,20 +2,24 @@
 //  PrivacyHook.m
 //  Device Fingerprint + Login State Isolation Dylib for iOS
 //
-//  v19: Modify NSBundle's INTERNAL info dictionary ivar directly.
+//  v20: Hook CFBundleGetIdentifier + CFBundleGetValueForInfoDictionaryKey
+//       via fishhook. These are CoreFoundation C functions that payment
+//       SDKs use to read Bundle ID, bypassing ALL ObjC method hooks.
 //
-//  Previous problem: hooking infoDictionary METHOD broke icons.
-//  New approach: don't hook the method at all. Instead, find the
-//  internal NSDictionary ivar inside NSBundle and replace
-//  CFBundleIdentifier in the actual data. This way:
-//  - infoDictionary method returns the modified dict naturally
-//  - objectForInfoDictionaryKey: reads from the same modified dict
-//  - bundleIdentifier method is still hooked (belt & suspenders)
-//  - No method hook on infoDictionary = no icon issues
+//  ROOT CAUSE ANALYSIS:
+//  Payment SDK reads CFBundleIdentifier via 5 paths:
+//  1. [NSBundle mainBundle].bundleIdentifier           → ObjC hook ✅ (v13+)
+//  2. [NSBundle mainBundle] objectForInfoDictionaryKey: → ObjC hook ✅ (v19)
+//  3. [NSBundle mainBundle].infoDictionary[@"CFBundle..."] → ivar mod ✅ (v19)
+//  4. CFBundleGetIdentifier(CFBundleGetMainBundle())  → C function ❌ NOT HOOKED
+//  5. CFBundleGetValueForInfoDictionaryKey(...)        → C function ❌ NOT HOOKED
 //
-//  Also: force ONE keychain clear (new flag kc19) to remove any
-//  cached risk flags from v14. After that, first-launch-only.
-//  User stays logged in on subsequent launches.
+//  v13 "sometimes worked" = SDK sometimes used ObjC (hooked), sometimes C (not).
+//  After v14's aggressive hooks, SDK switched to always using C API → always fail.
+//
+//  v20 uses fishhook ONLY for these 2 C functions. No sysctl, no getifaddrs,
+//  no dyld, no dladdr — those were what caused v14's account bans.
+//  fishhook for 2 CFBundle functions is minimal and safe.
 //
 
 #import <Foundation/Foundation.h>
@@ -24,8 +28,133 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <mach/mach.h>
+#import <string.h>
+#import <dlfcn.h>
 
 #define NSLog(...)
+
+// ============================================================
+// fishhook — minimal rebind_symbols (fixed: skip leading underscore)
+// ============================================================
+struct rebinding {
+    const char *name;
+    void *replacement;
+    void **replaced;
+};
+
+static void fishhook_rebind(const struct rebinding rebindings[], size_t rebindings_nel) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *header = _dyld_get_image_header(i);
+        if (!header) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        BOOL is64 = (header->magic == 0xFEEDFACF);
+        if (!is64 && header->magic != 0xFEEDFACE) continue;
+
+        const uint8_t *ptr = (const uint8_t *)header;
+        uint32_t ncmds;
+        if (is64) {
+            ncmds = ((struct mach_header_64 *)header)->ncmds;
+            ptr += sizeof(struct mach_header_64);
+        } else {
+            ncmds = ((struct mach_header *)header)->ncmds;
+            ptr += sizeof(struct mach_header);
+        }
+
+        uint64_t linkedit_fileoff = 0, linkedit_vmaddr = 0;
+        struct symtab_command symtab = {0};
+        struct dysymtab_command dysymtab = {0};
+
+        typedef struct { uint64_t addr; uint64_t size; } ptr_section_t;
+        ptr_section_t ptr_sections[8];
+        int ptr_section_count = 0;
+
+        for (uint32_t c = 0; c < ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)ptr;
+            if (lc->cmd == 0 || lc->cmdsize == 0) break;
+
+            if (is64 && lc->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
+                if (strcmp(seg->segname, SEG_DATA) == 0) {
+                    const struct section_64 *sects = (const struct section_64 *)
+                        (ptr + sizeof(struct segment_command_64));
+                    for (uint32_t s = 0; s < seg->nsects; s++) {
+                        if ((strcmp(sects[s].sectname, "__la_symbol_ptr") == 0 ||
+                             strcmp(sects[s].sectname, "__got") == 0) &&
+                            ptr_section_count < 8) {
+                            ptr_sections[ptr_section_count].addr = sects[s].addr;
+                            ptr_sections[ptr_section_count].size = sects[s].size;
+                            ptr_section_count++;
+                        }
+                    }
+                }
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+                    linkedit_fileoff = seg->fileoff;
+                    linkedit_vmaddr = seg->vmaddr;
+                }
+            }
+
+            if (lc->cmd == LC_SYMTAB)
+                memcpy(&symtab, ptr, sizeof(struct symtab_command));
+            if (lc->cmd == LC_DYSYMTAB)
+                memcpy(&dysymtab, ptr, sizeof(struct dysymtab_command));
+
+            ptr += lc->cmdsize;
+        }
+
+        if (ptr_section_count == 0 || !symtab.symoff || !dysymtab.indirectsymoff) continue;
+
+        uintptr_t linkedit_base = (uintptr_t)slide + linkedit_vmaddr - linkedit_fileoff;
+        struct nlist_64 *symbols = (struct nlist_64 *)(linkedit_base + symtab.symoff);
+        const char *strtab = (const char *)(linkedit_base + symtab.stroff);
+        const uint32_t *indirect_sym = (const uint32_t *)(linkedit_base + dysymtab.indirectsymoff);
+
+        for (int si = 0; si < ptr_section_count; si++) {
+            uint64_t *ptr_table = (uint64_t *)(slide + ptr_sections[si].addr);
+            uint32_t ptr_count = (uint32_t)(ptr_sections[si].size / sizeof(void *));
+
+            for (uint32_t j = 0; j < ptr_count; j++) {
+                uint32_t symtab_index = indirect_sym[j];
+                if (symtab_index == 0 ||
+                    symtab_index == INDIRECT_SYMBOL_ABS ||
+                    symtab_index == INDIRECT_SYMBOL_LOCAL) continue;
+
+                struct nlist_64 *sym = &symbols[symtab_index];
+                const char *sym_name = strtab + sym->n_un.n_strx;
+                if (!sym_name || sym_name[0] == '\0') continue;
+
+                // CRITICAL: skip leading underscore in Mach-O symbol names
+                const char *cmp_name = (sym_name[0] == '_') ? sym_name + 1 : sym_name;
+
+                for (size_t r = 0; r < rebindings_nel; r++) {
+                    if (strcmp(cmp_name, rebindings[r].name) == 0) {
+                        if (rebindings[r].replaced)
+                            *rebindings[r].replaced = (void *)ptr_table[j];
+                        size_t page_size = sysconf(_SC_PAGESIZE);
+                        uintptr_t page_start = (uintptr_t)(&ptr_table[j]) & ~(page_size - 1);
+                        vm_protect(mach_task_self(), (vm_address_t)page_start,
+                                   page_size, FALSE,
+                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+                        ptr_table[j] = (uint64_t)rebindings[r].replacement;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Original Bundle ID (file scope so C hooks can access it)
+// "com.baidu.BaiduMobile" built at runtime to avoid plaintext
+// ============================================================
+static CFStringRef g_origBundleID_CF = NULL;
+static NSString *g_origBundleID_NS = nil;
 
 // ============================================================
 // Persistent spoofed identifiers
@@ -47,9 +176,7 @@ static NSString *kKey(NSString *suffix) {
 static NSUUID *getOrCreateSpoofedUUID(NSString *key) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *uuidString = [defaults stringForKey:key];
-    if (uuidString) {
-        return [[NSUUID alloc] initWithUUIDString:uuidString];
-    }
+    if (uuidString) return [[NSUUID alloc] initWithUUIDString:uuidString];
     NSUUID *newUUID = [NSUUID UUID];
     [defaults setObject:[newUUID UUIDString] forKey:key];
     [defaults synchronize];
@@ -71,7 +198,6 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     NSString *prefix = prefixes[arc4random_uniform((uint32_t)prefixes.count)];
     NSString *suffix = suffixes[arc4random_uniform((uint32_t)suffixes.count)];
     NSString *name = [NSString stringWithFormat:@"%@%@", prefix, suffix];
-
     [defaults setObject:name forKey:key];
     [defaults synchronize];
     return name;
@@ -98,12 +224,11 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Keychain clearing — force one-time clear with new flag
+// Keychain clearing — one-time with new flag
 // ============================================================
 static void clearKeychainOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    // Use new flag to force one more clear even if old "kc" was set
-    NSString *key = kKey(@"kc19");
+    NSString *key = kKey(@"kc20");
     if ([defaults boolForKey:key]) return;
 
     NSArray *secItemClasses = @[
@@ -130,20 +255,42 @@ static void clearSharedCookies(void) {
 }
 
 // ============================================================
-// Modify NSBundle's internal info dictionary ivar directly.
-// This changes the ACTUAL data, not the method. All reads of
-// infoDictionary and objectForInfoDictionaryKey: will see the
-// modified CFBundleIdentifier without any method hooks.
+// fishhook'd C functions — CFBundle Bundle ID reads
+// These are the CoreFoundation C API paths that bypass ObjC hooks
 // ============================================================
-static void modifyBundleInfoDictionaryIvar(NSString *origBundleID) {
-    NSBundle *mainBundle = [NSBundle mainBundle];
 
-    // Force the info dictionary to load by accessing it once
-    // (this populates the internal ivar)
+// CFBundleGetIdentifier — returns the bundle's identifier
+static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef);
+
+static CFStringRef hook_CFBundleGetIdentifier(CFBundleRef bundle) {
+    if (g_origBundleID_CF && bundle == CFBundleGetMainBundle()) {
+        return g_origBundleID_CF;
+    }
+    return orig_CFBundleGetIdentifier(bundle);
+}
+
+// CFBundleGetValueForInfoDictionaryKey — reads a key from info dict
+static CFTypeRef (*orig_CFBundleGetValueForInfoDictionaryKey)(CFBundleRef, CFStringRef);
+
+static CFTypeRef hook_CFBundleGetValueForInfoDictionaryKey(CFBundleRef bundle, CFStringRef key) {
+    if (g_origBundleID_CF && bundle == CFBundleGetMainBundle() && key) {
+        // kCFBundleIdentifierKey == "CFBundleIdentifier"
+        if (CFStringCompare(key, CFSTR("CFBundleIdentifier"), 0) == kCFCompareEqualTo) {
+            return g_origBundleID_CF;
+        }
+    }
+    return orig_CFBundleGetValueForInfoDictionaryKey(bundle, key);
+}
+
+// ============================================================
+// Modify NSBundle's internal info dictionary ivar directly
+// Covers: [bundle infoDictionary][@"CFBundleIdentifier"]
+// ============================================================
+static void modifyBundleInfoDictionaryIvar(void) {
+    NSBundle *mainBundle = [NSBundle mainBundle];
     NSDictionary *loaded = [mainBundle infoDictionary];
     if (!loaded) return;
 
-    // Enumerate all ivars of NSBundle to find the one holding the info dict
     unsigned int count = 0;
     Ivar *ivars = class_copyIvarList([NSBundle class], &count);
 
@@ -153,23 +300,13 @@ static void modifyBundleInfoDictionaryIvar(NSString *origBundleID) {
         if (!type || type[0] != '@') continue;
 
         id value = object_getIvar(mainBundle, ivar);
-        if ([value isKindOfClass:[NSDictionary class]]) {
-            // Check if this dict contains CFBundleIdentifier
-            if ([value objectForKey:@"CFBundleIdentifier"]) {
-                // Found the info dictionary ivar!
-                // Replace with a mutable copy that has the original Bundle ID
-                NSMutableDictionary *modified =
-                    [NSMutableDictionary dictionaryWithDictionary:value];
-                modified[@"CFBundleIdentifier"] = origBundleID;
-
-                // Also replace CFBundleExecutable if it differs
-                // (some SDKs check this too)
-                // Keep original value — don't touch other keys
-
-                // Set the modified dict back into the ivar
-                object_setIvar(mainBundle, ivar, modified);
-                break;
-            }
+        if ([value isKindOfClass:[NSDictionary class]] &&
+            [value objectForKey:@"CFBundleIdentifier"]) {
+            NSMutableDictionary *modified =
+                [NSMutableDictionary dictionaryWithDictionary:value];
+            modified[@"CFBundleIdentifier"] = g_origBundleID_NS;
+            object_setIvar(mainBundle, ivar, modified);
+            break;
         }
     }
     free(ivars);
@@ -181,18 +318,18 @@ static void modifyBundleInfoDictionaryIvar(NSString *origBundleID) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        // --- Original Bundle ID (runtime-constructed) ---
-        static NSString *origBundleID = nil;
+        // --- Build original Bundle ID at runtime ---
         const char parts[] = {99,111,109,46,98,97,105,100,117,46,
                               66,97,105,100,117,77,111,98,105,108,101,0};
-        origBundleID = [NSString stringWithUTF8String:parts];
+        g_origBundleID_NS = [NSString stringWithUTF8String:parts];
+        g_origBundleID_CF = (__bridge_retained CFStringRef)g_origBundleID_NS;
 
         // --- Initialize spoofed values ---
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // --- Clear keychain ONE TIME (force with new flag) ---
+        // --- One-time keychain clear ---
         clearKeychainOnce();
 
         // --- Clear cookies ---
@@ -304,43 +441,36 @@ static void initPrivacyHook(void) {
         }
 
         // ============================================================
-        // 6. Bundle ID — THREE layers of protection
+        // 6. Bundle ID — 5 LAYERS of protection
         //
-        //    Layer A: bundleIdentifier METHOD hook
-        //    Layer B: objectForInfoDictionaryKey: hook (only CFBundleIdentifier)
-        //    Layer C: ivar modification (changes the ACTUAL internal dict)
+        //    Layer A: bundleIdentifier METHOD hook (ObjC)
+        //    Layer B: objectForInfoDictionaryKey: hook (ObjC)
+        //    Layer C: internal ivar modification (data-level)
+        //    Layer D: CFBundleGetIdentifier hook (fishhook C)
+        //    Layer E: CFBundleGetValueForInfoDictionaryKey hook (fishhook C)
         //
-        //    Layer C is the key innovation: instead of hooking the
-        //    infoDictionary method (which broke icons in v9/v17),
-        //    we modify the internal NSDictionary data directly.
-        //    This means infoDictionary returns the modified dict
-        //    naturally, without any method hook.
+        //    Layers D & E are the NEW additions in v20.
+        //    They cover CoreFoundation C API that bypasses ObjC.
         // ============================================================
 
-        // Layer C: Modify internal ivar FIRST (before any method hooks)
-        // This ensures the data is correct even if called before hooks are set
-        modifyBundleInfoDictionaryIvar(origBundleID);
+        // Layer C: Modify internal ivar FIRST
+        modifyBundleInfoDictionaryIvar();
 
-        // Layer A + B: Method hooks for belt-and-suspenders
+        // Layer A + B: ObjC method hooks
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
-            // 6a. bundleIdentifier method
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
             if (m) {
                 static IMP orig_bundleID = NULL;
                 orig_bundleID = method_getImplementation(m);
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    if (s == [NSBundle mainBundle]) {
-                        return origBundleID;
-                    }
+                    if (s == [NSBundle mainBundle]) return g_origBundleID_NS;
                     return ((NSString *(*)(id, SEL))orig_bundleID)(s, @selector(bundleIdentifier));
                 });
                 hookInstanceMethod(bundleClass, @selector(bundleIdentifier),
                                    imp, method_getTypeEncoding(m));
             }
 
-            // 6b. objectForInfoDictionaryKey: — intercept CFBundleIdentifier only
-            //     (This was tested in v13.1 and did NOT break icons)
             m = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
             if (m) {
                 static IMP orig_infoKey = NULL;
@@ -348,7 +478,7 @@ static void initPrivacyHook(void) {
                 IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
                     if (s == [NSBundle mainBundle] && key &&
                         [key isEqualToString:@"CFBundleIdentifier"]) {
-                        return origBundleID;
+                        return g_origBundleID_NS;
                     }
                     return ((id(*)(id, SEL, NSString *))orig_infoKey)(
                         s, @selector(objectForInfoDictionaryKey:), key);
@@ -357,5 +487,16 @@ static void initPrivacyHook(void) {
                                    imp, method_getTypeEncoding(m));
             }
         }
+
+        // Layer D + E: fishhook for CoreFoundation C functions
+        struct rebinding rebindings[] = {
+            { "CFBundleGetIdentifier",
+              (void *)hook_CFBundleGetIdentifier,
+              (void **)&orig_CFBundleGetIdentifier },
+            { "CFBundleGetValueForInfoDictionaryKey",
+              (void *)hook_CFBundleGetValueForInfoDictionaryKey,
+              (void **)&orig_CFBundleGetValueForInfoDictionaryKey },
+        };
+        fishhook_rebind(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
     }
 }
