@@ -1,12 +1,15 @@
 //
-//  PrivacyHook.m — Step 12c: hook ONLY .app images, ONLY sysctlbyname+sysctl
+//  PrivacyHook.m — Step 12d: .app images + ONLY sysctlbyname (no sysctl!)
 //
-//  Step12  crashed: hooking getifaddrs(return NULL) + IORegistry(orig=NULL)
-//  Step12b crashed: global rebind_symbols hooks system libs → crash
+//  Step12  crashed: getifaddrs(NULL) + IORegistry(orig=NULL)
+//  Step12b crashed: global rebind → system lib sysctl crash
+//  Step12c crashed: .app images + sysctlbyname + sysctl
 //
-//  Step12c: rebind_symbols_image ONLY on .app/ images (not system libs!)
-//           ONLY hook sysctlbyname + sysctl (safe passthrough)
-//           NO getifaddrs, NO IORegistryEntryCreateCFProperty
+//  Step12d: .app images + ONLY sysctlbyname (known safe from Step11)
+//           NO sysctl, NO getifaddrs, NO IORegistry
+//
+//  Step11 proved sysctlbyname rebind is safe on main exec.
+//  This just extends it to ALL .app images.
 //
 
 #import <Foundation/Foundation.h>
@@ -24,16 +27,9 @@
 
 #define NSLog(...)
 
-// ============================================================
-// Diagnostic counters
-// ============================================================
 static volatile int diag_sb_called = 0;
-static volatile int diag_sysctl_called = 0;
 static volatile int diag_images_hooked = 0;
 
-// ============================================================
-// Spoofed values
-// ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
@@ -44,9 +40,7 @@ static NSString *_spoofedWebKitUA = nil;
 static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
 
-// Original function pointers
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -183,9 +177,8 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// fishhook hooks — PURE C, only intercept specific args
+// fishhook: ONLY sysctlbyname — known safe from Step11
 // ============================================================
-
 static int hooked_sysctlbyname(const char *name, void *oldp,
                                 size_t *oldlenp, void *newp, size_t newlen) {
     diag_sb_called = 1;
@@ -205,47 +198,23 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
     return -1;
 }
 
-static int hooked_sysctl(int *name, u_int namelen, void *oldp,
-                         size_t *oldlenp, void *newp, size_t newlen) {
-    diag_sysctl_called = 1;
-    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
-        if (name[0] == 6) { // CTL_HW
-            if (name[1] == 1 && _c_machine[0] != 0) { // HW_MACHINE
-                size_t need = strlen(_c_machine) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
-            }
-            if (name[1] == 2 && _c_hwmodel[0] != 0) { // HW_MODEL
-                size_t need = strlen(_c_hwmodel) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
-            }
-        }
-    }
-    if (orig_sysctl) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    return -1;
-}
-
 // ============================================================
-// Hook ONLY .app images, ONLY 2 safe functions
+// Hook ALL .app images, but ONLY sysctlbyname
 // ============================================================
 static void rebindAppImages(void) {
     uint32_t count = _dyld_image_count();
     struct rebinding rebindings[] = {
         {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
-        {"sysctl",       (void *)hooked_sysctl,       (void **)&orig_sysctl},
     };
-    int rebind_count = sizeof(rebindings)/sizeof(rebindings[0]);
 
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
-        // Only hook images inside the app bundle
         if (strstr(name, ".app/") != NULL) {
             const struct mach_header *header = _dyld_get_image_header(i);
             intptr_t slide = _dyld_get_image_vmaddr_slide(i);
             if (!header) continue;
-            rebind_symbols_image((void *)header, slide, rebindings, rebind_count);
+            rebind_symbols_image((void *)header, slide, rebindings, 1);
             diag_images_hooked++;
         }
     }
@@ -260,15 +229,12 @@ static void showDiagnosticPopup(void) {
     sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step12c 诊断 ===\n\n"
+        @"=== Step12d 诊断 ===\n\n"
         @"已 hook .app image 数: %d\n\n"
         @"sysctlbyname:\n"
         @"  被调用: %@\n"
         @"  orig: %@\n"
         @"  伪造: %s | 真实: %s\n\n"
-        @"sysctl (数字ID):\n"
-        @"  被调用: %@\n"
-        @"  orig: %@\n\n"
         @"ObjC: 已生效\n"
         @"设备名: %@\n系统版本: %@",
         diag_images_hooked,
@@ -276,12 +242,10 @@ static void showDiagnosticPopup(void) {
         orig_sysctlbyname ? @"OK" : @"NULL",
         _c_machine[0] ? _c_machine : "(空)",
         realMachine[0] ? realMachine : "(空)",
-        diag_sysctl_called ? @"YES ✅" : @"NO ❌",
-        orig_sysctl ? @"OK" : @"NULL",
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step12c"
+        alertControllerWithTitle:@"Step12d"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -345,7 +309,7 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
 
-        // Hook ONLY .app images, ONLY sysctlbyname + sysctl
+        // ONLY sysctlbyname, ONLY .app images
         rebindAppImages();
 
         // ObjC hooks
