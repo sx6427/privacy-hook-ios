@@ -556,8 +556,6 @@ static void showDiagnosticPopup(void) {
     NSString *msg = [NSString stringWithFormat:
         @"=== Step23 清理UD ===\n\n"
         @"设备: %s\n"
-        @"屏幕: %.0fx%.0f (native %.0fx%.0f)\n"
-        @"缩放: %.1f/%.1f  FPS: %d\n"
         @"内存: %lluGB  CPU: %d核\n"
         @"磁盘: %lluGB/%lluGB\n"
         @"系统: %@\n"
@@ -565,8 +563,6 @@ static void showDiagnosticPopup(void) {
         @"IDFA: %@\n"
         @"IDFV: %@",
         _c_machine[0] ? _c_machine : "(空)",
-        _spoof_boundsW, _spoof_boundsH, _spoof_nativeW, _spoof_nativeH,
-        _spoof_scale, _spoof_nativeScale, (int)_spoof_maxFps,
         _spoof_physicalMemory / (1024*1024*1024), (int)_spoof_processorCount,
         _spoof_diskTotal / (1024*1024*1024), _spoof_diskFree / (1024*1024*1024),
         _spoofedSysVersion, _spoofedDeviceName,
@@ -644,20 +640,8 @@ static void initPrivacyHook(void) {
             if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; }); hookInstanceMethod(uiDeviceClass, @selector(localizedModel), imp, method_getTypeEncoding(m)); }
         }
 
-        // UIScreen — screen resolution
-        Class screenClass = objc_getClass("UIScreen");
-        if (screenClass) {
-            Method m = class_getInstanceMethod(screenClass, @selector(bounds));
-            if (m) { orig_screen_bounds = method_getImplementation(m); class_replaceMethod(screenClass, @selector(bounds), (IMP)my_screen_bounds, method_getTypeEncoding(m)); }
-            m = class_getInstanceMethod(screenClass, @selector(nativeBounds));
-            if (m) { orig_screen_nativeBounds = method_getImplementation(m); class_replaceMethod(screenClass, @selector(nativeBounds), (IMP)my_screen_nativeBounds, method_getTypeEncoding(m)); }
-            m = class_getInstanceMethod(screenClass, @selector(scale));
-            if (m) { orig_screen_scale = method_getImplementation(m); class_replaceMethod(screenClass, @selector(scale), (IMP)my_screen_scale, method_getTypeEncoding(m)); }
-            m = class_getInstanceMethod(screenClass, @selector(nativeScale));
-            if (m) { orig_screen_nativeScale = method_getImplementation(m); class_replaceMethod(screenClass, @selector(nativeScale), (IMP)my_screen_nativeScale, method_getTypeEncoding(m)); }
-            m = class_getInstanceMethod(screenClass, @selector(maximumFramesPerSecond));
-            if (m) { orig_screen_maxFps = method_getImplementation(m); class_replaceMethod(screenClass, @selector(maximumFramesPerSecond), (IMP)my_screen_maxFps, method_getTypeEncoding(m)); }
-        }
+        // NOTE: UIScreen hooks REMOVED — caused UI layout issues
+        // (fake resolution didn't match physical screen, buttons off-screen)
 
         // NSProcessInfo — RAM, CPU, OS version
         Class piClass = objc_getClass("NSProcessInfo");
