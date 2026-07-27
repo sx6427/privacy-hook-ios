@@ -228,7 +228,7 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 // ============================================================
 static void clearKeychainOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"kc20");
+    NSString *key = kKey(@"kc21");
     if ([defaults boolForKey:key]) return;
 
     NSArray *secItemClasses = @[
