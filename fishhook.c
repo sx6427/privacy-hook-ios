@@ -88,8 +88,9 @@ static void perform_rebinding_with_section(section_t *section,
 static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                       const mach_header_t *header,
                                       intptr_t slide) {
-    Dl_info info;
-    if (dladdr(header, &info) == 0) return;
+    // REMOVED: dladdr check — dladdr may return 0 during constructor
+    // phase, causing the entire rebind to silently skip.
+    // The info from dladdr isn't used anyway.
 
     segment_command_t *cur_seg_cmd;
     segment_command_t *linkedit_segment = NULL;
