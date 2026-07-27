@@ -1,11 +1,11 @@
 //
-//  PrivacyHook.m — Step 4b: Step3 + UIDevice systemVersion (NO fishhook)
+//  PrivacyHook.m — Step 5: Step4b + fishhook(pure C) + WebView clear
 //
-//  Full device fingerprint via ObjC swizzle only:
-//    - IDFA, IDFV, device name, systemVersion
-//    - Keychain clear, cookie clear, pasteboard, app group
-//    - NO fishhook (causes crash when hooking sysctlbyname)
-//    - NO Bundle ID spoof (causes icon disappearance)
+//  CRITICAL FIX: fishhook hook function uses ONLY C code (no ObjC)
+//  Step4 crashed because hooked_sysctlbyname called [_spoofedModel UTF8String]
+//  which deadlocks when sysctlbyname is called during early runtime init.
+//
+//  Now: C strings are pre-filled in constructor, hook is pure C.
 //
 
 #import <Foundation/Foundation.h>
@@ -14,16 +14,23 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <sys/sysctl.h>
+#import <string.h>
+#import "fishhook.h"
 
 #define NSLog(...)
 
 // ============================================================
-// Spoofed values
+// Spoofed values (ObjC)
 // ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
 static NSString *_spoofedSysVersion = nil;
+
+// Spoofed values (C strings — used inside fishhook hook, NO ObjC!)
+static char _c_machine[32] = {0};   // "iPhone15,2"
+static char _c_hwmodel[32] = {0};   // "D83AP"
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -70,6 +77,38 @@ static NSString *getOrCreateSpoofedSysVersion(void) {
     return v;
 }
 
+// Pre-fill C strings BEFORE fishhook rebind — critical!
+static void initSpoofedHWInfoC(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(@"hw");
+
+    NSString *saved = [defaults stringForKey:key];
+    if (!saved) {
+        NSArray *models = @[
+            @"iPhone14,5|D27AP",
+            @"iPhone14,2|D63AP",
+            @"iPhone14,3|D64AP",
+            @"iPhone14,7|D37AP",
+            @"iPhone14,8|D38AP",
+            @"iPhone15,2|D83AP",
+            @"iPhone15,3|D84AP",
+            @"iPhone15,4|D37AP",
+            @"iPhone15,5|D38AP",
+            @"iPhone16,1|D93AP",
+            @"iPhone16,2|D94AP",
+        ];
+        saved = models[arc4random_uniform((uint32_t)models.count)];
+        [defaults setObject:saved forKey:key];
+        [defaults synchronize];
+    }
+
+    NSArray *parts = [saved componentsSeparatedByString:@"|"];
+    if (parts.count >= 2) {
+        strlcpy(_c_machine, [parts[0] UTF8String], sizeof(_c_machine));
+        strlcpy(_c_hwmodel, [parts[1] UTF8String], sizeof(_c_hwmodel));
+    }
+}
+
 // ============================================================
 // Method hooking helpers
 // ============================================================
@@ -91,7 +130,7 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Keychain + Cookie clearing
+// Data clearing
 // ============================================================
 static void clearKeychainOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -121,19 +160,111 @@ static void clearSharedCookies(void) {
     }
 }
 
+static void clearURLCache(void) {
+    [[NSURLCache sharedURLCache] removeAllCachedResponses];
+}
+
+static void clearWebViewData(void) {
+    Class wkClass = objc_getClass("WKWebsiteDataStore");
+    if (!wkClass) return;
+    id defaultStore = [wkClass performSelector:@selector(defaultDataStore)];
+    if (!defaultStore) return;
+
+    NSSet *allTypes = [NSSet setWithArray:@[
+        @"WKWebsiteDataTypeCookies",
+        @"WKWebsiteDataTypeSessionStorage",
+        @"WKWebsiteDataTypeLocalStorage",
+        @"WKWebsiteDataTypeWebSQLDatabases",
+        @"WKWebsiteDataTypeIndexedDBDatabases",
+        @"WKWebsiteDataTypeDiskCache",
+        @"WKWebsiteDataTypeMemoryCache",
+        @"WKWebsiteDataTypeOfflineWebApplicationCache",
+        @"WKWebsiteDataTypeFetchCache",
+        @"WKWebsiteDataTypeServiceWorkerRegistrations",
+    ]];
+
+    SEL fetchSel = NSSelectorFromString(@"fetchDataRecordsOfTypes:completionHandler:");
+    SEL removeSel = NSSelectorFromString(@"removeDataOfTypes:forDataRecords:completionHandler:");
+
+    if (![defaultStore respondsToSelector:fetchSel]) return;
+
+    // Fetch all records, then remove them
+    ((void(*)(id, SEL, NSSet *, void(^)(NSArray *)))objc_msgSend)(
+        defaultStore, fetchSel, allTypes, ^(NSArray *records) {
+        if (![defaultStore respondsToSelector:removeSel]) return;
+        ((void(*)(id, SEL, NSSet *, NSArray *, void(^)()))objc_msgSend)(
+            defaultStore, removeSel, allTypes, records, ^{});
+    });
+}
+
+// ============================================================
+// fishhook: sysctlbyname — PURE C, ZERO ObjC!
+// ============================================================
+static int (*orig_sysctlbyname)(const char *, void *, size_t *,
+                                 void *, size_t) = NULL;
+
+static int hooked_sysctlbyname(const char *name, void *oldp,
+                                size_t *oldlenp, void *newp,
+                                size_t newlen) {
+    // Only intercept reads
+    if (name && newp == NULL && newlen == 0) {
+
+        if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
+            size_t need = strlen(_c_machine) + 1;
+            if (oldp == NULL) {
+                if (oldlenp) *oldlenp = need;
+                return 0;
+            }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_machine, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+
+        if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
+            size_t need = strlen(_c_hwmodel) + 1;
+            if (oldp == NULL) {
+                if (oldlenp) *oldlenp = need;
+                return 0;
+            }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_hwmodel, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+    }
+
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
 // ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
+        // --- Init spoofed values FIRST ---
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
         _spoofedSysVersion = getOrCreateSpoofedSysVersion();
+        initSpoofedHWInfoC();  // C strings must be ready before fishhook!
 
+        // --- Clear stored data ---
         clearKeychainOnce();
         clearSharedCookies();
+        clearURLCache();
+        clearWebViewData();
+
+        // --- fishhook: sysctlbyname (pure C hook) ---
+        struct rebinding r = {
+            "sysctlbyname",
+            (void *)hooked_sysctlbyname,
+            (void **)&orig_sysctlbyname
+        };
+        rebind_symbols(&r, 1);
 
         // --- 1. IDFA ---
         Class asmClass = objc_getClass("ASIdentifierManager");
@@ -160,7 +291,7 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // --- 3. UIDevice: IDFV + name + systemVersion ---
+        // --- 3. UIDevice ---
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
@@ -180,7 +311,7 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // --- 4. UIPasteboard — block ALL reads ---
+        // --- 4. UIPasteboard ---
         Class pbClass = objc_getClass("UIPasteboard");
         if (pbClass) {
             Method m = class_getInstanceMethod(pbClass, @selector(string));
