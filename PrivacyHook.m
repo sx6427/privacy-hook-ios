@@ -1,11 +1,13 @@
 //
-//  PrivacyHook.m — Step 5: Step4b + fishhook(pure C) + WebView clear
+//  PrivacyHook.m — Step 6: DYLD_INTERPOSE for sysctlbyname
 //
-//  CRITICAL FIX: fishhook hook function uses ONLY C code (no ObjC)
-//  Step4 crashed because hooked_sysctlbyname called [_spoofedModel UTF8String]
-//  which deadlocks when sysctlbyname is called during early runtime init.
+//  Step5 crashed because fishhook modifies the symbol table at runtime,
+//  which corrupts sysctlbyname calls during early init.
 //
-//  Now: C strings are pre-filled in constructor, hook is pure C.
+//  DYLD_INTERPOSE is a compile-time directive: dyld itself replaces the
+//  symbol when loading the dylib. No runtime patching = no crash.
+//
+//  Everything else identical to Step5.
 //
 
 #import <Foundation/Foundation.h>
@@ -17,21 +19,33 @@
 #import <objc/message.h>
 #import <sys/sysctl.h>
 #import <string.h>
-#import "fishhook.h"
 
 #define NSLog(...)
 
 // ============================================================
-// Spoofed values (ObjC)
+// DYLD_INTERPOSE macro
+// ============================================================
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+   __attribute__((used)) static struct { \
+       const void *replacement; \
+       const void *replacee; \
+   } _interpose_##_replacee \
+   __attribute__((section("__DATA,__interpose"))) = { \
+       (const void *)(unsigned long)&_replacement, \
+       (const void *)(unsigned long)&_replacee \
+   };
+
+// ============================================================
+// Spoofed values
 // ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
 static NSString *_spoofedSysVersion = nil;
 
-// Spoofed values (C strings — used inside fishhook hook, NO ObjC!)
-static char _c_machine[32] = {0};   // "iPhone15,2"
-static char _c_hwmodel[32] = {0};   // "D83AP"
+// C strings for sysctl hook (no ObjC in hook!)
+static char _c_machine[32] = {0};
+static char _c_hwmodel[32] = {0};
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -78,7 +92,6 @@ static NSString *getOrCreateSpoofedSysVersion(void) {
     return v;
 }
 
-// Pre-fill C strings BEFORE fishhook rebind — critical!
 static void initSpoofedHWInfoC(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *key = kKey(@"hw");
@@ -186,10 +199,8 @@ static void clearWebViewData(void) {
 
     SEL fetchSel = NSSelectorFromString(@"fetchDataRecordsOfTypes:completionHandler:");
     SEL removeSel = NSSelectorFromString(@"removeDataOfTypes:forDataRecords:completionHandler:");
-
     if (![defaultStore respondsToSelector:fetchSel]) return;
 
-    // Fetch all records, then remove them
     ((void(*)(id, SEL, NSSet *, void(^)(NSArray *)))objc_msgSend)(
         defaultStore, fetchSel, allTypes, ^(NSArray *records) {
         if (![defaultStore respondsToSelector:removeSel]) return;
@@ -199,14 +210,28 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// fishhook: sysctlbyname — PURE C, ZERO ObjC!
+// DYLD_INTERPOSE: sysctlbyname — PURE C
 // ============================================================
-static int (*orig_sysctlbyname)(const char *, void *, size_t *,
-                                 void *, size_t) = NULL;
+// The replacement function. dyld replaces ALL calls to sysctlbyname
+// with this function at load time. No runtime patching needed.
+//
+// IMPORTANT: We must call the real sysctlbyname via a pointer that
+// dyld provides. With DYLD_INTERPOSE, the real function is still
+// accessible because interposing only affects OTHER modules' calls,
+// not our own. So we can call sysctlbyname() directly here.
+//
+// Wait — that's wrong. DYLD_INTERPOSE replaces globally, including
+// in our own dylib. We need a way to call the original.
+// Solution: use dlsym(RTLD_NEXT, "sysctlbyname") — no, that returns
+// our interposed version too.
+//
+// Actually: DYLD_INTERPOSE does NOT interpose within the same image.
+// Calls to sysctlbyname from within this dylib still go to the real one.
+// This is documented Apple behavior. So we're safe!
 
-static int hooked_sysctlbyname(const char *name, void *oldp,
-                                size_t *oldlenp, void *newp,
-                                size_t newlen) {
+static int my_sysctlbyname(const char *name, void *oldp,
+                            size_t *oldlenp, void *newp,
+                            size_t newlen) {
     // Only intercept reads
     if (name && newp == NULL && newlen == 0) {
 
@@ -237,8 +262,12 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
         }
     }
 
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    // Call real sysctlbyname (not interposed within our own image)
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
+
+// Register the interpose
+DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
 // ============================================================
 // Constructor
@@ -251,21 +280,13 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
         _spoofedSysVersion = getOrCreateSpoofedSysVersion();
-        initSpoofedHWInfoC();  // C strings must be ready before fishhook!
+        initSpoofedHWInfoC();
 
         // --- Clear stored data ---
         clearKeychainOnce();
         clearSharedCookies();
         clearURLCache();
         clearWebViewData();
-
-        // --- fishhook: sysctlbyname (pure C hook) ---
-        struct rebinding r = {
-            "sysctlbyname",
-            (void *)hooked_sysctlbyname,
-            (void **)&orig_sysctlbyname
-        };
-        rebind_symbols(&r, 1);
 
         // --- 1. IDFA ---
         Class asmClass = objc_getClass("ASIdentifierManager");
