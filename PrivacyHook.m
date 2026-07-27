@@ -549,117 +549,100 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
     ((void(*)(id, SEL, NSString *, NSString *))orig_setValue)(self, _cmd, value, field);
 }
 
+
+// ============================================================
+// Nuke entire sandbox — delete ALL files in Documents/Library/tmp
+// This removes any device IDs stored in SQLite DBs, plist files,
+// or any other persistence mechanism Baidu might use.
+// ============================================================
+static void nukeSandbox(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *home = NSHomeDirectory();
+
+    // Save our own config first
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *savedConfig = [NSMutableDictionary dictionary];
+    NSDictionary *allDict = [defaults dictionaryRepresentation];
+    for (NSString *key in allDict) {
+        if ([key hasPrefix:@"BaiduBox.cfg."]) {
+            savedConfig[key] = allDict[key];
+        }
+    }
+
+    // Delete Documents directory contents
+    NSString *docsDir = [home stringByAppendingPathComponent:@"Documents"];
+    NSArray *docsFiles = [fm contentsOfDirectoryAtPath:docsDir error:nil];
+    for (NSString *f in docsFiles) {
+        [fm removeItemAtPath:[docsDir stringByAppendingPathComponent:f] error:nil];
+    }
+
+    // Delete Library directory contents (except Preferences which we handle via UserDefaults)
+    NSString *libDir = [home stringByAppendingPathComponent:@"Library"];
+    NSArray *libFiles = [fm contentsOfDirectoryAtPath:libDir error:nil];
+    for (NSString *f in libFiles) {
+        NSString *path = [libDir stringByAppendingPathComponent:f];
+        // Skip Preferences — handled by clearBaiduUserDefaults
+        // Skip Caches — will be regenerated
+        [fm removeItemAtPath:path error:nil];
+    }
+
+    // Delete tmp directory contents
+    NSString *tmpDir = [home stringByAppendingPathComponent:@"tmp"];
+    NSArray *tmpFiles = [fm contentsOfDirectoryAtPath:tmpDir error:nil];
+    for (NSString *f in tmpFiles) {
+        [fm removeItemAtPath:[tmpDir stringByAppendingPathComponent:f] error:nil];
+    }
+
+    // Recreate essential directories
+    [fm createDirectoryAtPath:docsDir withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:libDir withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:[libDir stringByAppendingPathComponent:@"Caches"] withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:[libDir stringByAppendingPathComponent:@"Preferences"] withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Restore our config
+    for (NSString *key in savedConfig) {
+        [defaults setObject:savedConfig[key] forKey:key];
+    }
+    // Reset keychain clear flag
+    [defaults setBool:NO forKey:@"BaiduBox.cfg.kc23"];
+    [defaults synchronize];
+}
+
 // ============================================================
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    // Scan App sandbox for files that might contain device IDs
-    NSMutableString *report = [NSMutableString string];
-
-    // Get sandbox paths
-    NSString *home = NSHomeDirectory();
-    NSArray *dirsToScan = @[
-        [home stringByAppendingPathComponent:@"Documents"],
-        [home stringByAppendingPathComponent:@"Library"],
-        [home stringByAppendingPathComponent:@"tmp"],
-    ];
-
+    // Check what's in sandbox after nuke + 15s
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSInteger fileCount = 0;
+    NSString *home = NSHomeDirectory();
 
-    for (NSString *dir in dirsToScan) {
-        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:dir];
-        NSString *file;
-        while ((file = [enumerator nextObject])) {
-            if (fileCount >= 30) break;
+    NSInteger docCount = 0, libCount = 0;
+    NSString *docsDir = [home stringByAppendingPathComponent:@"Documents"];
+    NSString *libDir = [home stringByAppendingPathComponent:@"Library"];
 
-            NSString *fullPath = [dir stringByAppendingPathComponent:file];
-            NSDictionary *attrs = [fm attributesOfItemAtPath:fullPath error:nil];
-            NSUInteger fileSize = [[attrs objectForKey:NSFileSize] unsignedLongLongValue];
+    NSDirectoryEnumerator *de = [fm enumeratorAtPath:docsDir];
+    NSString *f;
+    while ((f = [de nextObject])) docCount++;
 
-            // Skip large files (> 100KB) and directories
-            if (fileSize > 100000) continue;
-            if ([[attrs objectForKey:NSFileType] isEqualToString:NSFileTypeDirectory]) continue;
+    NSDirectoryEnumerator *le = [fm enumeratorAtPath:libDir];
+    while ((f = [le nextObject])) libCount++;
 
-            // Skip common non-interesting files
-            NSString *lname = file.lowercaseString;
-            if ([lname hasSuffix:@".png"] || [lname hasSuffix:@".jpg"] || [lname hasSuffix:@".jpeg"]) continue;
-            if ([lname hasSuffix:@".db-shm"] || [lname hasSuffix:@".db-wal"]) continue;
-            if ([lname containsString:@"snapshots"]) continue;
-            if ([lname containsString:@"cache"]) continue;
-            if ([lname containsString:@"photos"]) continue;
-
-            // Read file content
-            NSData *data = [NSData dataWithContentsOfFile:fullPath options:NSDataReadingMappedIfSafe error:nil];
-            if (!data || data.length == 0 || data.length > 50000) continue;
-
-            // Try to read as string
-            NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!content) {
-                // Try to find readable strings in binary data
-                const char *bytes = data.bytes;
-                NSUInteger len = data.length;
-                NSMutableString *found = [NSMutableString string];
-                NSMutableString *current = [NSMutableString string];
-                for (NSUInteger j = 0; j < len && found.length < 200; j++) {
-                    if (bytes[j] >= 32 && bytes[j] < 127) {
-                        [current appendFormat:@"%c", bytes[j]];
-                    } else {
-                        if (current.length >= 8) {
-                            // Check if this looks like an ID
-                            NSString *s = current;
-                            if ([s containsString:@"cuid"] || [s containsString:@"device"] ||
-                                [s containsString:@"CUID"] || [s containsString:@"DEVICE"] ||
-                                [s containsString:@"uuid"] || [s containsString:@"UUID"] ||
-                                [s containsString:@"idfa"] || [s containsString:@"IDFA"] ||
-                                [s containsString:@"bduss"] || [s containsString:@"BDUSS"] ||
-                                [s containsString:@"machine"] || [s containsString:@"iphone"] ||
-                                [s containsString:@"serial"] || [s containsString:@"token"] ||
-                                [s containsString:@"android_id"] || [s containsString:@"zid"] ||
-                                [s containsString:@"cuid"]) {
-                                [found appendFormat:@"%@ ", s];
-                            }
-                        }
-                        [current setString:@""];
-                    }
-                }
-                if (found.length > 0) {
-                    [report appendFormat:@" %@ (%luB) => %@\n", file, (unsigned long)data.length, found];
-                    fileCount++;
-                }
-            } else {
-                // It's a text file — check for device IDs
-                NSString *lc = content.lowercaseString;
-                if ([lc containsString:@"cuid"] || [lc containsString:@"device"] ||
-                    [lc containsString:@"uuid"] || [lc containsString:@"idfa"] ||
-                    [lc containsString:@"bduss"] || [lc containsString:@"machine"] ||
-                    [lc containsString:@"iphone"] || [lc containsString:@"serial"] ||
-                    [lc containsString:@"token"] || [lc containsString:@"zid"] ||
-                    [lc containsString:@"android_id"] || [lc containsString:@"model"]) {
-                    // Extract just the relevant part
-                    if (content.length > 200) content = [content substringToIndex:200];
-                    [report appendFormat:@" %@ (%luB) => %@\n", file, (unsigned long)data.length, content];
-                    fileCount++;
-                }
-            }
-        }
-        if (fileCount >= 30) break;
-    }
-
-    if (fileCount == 0) {
-        [report setString:@"(no device ID files found)"];
-    }
+    // List Library subdirectories
+    NSArray *libDirs = [fm contentsOfDirectoryAtPath:libDir error:nil];
+    NSString *libReport = [libDirs componentsJoinedByString:@", "];
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step25 沙盒扫描 ===\n\n"
-        @"找到含设备ID的文件(%d):\n%@\n\n"
+        @"=== Step26 沙盒清空 ===\n\n"
+        @"Documents文件: %d\n"
+        @"Library文件: %d\n"
+        @"Library目录: %@\n\n"
         @"设备: %s\n系统: %@",
-        (int)fileCount, report,
+        (int)docCount, (int)libCount, libReport,
         _c_machine[0] ? _c_machine : "(空)",
         _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step25"
+        alertControllerWithTitle:@"Step26"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -696,6 +679,7 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
         clearBaiduUserDefaults();
+        nukeSandbox();
 
         // === ObjC hooks ===
 
