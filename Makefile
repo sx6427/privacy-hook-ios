@@ -5,7 +5,7 @@
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 # Also build a minimal test dylib
 MIN_DYLIB = PrivacyHookMin.dylib
@@ -46,7 +46,7 @@ all: $(DYLIB) $(MIN_DYLIB)
 
 $(DYLIB): $(SRC)
 	@echo "Building PrivacyHook.dylib..."
-	clang $(CFLAGS) $(LDFLAGS) -o $@ $<
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
 	@lipo -info $@ || true
 	@otool -L $@ || true
