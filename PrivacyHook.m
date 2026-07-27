@@ -1,15 +1,12 @@
 //
-//  PrivacyHook.m — Step 15: Keychain spy + all interpose
+//  PrivacyHook.m — Step 16: HTTP request spy
 //
-//  Step14 result: ALL C functions 0 calls!
-//  sysctlbyname=0, sysctl=0, IORegistry=0, getifaddrs=0
+//  Step15: ALL 0 calls — no keychain, no C functions
+//  Baidu must send device ID via HTTP headers/params.
 //
-//  Baidu does NOT use C functions for device ID.
-//  Most likely: Baidu stores its own device_id in Keychain.
-//
-//  Step15: Hook SecItemAdd/SecItemCopyMatching/SecItemUpdate
-//  to see what Baidu reads/writes from keychain.
-//  Also hook NSUserDefaults to see what device IDs are stored.
+//  Step16: Hook NSURLSession to capture HTTP requests
+//  Show URL + headers in diagnostic popup.
+//  This will reveal EXACTLY what Baidu sends for device ID.
 //
 
 #import <Foundation/Foundation.h>
@@ -29,19 +26,10 @@
 #define NSLog(...)
 
 // ============================================================
-// Diagnostic counters
+// Diagnostic
 // ============================================================
+static NSMutableArray *diag_requests = nil;
 static volatile int diag_sbn_called = 0;
-static volatile int diag_sc_called = 0;
-static volatile int diag_iok_called = 0;
-static volatile int diag_gifa_called = 0;
-static volatile int diag_sec_add = 0;
-static volatile int diag_sec_copy = 0;
-static volatile int diag_sec_update = 0;
-static volatile int diag_sec_delete = 0;
-
-static NSMutableArray *diag_keychain_keys = nil;
-static NSMutableArray *diag_defaults_keys = nil;
 
 // ============================================================
 // Spoofed values
@@ -59,7 +47,7 @@ static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
 // ============================================================
-// DYLD_INTERPOSE
+// DYLD_INTERPOSE (keep sysctlbyname for hw.machine)
 // ============================================================
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
@@ -71,9 +59,6 @@ static char _c_platformSerial[32] = {0};
       (const void *)(unsigned long)&_replacee, \
   };
 
-// ============================================================
-// C function hooks (same as Step14, keep for completeness)
-// ============================================================
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp, size_t newlen) {
     diag_sbn_called++;
@@ -92,88 +77,6 @@ static int my_sysctlbyname(const char *name, void *oldp,
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
-
-static int my_sysctl(int *name, u_int namelen, void *oldp,
-                     size_t *oldlenp, void *newp, size_t newlen) {
-    diag_sc_called++;
-    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-}
-DYLD_INTERPOSE(my_sysctl, sysctl);
-
-static CFTypeRef my_IORegistryEntryCreateCFProperty(
-    io_registry_entry_t entry, CFStringRef key,
-    CFAllocatorRef allocator, IOOptionBits options) {
-    diag_iok_called++;
-    if (key && _c_platformUUID[0] != 0) {
-        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo)
-            return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
-        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo)
-            return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
-    }
-    return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
-}
-DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
-
-static int my_getifaddrs(struct ifaddrs **ifap) {
-    diag_gifa_called++;
-    *ifap = NULL;
-    return 0;
-}
-DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
-
-// ============================================================
-// Keychain spy hooks — see what Baidu reads/writes
-// ============================================================
-static OSStatus my_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
-    diag_sec_add++;
-    if (attributes && diag_keychain_keys) {
-        CFStringRef acct = CFDictionaryGetValue(attributes, kSecAttrAccount);
-        CFStringRef svc = CFDictionaryGetValue(attributes, kSecAttrService);
-        CFStringRef label = CFDictionaryGetValue(attributes, kSecAttrLabel);
-        NSString *key = [NSString stringWithFormat:@"ADD: acct=%@ svc=%@ label=%@",
-                         acct ? (__bridge NSString *)acct : @"(null)",
-                         svc ? (__bridge NSString *)svc : @"(null)",
-                         label ? (__bridge NSString *)label : @"(null)"];
-        @synchronized(diag_keychain_keys) { [diag_keychain_keys addObject:key]; }
-    }
-    return SecItemAdd(attributes, result);
-}
-DYLD_INTERPOSE(my_SecItemAdd, SecItemAdd);
-
-static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    diag_sec_copy++;
-    if (query && diag_keychain_keys) {
-        CFStringRef acct = CFDictionaryGetValue(query, kSecAttrAccount);
-        CFStringRef svc = CFDictionaryGetValue(query, kSecAttrService);
-        CFStringRef label = CFDictionaryGetValue(query, kSecAttrLabel);
-        NSString *key = [NSString stringWithFormat:@"READ: acct=%@ svc=%@",
-                         acct ? (__bridge NSString *)acct : @"*",
-                         svc ? (__bridge NSString *)svc : @"*"];
-        @synchronized(diag_keychain_keys) { [diag_keychain_keys addObject:key]; }
-    }
-    return SecItemCopyMatching(query, result);
-}
-DYLD_INTERPOSE(my_SecItemCopyMatching, SecItemCopyMatching);
-
-static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
-    diag_sec_update++;
-    if (query && diag_keychain_keys) {
-        CFStringRef acct = CFDictionaryGetValue(query, kSecAttrAccount);
-        CFStringRef svc = CFDictionaryGetValue(query, kSecAttrService);
-        NSString *key = [NSString stringWithFormat:@"UPD: acct=%@ svc=%@",
-                         acct ? (__bridge NSString *)acct : @"*",
-                         svc ? (__bridge NSString *)svc : @"*"];
-        @synchronized(diag_keychain_keys) { [diag_keychain_keys addObject:key]; }
-    }
-    return SecItemUpdate(query, attributesToUpdate);
-}
-DYLD_INTERPOSE(my_SecItemUpdate, SecItemUpdate);
-
-static OSStatus my_SecItemDelete(CFDictionaryRef query) {
-    diag_sec_delete++;
-    return SecItemDelete(query);
-}
-DYLD_INTERPOSE(my_SecItemDelete, SecItemDelete);
 
 // ============================================================
 // Spoofed value initialization
@@ -293,10 +196,20 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     }
 }
 
-// ============================================================
-// Data clearing — DON'T clear keychain this time!
-// We want to see what's in it via the spy hooks.
-// ============================================================
+static void clearKeychainOnce(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(@"kc23");
+    if ([defaults boolForKey:key]) return;
+    NSArray *secItemClasses = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassKey, (__bridge id)kSecClassCertificate, (__bridge id)kSecClassIdentity];
+    for (id secItemClass in secItemClasses) {
+        NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
+        SecItemDelete((__bridge CFDictionaryRef)query);
+    }
+    [defaults setBool:YES forKey:key];
+    [defaults synchronize];
+}
+
 static void clearSharedCookies(void) {
     NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
     NSArray *cookies = [[storage cookies] copy];
@@ -326,42 +239,136 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
+// HTTP Request Spy — hook NSURLSession
+// ============================================================
+static IMP orig_dataTask_request = NULL;
+static IMP orig_dataTask_request_complete = NULL;
+
+static void logRequest(NSURLRequest *request) {
+    if (!request || !diag_requests) return;
+    NSURL *url = request.URL;
+    if (!url) return;
+    NSString *host = url.host ?: @"";
+    // Only log Baidu-related requests
+    NSString *hostLower = [host lowercaseString];
+    if (![hostLower containsString:@"baidu"] &&
+        ![hostLower containsString:@"bdstatic"] &&
+        ![hostLower containsString:@"bdimg"] &&
+        ![hostLower containsString:@"hm."] &&
+        ![hostLower containsString:@"dnspod"]) {
+        return;
+    }
+
+    NSDictionary *headers = [request allHTTPHeaderFields];
+    NSString *path = url.path ?: @"/";
+    NSString *query = url.query ?: @"";
+    // Truncate query to 200 chars
+    if (query.length > 200) query = [query substringToIndex:200];
+
+    // Extract device-related headers
+    NSMutableString *deviceHeaders = [NSMutableString string];
+    for (NSString *key in headers) {
+        NSString *keyLower = [key lowercaseString];
+        if ([keyLower containsString:@"device"] ||
+            [keyLower containsString:@"uuid"] ||
+            [keyLower containsString:@"idfa"] ||
+            [keyLower containsString:@"idfv"] ||
+            [keyLower containsString:@"mac"] ||
+            [keyLower containsString:@"imei"] ||
+            [keyLower containsString:@"serial"] ||
+            [keyLower containsString:@"android"] ||
+            [keyLower containsString:@"model"] ||
+            [keyLower containsString:@"machine"] ||
+            [keyLower containsString:@"fingerprint"] ||
+            [keyLower containsString:@"token"] ||
+            [keyLower containsString:@"cid"] ||
+            [keyLower containsString:@"uid"] ||
+            [keyLower containsString:@"user-agent"]) {
+            NSString *val = headers[key];
+            if (val.length > 100) val = [val substringToIndex:100];
+            [deviceHeaders appendFormat:@"  %@: %@\n", key, val];
+        }
+    }
+
+    // Also check query params for device IDs
+    NSMutableString *deviceParams = [NSMutableString string];
+    for (NSString *param in [query componentsSeparatedByString:@"&"]) {
+        NSString *paramLower = [param lowercaseString];
+        if ([paramLower containsString:@"device"] ||
+            [paramLower containsString:@"uuid"] ||
+            [paramLower containsString:@"idfa"] ||
+            [paramLower containsString:@"idfv"] ||
+            [paramLower containsString:@"mac"] ||
+            [paramLower containsString:@"imei"] ||
+            [paramLower containsString:@"model"] ||
+            [paramLower containsString:@"machine"] ||
+            [paramLower containsString:@"fingerprint"] ||
+            [paramLower containsString:@"cid"] ||
+            [paramLower containsString:@"uid"] ||
+            [paramLower hasPrefix:@"id="]) {
+            [deviceParams appendFormat:@"  ?%@\n", param];
+        }
+    }
+
+    NSString *entry = [NSString stringWithFormat:@"[%@]%@\nHeaders:\n%@Params:\n%@",
+                       request.HTTPMethod ?: @"GET",
+                       [NSString stringWithFormat:@"%@%@", host, path],
+                       deviceHeaders.length > 0 ? deviceHeaders : @"  (none)\n",
+                       deviceParams.length > 0 ? deviceParams : @"  (none)\n"];
+
+    @synchronized(diag_requests) {
+        if (diag_requests.count < 20) {
+            [diag_requests addObject:entry];
+        }
+    }
+}
+
+// Hook: -[NSURLSession dataTaskWithRequest:completionHandler:]
+static id my_dataTask_request_complete(id self, SEL _cmd, NSURLRequest *request, void(^completion)(NSData *, NSURLResponse *, NSError *)) {
+    logRequest(request);
+    return ((id(*)(id, SEL, NSURLRequest *, void(^)(NSData *, NSURLResponse *, NSError *)))orig_dataTask_request_complete)(self, _cmd, request, completion);
+}
+
+// Hook: -[NSURLSession dataTaskWithRequest:]
+static id my_dataTask_request(id self, SEL _cmd, NSURLRequest *request) {
+    logRequest(request);
+    return ((id(*)(id, SEL, NSURLRequest *))orig_dataTask_request)(self, _cmd, request);
+}
+
+// ============================================================
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    NSString *kcReport = @"(none)";
-    if (diag_keychain_keys && diag_keychain_keys.count > 0) {
-        @synchronized(diag_keychain_keys) {
-            // Show up to 15 entries
-            NSInteger max = MIN(diag_keychain_keys.count, 15);
-            kcReport = [[diag_keychain_keys subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
-            if (diag_keychain_keys.count > max) {
-                kcReport = [kcReport stringByAppendingFormat:@"\n... +%d more", (int)(diag_keychain_keys.count - max)];
+    NSString *reqReport = @"(no baidu requests)";
+    if (diag_requests && diag_requests.count > 0) {
+        @synchronized(diag_requests) {
+            NSInteger max = MIN(diag_requests.count, 10);
+            reqReport = [[diag_requests subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n---\n"];
+            if (diag_requests.count > max) {
+                reqReport = [reqReport stringByAppendingFormat:@"\n... +%d more", (int)(diag_requests.count - max)];
             }
         }
     }
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step15 Keychain Spy ===\n\n"
-        @"C函数: sbn=%d sc=%d iok=%d gifa=%d\n\n"
-        @"Keychain操作:\n"
-        @"  Add: %d  Read: %d\n"
-        @"  Update: %d  Delete: %d\n\n"
-        @"Keychain记录:\n%@\n\n"
-        @"ObjC: 已生效\n"
-        @"设备名: %@\n系统版本: %@",
-        diag_sbn_called, diag_sc_called, diag_iok_called, diag_gifa_called,
-        diag_sec_add, diag_sec_copy, diag_sec_update, diag_sec_delete,
-        kcReport,
+        @"=== Step16 HTTP Spy ===\n\n"
+        @"sysctlbyname: %d calls\n"
+        @"捕获请求数: %d\n\n"
+        @"百度请求详情:\n%@\n"
+        @"ObjC: 已生效\n设备名: %@\n系统版本: %@",
+        diag_sbn_called,
+        diag_requests ? (int)diag_requests.count : 0,
+        reqReport,
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step15"
+        alertControllerWithTitle:@"Step16"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+    // 10 second delay to let Baidu make requests
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -408,7 +415,7 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        diag_keychain_keys = [NSMutableArray new];
+        diag_requests = [NSMutableArray new];
 
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
@@ -418,8 +425,7 @@ static void initPrivacyHook(void) {
         initSpoofedIOKitInfo();
         initSpoofedUserAgent();
 
-        // DON'T clear keychain — we want to spy on it!
-        // clearKeychainOnce();
+        clearKeychainOnce();
         clearSharedCookies();
         clearURLCache();
         clearWebViewData();
@@ -485,6 +491,16 @@ static void initPrivacyHook(void) {
         if (reqClass) {
             Method m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
             if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
+        }
+
+        // HTTP spy: hook NSURLSession
+        Class sessionClass = objc_getClass("NSURLSession");
+        if (sessionClass) {
+            Method m = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:));
+            if (m) { orig_dataTask_request_complete = method_getImplementation(m); class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:), (IMP)my_dataTask_request_complete, method_getTypeEncoding(m)); }
+
+            m = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:));
+            if (m) { orig_dataTask_request = method_getImplementation(m); class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:), (IMP)my_dataTask_request, method_getTypeEncoding(m)); }
         }
 
         showDiagnosticPopup();
