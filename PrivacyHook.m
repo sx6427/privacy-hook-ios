@@ -2,15 +2,13 @@
 //  PrivacyHook.m
 //  Device Fingerprint + Login State Isolation Dylib for iOS
 //
-//  v21: Runtime keychain isolation via SecItem* hooks.
-//       v20's blanket clearKeychainOnce() was destructive — clone B's
-//       first launch deleted ALL keychain items (including clone A's),
-//       then payment SDK wrote fresh risk flags visible to both clones.
+//  v22: Revert SecItem* hooks (broke payment in v21).
+//       Multi-clone keychain isolation now handled at IPA level:
+//       modify_ipa.py gives each clone unique keychain-access-groups.
+//       clearKeychainOnce() only affects this clone's own groups.
+//       New flag kc22 to force clear after v21 experiment.
 //
-//       v21 replaces blanket clear with per-clone namespace prefix.
-//       Each clone gets a unique UUID. All kSecAttrService values are
-//       transparently prefixed (e.g. "uuid|com.baidu.pay"), so each
-//       clone only sees its own keychain items. No cross-contamination.
+//  v21: SecItem* hooks — REVERTED (broke payment SDK keychain flow).
 //
 //  v20: Hook CFBundleGetIdentifier + CFBundleGetValueForInfoDictionaryKey
 //       via fishhook. These are CoreFoundation C functions that payment
@@ -234,93 +232,34 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Keychain isolation — per-clone namespace prefix
+// Keychain clearing — one-time with new flag
 //
-// ROOT CAUSE: Multiple clones share the same keychain-access-groups
-// (e.g. com.baidu.shareLoginAccount). Payment SDKs write risk flags
-// to these shared groups. Clone B's flags poison Clone A.
+// v21 tried SecItem* hooks for runtime isolation but it broke
+// payment SDKs that rely on keychain for payment flow.
 //
-// FIX: Hook SecItemAdd/CopyMatching/Update/Delete via fishhook.
-// Each clone gets a unique UUID prefix. All kSecAttrService values
-// are transparently prefixed, so each clone only sees its own items.
-// No blanket clear needed — items are invisible across clones.
+// v22 goes back to v20's approach: one-time clear with new flag.
+// Multi-clone isolation is handled at the IPA level by giving each
+// clone different keychain-access-groups in modify_ipa.py.
+// With different groups, each clone's clear only affects its own items.
 // ============================================================
-static NSString *g_kcPrefix = nil;
-
-static void initKeychainPrefix(void) {
+static void clearKeychainOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"kcp");
-    g_kcPrefix = [defaults stringForKey:key];
-    if (!g_kcPrefix) {
-        g_kcPrefix = [[NSUUID UUID] UUIDString];
-        [defaults setObject:g_kcPrefix forKey:key];
-        [defaults synchronize];
+    NSString *key = kKey(@"kc22");
+    if ([defaults boolForKey:key]) return;
+
+    NSArray *secItemClasses = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassIdentity
+    ];
+    for (id secItemClass in secItemClasses) {
+        NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
+        SecItemDelete((__bridge CFDictionaryRef)query);
     }
-}
-
-// Namespace a keychain query: prefix kSecAttrService and kSecAttrServer
-// so each clone only sees its own items.
-static void namespaceKeychainQuery(NSMutableDictionary *q) {
-    if (!g_kcPrefix) return;
-
-    // kSecAttrService — used by kSecClassGenericPassword (most common for SDKs)
-    id service = q[(__bridge id)kSecAttrService];
-    if (service && [service isKindOfClass:[NSString class]]) {
-        q[(__bridge id)kSecAttrService] =
-            [NSString stringWithFormat:@"%@|%@", g_kcPrefix, service];
-    } else {
-        // No service specified — if it's a generic password, add one
-        // so broad queries don't leak across clones
-        id secClass = q[(__bridge id)kSecClass];
-        if (secClass == (__bridge id)kSecClassGenericPassword) {
-            q[(__bridge id)kSecAttrService] =
-                [NSString stringWithFormat:@"%@|ns", g_kcPrefix];
-        }
-    }
-
-    // kSecAttrServer — used by kSecClassInternetPassword
-    id server = q[(__bridge id)kSecAttrServer];
-    if (server && [server isKindOfClass:[NSString class]]) {
-        q[(__bridge id)kSecAttrServer] =
-            [NSString stringWithFormat:@"%@|%@", g_kcPrefix, server];
-    }
-}
-
-// --- SecItem function pointers ---
-static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
-static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef);
-static OSStatus (*orig_SecItemDelete)(CFDictionaryRef);
-
-static OSStatus hook_SecItemAdd(CFDictionaryRef query, CFTypeRef *result) {
-    NSMutableDictionary *q =
-        [NSMutableDictionary dictionaryWithDictionary:(__bridge NSDictionary *)query];
-    namespaceKeychainQuery(q);
-    return orig_SecItemAdd((__bridge CFDictionaryRef)q, result);
-}
-
-static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    NSMutableDictionary *q =
-        [NSMutableDictionary dictionaryWithDictionary:(__bridge NSDictionary *)query];
-    namespaceKeychainQuery(q);
-    return orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, result);
-}
-
-static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToUpdate) {
-    NSMutableDictionary *q =
-        [NSMutableDictionary dictionaryWithDictionary:(__bridge NSDictionary *)query];
-    namespaceKeychainQuery(q);
-    NSMutableDictionary *a =
-        [NSMutableDictionary dictionaryWithDictionary:(__bridge NSDictionary *)attrsToUpdate];
-    namespaceKeychainQuery(a);
-    return orig_SecItemUpdate((__bridge CFDictionaryRef)q, (__bridge CFDictionaryRef)a);
-}
-
-static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
-    NSMutableDictionary *q =
-        [NSMutableDictionary dictionaryWithDictionary:(__bridge NSDictionary *)query];
-    namespaceKeychainQuery(q);
-    return orig_SecItemDelete((__bridge CFDictionaryRef)q);
+    [defaults setBool:YES forKey:key];
+    [defaults synchronize];
 }
 
 static void clearSharedCookies(void) {
@@ -406,10 +345,10 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // --- Keychain isolation: per-clone namespace prefix ---
-        // No blanket clear — SecItem* hooks make each clone only see
-        // its own items via a unique UUID prefix on kSecAttrService.
-        initKeychainPrefix();
+        // --- One-time keychain clear (new flag kc22) ---
+        // Each clone has different keychain-access-groups (set in IPA),
+        // so this clear only affects this clone's own items.
+        clearKeychainOnce();
 
         // --- Clear cookies ---
         clearSharedCookies();
@@ -577,30 +516,5 @@ static void initPrivacyHook(void) {
               (void **)&orig_CFBundleGetValueForInfoDictionaryKey },
         };
         fishhook_rebind(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
-
-        // ============================================================
-        // 7. Keychain isolation — SecItem* hooks via fishhook
-        //
-        //    Each clone gets a unique UUID prefix. All SecItemAdd/Copy/
-        //    Update/Delete calls are transparently namespaced via
-        //    kSecAttrService, so clones cannot see each other's items.
-        //    This replaces the old blanket keychain clear (which was
-        //    destructive to other clones).
-        // ============================================================
-        struct rebinding kc_rebindings[] = {
-            { "SecItemAdd",
-              (void *)hook_SecItemAdd,
-              (void **)&orig_SecItemAdd },
-            { "SecItemCopyMatching",
-              (void *)hook_SecItemCopyMatching,
-              (void **)&orig_SecItemCopyMatching },
-            { "SecItemUpdate",
-              (void *)hook_SecItemUpdate,
-              (void **)&orig_SecItemUpdate },
-            { "SecItemDelete",
-              (void *)hook_SecItemDelete,
-              (void **)&orig_SecItemDelete },
-        };
-        fishhook_rebind(kc_rebindings, sizeof(kc_rebindings) / sizeof(kc_rebindings[0]));
     }
 }
