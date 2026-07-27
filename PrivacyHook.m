@@ -1,12 +1,14 @@
 //
-//  PrivacyHook.m — Step 7: Step6 + IOKit hook (IOPlatformUUID)
+//  PrivacyHook.m — Step 8: Step7 + User-Agent spoofing
 //
-//  Step6 doesn't crash but Baidu still recognizes the device.
-//  Missing piece: IOPlatformUUID — hardware-level unique ID that
-//  survives factory reset. Baidu reads it via IOKit.
+//  Step7 doesn't crash but server still sees real iOS 14.6.
+//  Root cause: "WAP登录" = WebView login. WKWebView's User-Agent
+//  is set by WebKit internally, reveals real OS version.
 //
-//  Hook IORegistryEntryCreateCFProperty via DYLD_INTERPOSE.
-//  Return fake UUID/serial when those keys are requested.
+//  Fix:
+//    1. Hook WKWebView customUserAgent getter → return spoofed UA
+//    2. Hook WKWebView initWithFrame:configuration: → set customUserAgent on init
+//    3. Hook NSMutableURLRequest setValue:forHTTPHeaderField: → replace User-Agent
 //
 
 #import <Foundation/Foundation.h>
@@ -43,14 +45,13 @@ static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
 static NSString *_spoofedSysVersion = nil;
+static NSString *_spoofedUserAgent = nil;
+static NSString *_spoofedWebKitUA = nil;
 
-// C strings for sysctl hook (no ObjC!)
 static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
-
-// C strings for IOKit hook (no ObjC!)
-static char _c_platformUUID[64] = {0};    // e.g. "A1B2C3D4-..."
-static char _c_platformSerial[32] = {0};  // e.g. "F2LXY1234ABCDEFG"
+static char _c_platformUUID[64] = {0};
+static char _c_platformSerial[32] = {0};
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -104,17 +105,10 @@ static void initSpoofedHWInfoC(void) {
     NSString *saved = [defaults stringForKey:key];
     if (!saved) {
         NSArray *models = @[
-            @"iPhone14,5|D27AP",
-            @"iPhone14,2|D63AP",
-            @"iPhone14,3|D64AP",
-            @"iPhone14,7|D37AP",
-            @"iPhone14,8|D38AP",
-            @"iPhone15,2|D83AP",
-            @"iPhone15,3|D84AP",
-            @"iPhone15,4|D37AP",
-            @"iPhone15,5|D38AP",
-            @"iPhone16,1|D93AP",
-            @"iPhone16,2|D94AP",
+            @"iPhone14,5|D27AP", @"iPhone14,2|D63AP", @"iPhone14,3|D64AP",
+            @"iPhone14,7|D37AP", @"iPhone14,8|D38AP", @"iPhone15,2|D83AP",
+            @"iPhone15,3|D84AP", @"iPhone15,4|D37AP", @"iPhone15,5|D38AP",
+            @"iPhone16,1|D93AP", @"iPhone16,2|D94AP",
         ];
         saved = models[arc4random_uniform((uint32_t)models.count)];
         [defaults setObject:saved forKey:key];
@@ -128,22 +122,18 @@ static void initSpoofedHWInfoC(void) {
     }
 }
 
-// Generate fake IOPlatformUUID + serial number
 static void initSpoofedIOKitInfo(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 
-    // UUID
     NSString *uuidKey = kKey(@"iouuid");
     NSString *savedUUID = [defaults stringForKey:uuidKey];
     if (!savedUUID) {
-        // Generate a random UUID string
         savedUUID = [[NSUUID UUID] UUIDString];
         [defaults setObject:savedUUID forKey:uuidKey];
         [defaults synchronize];
     }
     strlcpy(_c_platformUUID, [savedUUID UTF8String], sizeof(_c_platformUUID));
 
-    // Serial number — random 12-char alphanumeric
     NSString *serialKey = kKey(@"iosn");
     NSString *savedSerial = [defaults stringForKey:serialKey];
     if (!savedSerial) {
@@ -157,6 +147,23 @@ static void initSpoofedIOKitInfo(void) {
         [defaults synchronize];
     }
     strlcpy(_c_platformSerial, [savedSerial UTF8String], sizeof(_c_platformSerial));
+}
+
+static void initSpoofedUserAgent(void) {
+    // "17.4.1" -> "17_4_1"
+    NSString *uaVersion = [_spoofedSysVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+
+    // Full WebKit User-Agent (for WKWebView)
+    _spoofedWebKitUA = [NSString stringWithFormat:
+        @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) "
+        @"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        uaVersion];
+
+    // Shorter User-Agent (for HTTP requests)
+    _spoofedUserAgent = [NSString stringWithFormat:
+        @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) "
+        @"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+        uaVersion];
 }
 
 // ============================================================
@@ -221,16 +228,11 @@ static void clearWebViewData(void) {
     if (!defaultStore) return;
 
     NSSet *allTypes = [NSSet setWithArray:@[
-        @"WKWebsiteDataTypeCookies",
-        @"WKWebsiteDataTypeSessionStorage",
-        @"WKWebsiteDataTypeLocalStorage",
-        @"WKWebsiteDataTypeWebSQLDatabases",
-        @"WKWebsiteDataTypeIndexedDBDatabases",
-        @"WKWebsiteDataTypeDiskCache",
-        @"WKWebsiteDataTypeMemoryCache",
-        @"WKWebsiteDataTypeOfflineWebApplicationCache",
-        @"WKWebsiteDataTypeFetchCache",
-        @"WKWebsiteDataTypeServiceWorkerRegistrations",
+        @"WKWebsiteDataTypeCookies", @"WKWebsiteDataTypeSessionStorage",
+        @"WKWebsiteDataTypeLocalStorage", @"WKWebsiteDataTypeWebSQLDatabases",
+        @"WKWebsiteDataTypeIndexedDBDatabases", @"WKWebsiteDataTypeDiskCache",
+        @"WKWebsiteDataTypeMemoryCache", @"WKWebsiteDataTypeOfflineWebApplicationCache",
+        @"WKWebsiteDataTypeFetchCache", @"WKWebsiteDataTypeServiceWorkerRegistrations",
     ]];
 
     SEL fetchSel = NSSelectorFromString(@"fetchDataRecordsOfTypes:completionHandler:");
@@ -246,89 +248,93 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// DYLD_INTERPOSE: sysctlbyname — PURE C
+// DYLD_INTERPOSE: sysctlbyname
 // ============================================================
 static int my_sysctlbyname(const char *name, void *oldp,
-                            size_t *oldlenp, void *newp,
-                            size_t newlen) {
+                            size_t *oldlenp, void *newp, size_t newlen) {
     if (name && newp == NULL && newlen == 0) {
-
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_machine, need);
-                *oldlenp = need;
-                return 0;
+                memcpy(oldp, _c_machine, need); *oldlenp = need; return 0;
             }
         }
-
         if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
             size_t need = strlen(_c_hwmodel) + 1;
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_hwmodel, need);
-                *oldlenp = need;
-                return 0;
+                memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0;
             }
         }
-
-        // Also intercept hw.serialnumber and hw.memsize
         if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
             size_t need = strlen(_c_platformSerial) + 1;
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _c_platformSerial, need);
-                *oldlenp = need;
-                return 0;
+                memcpy(oldp, _c_platformSerial, need); *oldlenp = need; return 0;
             }
         }
     }
-
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
-
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
 // ============================================================
 // DYLD_INTERPOSE: IORegistryEntryCreateCFProperty
 // ============================================================
-// Hook IOKit to fake IOPlatformUUID and IOPlatformSerialNumber.
-// These are the #1 hardware identifiers used by device fingerprinting.
-// Uses CoreFoundation only (no ObjC) for safety.
-
 static CFTypeRef my_IORegistryEntryCreateCFProperty(
-    io_registry_entry_t entry,
-    CFStringRef key,
-    CFAllocatorRef allocator,
-    IOOptionBits options) {
-
+    io_registry_entry_t entry, CFStringRef key,
+    CFAllocatorRef allocator, IOOptionBits options) {
     if (key && _c_platformUUID[0] != 0) {
-        // IOPlatformUUID
         if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
-            return CFStringCreateWithCString(allocator, _c_platformUUID,
-                                             kCFStringEncodingUTF8);
+            return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
         }
-        // IOPlatformSerialNumber
         if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
-            return CFStringCreateWithCString(allocator, _c_platformSerial,
-                                             kCFStringEncodingUTF8);
+            return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
         }
     }
-
     return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
 }
-
 DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
+
+// ============================================================
+// WKWebView hook: save original IMPs
+// ============================================================
+static IMP orig_wk_init_frame = NULL;
+static IMP orig_wk_init_coder = NULL;
+
+// Replacement for initWithFrame:configuration:
+static id my_wk_init_frame(id self, SEL _cmd, CGRect frame, id config) {
+    id instance = ((id(*)(id, SEL, CGRect, id))orig_wk_init_frame)(self, _cmd, frame, config);
+    if (instance && _spoofedWebKitUA) {
+        ((void(*)(id, SEL, NSString *))objc_msgSend)(
+            instance, @selector(setCustomUserAgent:), _spoofedWebKitUA);
+    }
+    return instance;
+}
+
+// Replacement for initWithCoder:
+static id my_wk_init_coder(id self, SEL _cmd, id coder) {
+    id instance = ((id(*)(id, SEL, id))orig_wk_init_coder)(self, _cmd, coder);
+    if (instance && _spoofedWebKitUA) {
+        ((void(*)(id, SEL, NSString *))objc_msgSend)(
+            instance, @selector(setCustomUserAgent:), _spoofedWebKitUA);
+    }
+    return instance;
+}
+
+// ============================================================
+// NSMutableURLRequest hook: save original IMP
+// ============================================================
+static IMP orig_setValue = NULL;
+
+// Replacement for setValue:forHTTPHeaderField:
+static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
+    if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame && _spoofedUserAgent) {
+        value = _spoofedUserAgent;
+    }
+    ((void(*)(id, SEL, NSString *, NSString *))orig_setValue)(self, _cmd, value, field);
+}
 
 // ============================================================
 // Constructor
@@ -343,6 +349,7 @@ static void initPrivacyHook(void) {
         _spoofedSysVersion = getOrCreateSpoofedSysVersion();
         initSpoofedHWInfoC();
         initSpoofedIOKitInfo();
+        initSpoofedUserAgent();
 
         // --- Clear stored data ---
         clearKeychainOnce();
@@ -440,6 +447,48 @@ static void initPrivacyHook(void) {
                 hookInstanceMethod(fmClass,
                     @selector(containerURLForSecurityApplicationGroupIdentifier:),
                     imp, method_getTypeEncoding(m));
+            }
+        }
+
+        // --- 6. WKWebView User-Agent ---
+        Class wkClass = objc_getClass("WKWebView");
+        if (wkClass) {
+            // Hook customUserAgent getter to always return our value
+            Method m = class_getInstanceMethod(wkClass, @selector(customUserAgent));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                    return _spoofedWebKitUA;
+                });
+                hookInstanceMethod(wkClass, @selector(customUserAgent), imp, method_getTypeEncoding(m));
+            }
+
+            // Hook initWithFrame:configuration: — set customUserAgent after init
+            m = class_getInstanceMethod(wkClass, @selector(initWithFrame:configuration:));
+            if (m) {
+                orig_wk_init_frame = method_getImplementation(m);
+                class_replaceMethod(wkClass, @selector(initWithFrame:configuration:),
+                                    (IMP)my_wk_init_frame, method_getTypeEncoding(m));
+            }
+
+            // Hook initWithCoder: — for storyboard-created WKWebViews
+            m = class_getInstanceMethod(wkClass, @selector(initWithCoder:));
+            if (m) {
+                orig_wk_init_coder = method_getImplementation(m);
+                class_replaceMethod(wkClass, @selector(initWithCoder:),
+                                    (IMP)my_wk_init_coder, method_getTypeEncoding(m));
+            }
+        }
+
+        // --- 7. NSMutableURLRequest User-Agent ---
+        Class reqClass = objc_getClass("NSMutableURLRequest");
+        if (reqClass) {
+            Method m = class_getInstanceMethod(reqClass,
+                @selector(setValue:forHTTPHeaderField:));
+            if (m) {
+                orig_setValue = method_getImplementation(m);
+                class_replaceMethod(reqClass,
+                    @selector(setValue:forHTTPHeaderField:),
+                    (IMP)my_setValue, method_getTypeEncoding(m));
             }
         }
     }
