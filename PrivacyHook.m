@@ -1,17 +1,20 @@
 //
-//  PrivacyHook.m — Step 12: hook ALL app images + sysctl()
+//  PrivacyHook.m — Step 12b: global rebind_symbols (no dladdr) + sysctl()
 //
-//  Step11 diagnosis revealed:
-//    - sysctlbyname: rebind OK on main exec, but NOT CALLED
-//    - IORegistryEntryCreateCFProperty: orig=NULL (not in main exec!)
-//    - getifaddrs: rebind OK, but NOT CALLED
+//  Step12 crashed because hooking ALL app images was too aggressive.
 //
-//  Root cause: Baidu's device info code is in ITS OWN dylibs,
-//  not in the main executable. We were only hooking image 0.
+//  Step11 showed: rebind_symbols_image on main exec → orig=OK but NOT CALLED.
+//  Baidu's device info code is in its own dylibs, not main exec.
 //
-//  Fix: Iterate ALL loaded images, hook only those inside the .app bundle.
-//  Also add hook for sysctl() (numeric ID version) in case Baidu
-//  uses that instead of sysctlbyname().
+//  NEW APPROACH: Use rebind_symbols (GLOBAL, all images) but:
+//    - Only hook sysctlbyname + sysctl (safe, pure C, passthrough)
+//    - Do NOT hook getifaddrs (returning NULL crashes some libs)
+//    - Do NOT hook IORegistryEntryCreateCFProperty (orig=NULL on main exec)
+//    - No dladdr check (Step10 fix)
+//    - Keep diagnostic popup
+//
+//  rebind_symbols = rebind_symbols_image for ALL loaded images.
+//  Our hooks only intercept specific args, everything else passes through.
 //
 
 #import <Foundation/Foundation.h>
@@ -24,8 +27,6 @@
 #import <sys/sysctl.h>
 #import <string.h>
 #import <CoreFoundation/CoreFoundation.h>
-#import <IOKit/IOKitLib.h>
-#import <ifaddrs.h>
 #import <mach-o/dyld.h>
 #import "fishhook.h"
 
@@ -36,12 +37,7 @@
 // ============================================================
 static volatile int diag_sb_called = 0;
 static volatile int diag_sysctl_called = 0;
-static volatile int diag_iok_called = 0;
-static volatile int diag_gifa_called = 0;
-static volatile int diag_images_hooked = 0;
 static volatile int diag_sb_orig_null = 0;
-static volatile int diag_iok_orig_null = 0;
-static volatile int diag_gifa_orig_null = 0;
 static volatile int diag_sysctl_orig_null = 0;
 
 // ============================================================
@@ -56,14 +52,10 @@ static NSString *_spoofedWebKitUA = nil;
 
 static char _c_machine[32] = {0};
 static char _c_hwmodel[32] = {0};
-static char _c_platformUUID[64] = {0};
-static char _c_platformSerial[32] = {0};
 
 // Original function pointers
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
-static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -128,29 +120,6 @@ static void initSpoofedHWInfoC(void) {
         strlcpy(_c_machine, [parts[0] UTF8String], sizeof(_c_machine));
         strlcpy(_c_hwmodel, [parts[1] UTF8String], sizeof(_c_hwmodel));
     }
-}
-
-static void initSpoofedIOKitInfo(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *uuidKey = kKey(@"iouuid");
-    NSString *savedUUID = [defaults stringForKey:uuidKey];
-    if (!savedUUID) {
-        savedUUID = [[NSUUID UUID] UUIDString];
-        [defaults setObject:savedUUID forKey:uuidKey];
-        [defaults synchronize];
-    }
-    strlcpy(_c_platformUUID, [savedUUID UTF8String], sizeof(_c_platformUUID));
-    NSString *serialKey = kKey(@"iosn");
-    NSString *savedSerial = [defaults stringForKey:serialKey];
-    if (!savedSerial) {
-        const char *chars = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
-        char serial[13] = {0};
-        for (int i = 0; i < 12; i++) serial[i] = chars[arc4random_uniform(33)];
-        savedSerial = [NSString stringWithUTF8String:serial];
-        [defaults setObject:savedSerial forKey:serialKey];
-        [defaults synchronize];
-    }
-    strlcpy(_c_platformSerial, [savedSerial UTF8String], sizeof(_c_platformSerial));
 }
 
 static void initSpoofedUserAgent(void) {
@@ -223,13 +192,14 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// fishhook hooks — PURE C, with diagnostic counters
+// fishhook hooks — PURE C, only intercept specific args
 // ============================================================
 
-// Hook for sysctlbyname (string name version)
 static int hooked_sysctlbyname(const char *name, void *oldp,
                                 size_t *oldlenp, void *newp, size_t newlen) {
     diag_sb_called = 1;
+    if (orig_sysctlbyname == NULL) { diag_sb_orig_null = 1; }
+
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
@@ -241,18 +211,12 @@ static int hooked_sysctlbyname(const char *name, void *oldp,
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
         }
-        if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
-            size_t need = strlen(_c_platformSerial) + 1;
-            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_platformSerial, need); *oldlenp = need; return 0; }
-        }
     }
+    // EVERYTHING ELSE → passthrough to original
     if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     return -1;
 }
 
-// Hook for sysctl (numeric ID version) — NEW in Step12!
-// Baidu may use sysctl({CTL_HW, HW_MACHINE}, ...) instead of sysctlbyname("hw.machine")
 static int hooked_sysctl(int *name, u_int namelen, void *oldp,
                          size_t *oldlenp, void *newp, size_t newlen) {
     diag_sysctl_called = 1;
@@ -261,134 +225,69 @@ static int hooked_sysctl(int *name, u_int namelen, void *oldp,
     if (name && namelen >= 2 && newp == NULL && newlen == 0) {
         // CTL_HW = 6
         if (name[0] == 6) {
-            // HW_MACHINE = 1 → equivalent to "hw.machine"
+            // HW_MACHINE = 1
             if (name[1] == 1 && _c_machine[0] != 0) {
                 size_t need = strlen(_c_machine) + 1;
                 if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_machine, need); *oldlenp = need; return 0;
-                }
+                if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
             }
-            // HW_MODEL = 2 → equivalent to "hw.model"
+            // HW_MODEL = 2
             if (name[1] == 2 && _c_hwmodel[0] != 0) {
                 size_t need = strlen(_c_hwmodel) + 1;
                 if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0;
-                }
+                if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
             }
         }
-        // CTL_KERN = 1
-        if (name[0] == 1) {
-            // KERN_OSVERSION = 2 → "kern.osversion"
-            // KERN_HOSTNAME = 10 → "kern.hostname"
-            // Don't need to spoof these, just let them pass through
-        }
     }
+    // EVERYTHING ELSE → passthrough
     if (orig_sysctl) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     return -1;
 }
 
-static CFTypeRef hooked_IORegistryEntryCreateCFProperty(
-    io_registry_entry_t entry, CFStringRef key,
-    CFAllocatorRef allocator, IOOptionBits options) {
-    diag_iok_called = 1;
-    if (orig_IORegistryEntryCreateCFProperty == NULL) { diag_iok_orig_null = 1; }
-    if (key && _c_platformUUID[0] != 0) {
-        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo)
-            return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
-        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo)
-            return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
-    }
-    if (orig_IORegistryEntryCreateCFProperty)
-        return orig_IORegistryEntryCreateCFProperty(entry, key, allocator, options);
-    return NULL;
-}
-
-static int hooked_getifaddrs(struct ifaddrs **ifap) {
-    diag_gifa_called = 1;
-    if (orig_getifaddrs == NULL) { diag_gifa_orig_null = 1; }
-    *ifap = NULL;
-    return 0;
-}
-
 // ============================================================
-// Hook ALL images inside the .app bundle (not just main exec!)
+// GLOBAL rebind_symbols — hooks ALL images (system + app)
+// Safe because our hooks only intercept specific args, everything
+// else passes through to the original function.
 // ============================================================
-static void rebindAppImages(void) {
-    uint32_t count = _dyld_image_count();
-
+static void rebindAllImages(void) {
     struct rebinding rebindings[] = {
         {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
-        {"sysctl", (void *)hooked_sysctl, (void **)&orig_sysctl},
-        {"IORegistryEntryCreateCFProperty", (void *)hooked_IORegistryEntryCreateCFProperty, (void **)&orig_IORegistryEntryCreateCFProperty},
-        {"getifaddrs", (void *)hooked_getifaddrs, (void **)&orig_getifaddrs},
+        {"sysctl",       (void *)hooked_sysctl,       (void **)&orig_sysctl},
     };
-    int rebind_count = sizeof(rebindings)/sizeof(rebindings[0]);
-
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-
-        // Only hook images inside the app bundle
-        // App bundle images have ".app/" in their path
-        // System libraries have paths like /usr/lib/ or /System/Library/
-        if (strstr(name, ".app/") != NULL) {
-            const struct mach_header *header = _dyld_get_image_header(i);
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            if (!header) continue;
-
-            rebind_symbols_image((void *)header, slide, rebindings, rebind_count);
-            diag_images_hooked++;
-        }
-    }
+    rebind_symbols(rebindings, sizeof(rebindings)/sizeof(rebindings[0]));
 }
 
 // ============================================================
 // Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
-    // Read REAL hw.machine to compare with spoofed
     char realMachine[32] = {0};
     size_t size = sizeof(realMachine);
     sysctlbyname("hw.machine", realMachine, &size, NULL, 0);
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step12 诊断 ===\n\n"
-        @"已 hook image 数量: %d\n\n"
+        @"=== Step12b 诊断 ===\n\n"
+        @"全局 rebind_symbols (所有image)\n\n"
         @"sysctlbyname (字符串名):\n"
         @"  被调用: %@\n"
         @"  orig: %@\n"
         @"  伪造: %s | 真实: %s\n\n"
-        @"sysctl (数字ID) — 新增:\n"
-        @"  被调用: %@\n"
-        @"  orig: %@\n\n"
-        @"IORegistryEntry:\n"
-        @"  被调用: %@\n"
-        @"  orig: %@\n"
-        @"  伪造UUID: %s\n\n"
-        @"getifaddrs:\n"
+        @"sysctl (数字ID):\n"
         @"  被调用: %@\n"
         @"  orig: %@\n\n"
         @"ObjC: 已生效\n"
         @"设备名: %@\n"
         @"系统版本: %@",
-        diag_images_hooked,
         diag_sb_called ? @"YES ✅" : @"NO ❌",
         orig_sysctlbyname ? @"OK" : @"NULL",
         _c_machine[0] ? _c_machine : "(空)",
         realMachine[0] ? realMachine : "(空)",
         diag_sysctl_called ? @"YES ✅" : @"NO ❌",
         orig_sysctl ? @"OK" : @"NULL",
-        diag_iok_called ? @"YES ✅" : @"NO ❌",
-        orig_IORegistryEntryCreateCFProperty ? @"OK" : @"NULL",
-        _c_platformUUID[0] ? _c_platformUUID : "(空)",
-        diag_gifa_called ? @"YES ✅" : @"NO ❌",
-        orig_getifaddrs ? @"OK" : @"NULL",
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step12 诊断"
+        alertControllerWithTitle:@"Step12b 诊断"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -448,7 +347,6 @@ static void initPrivacyHook(void) {
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
         _spoofedSysVersion = getOrCreateSpoofedSysVersion();
         initSpoofedHWInfoC();
-        initSpoofedIOKitInfo();
         initSpoofedUserAgent();
 
         clearKeychainOnce();
@@ -456,8 +354,8 @@ static void initPrivacyHook(void) {
         clearURLCache();
         clearWebViewData();
 
-        // KEY CHANGE: Hook ALL app bundle images, not just main exec!
-        rebindAppImages();
+        // GLOBAL rebind — all images, but only 2 safe functions
+        rebindAllImages();
 
         // ObjC hooks
         Class asmClass = objc_getClass("ASIdentifierManager");
