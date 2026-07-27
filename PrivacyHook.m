@@ -14,6 +14,7 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <sys/sysctl.h>
 #import <string.h>
 #import "fishhook.h"
