@@ -1,9 +1,10 @@
 //
-//  PrivacyHook.m — Step 8: Step7 + User-Agent spoofing
+//  PrivacyHook.m — Step 9: Step8 + sysctl hook + getifaddrs hook
 //
-//  Step7 doesn't crash but server still sees real iOS 14.6.
-//  Root cause: "WAP登录" = WebView login. WKWebView's User-Agent
-//  is set by WebKit internally, reveals real OS version.
+//  Step8 UA spoofing works (iOS 17.4.1 shown) but Baidu still
+//  recognizes same device. Likely cause: Baidu calls sysctl()
+//  directly (by numeric ID) instead of sysctlbyname(), bypassing
+//  our DYLD_INTERPOSE. Also hook getifaddrs for network info.
 //
 //  Fix:
 //    1. Hook WKWebView customUserAgent getter → return spoofed UA
@@ -20,6 +21,9 @@
 #import <objc/message.h>
 #import <sys/sysctl.h>
 #import <string.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <arpa/inet.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <IOKit/IOKitLib.h>
 
@@ -278,6 +282,52 @@ static int my_sysctlbyname(const char *name, void *oldp,
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
+
+// ============================================================
+// DYLD_INTERPOSE: sysctl (numeric ID version)
+// ============================================================
+// Baidu may call sysctl() directly instead of sysctlbyname().
+// sysctl uses numeric IDs: name[0]=CTL_HW(6), name[1]=HW_MACHINE(1) etc.
+static int my_sysctl(int *name, u_int namelen, void *oldp,
+                     size_t *oldlenp, void *newp, size_t newlen) {
+    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
+        // CTL_HW = 6
+        if (name[0] == 6) {
+            // HW_MACHINE = 1
+            if (name[1] == 1 && _c_machine[0] != 0) {
+                size_t need = strlen(_c_machine) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_machine, need); *oldlenp = need; return 0;
+                }
+            }
+            // HW_MODEL = 2
+            if (name[1] == 2 && _c_hwmodel[0] != 0) {
+                size_t need = strlen(_c_hwmodel) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0;
+                }
+            }
+            // HW_MACHINE_ARCH = 3 -> return arm64e (standard, not unique)
+            // HW_MEMSIZE = 24 -> leave original (not unique per device)
+        }
+    }
+    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(my_sysctl, sysctl);
+
+// ============================================================
+// DYLD_INTERPOSE: getifaddrs — hide network interface info
+// ============================================================
+// Baidu may read network interface MAC address or IP via getifaddrs.
+// Return empty interface list to prevent fingerprinting.
+static int my_getifaddrs(struct ifaddrs **ifap) {
+    // Return success but with empty list
+    *ifap = NULL;
+    return 0;
+}
+DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
 
 // ============================================================
 // DYLD_INTERPOSE: IORegistryEntryCreateCFProperty
