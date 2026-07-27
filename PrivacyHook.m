@@ -1,11 +1,16 @@
 //
-//  PrivacyHook.m — Step 17: catch ALL URL creation + NSUserDefaults spy
+//  PrivacyHook.m — Step 14: DYLD_INTERPOSE for ALL C functions
 //
-//  Step16: 0 NSURLSession requests — Baidu doesn't use NSURLSession
+//  Step13b PROVEN: DYLD_INTERPOSE works, no crash!
+//  But sysctlbyname only called 1 time → Baidu uses other methods.
 //
-//  Step17: Hook NSMutableURLRequest initWithURL: (catches ALL requests)
-//          + Hook NSUserDefaults setObject:forKey: (see what Baidu stores)
-//          + 30 second delay (let user interact with app)
+//  Step14: Add interpose for:
+//    - sysctlbyname ✅ (from Step13b)
+//    - sysctl (numeric ID) — NEW
+//    - IORegistryEntryCreateCFProperty (UUID/Serial) — NEW
+//    - getifaddrs (MAC address) — NEW
+//
+//  All use direct call (no orig pointer) — proven safe in Step13b.
 //
 
 #import <Foundation/Foundation.h>
@@ -18,14 +23,28 @@
 #import <sys/sysctl.h>
 #import <string.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <IOKit/IOKitLib.h>
+#import <ifaddrs.h>
+#import <net/if.h>
 #import <mach-o/dyld.h>
 
 #define NSLog(...)
 
-static NSMutableArray *diag_urls = nil;
-static NSMutableArray *diag_defaults = nil;
-static volatile int diag_sbn_called = 0;
+// ============================================================
+// Diagnostic counters
+// ============================================================
+static volatile int diag_sbn_called = 0;    // sysctlbyname
+static volatile int diag_sbn_intercepted = 0;
+static volatile int diag_sc_called = 0;     // sysctl (numeric)
+static volatile int diag_sc_intercepted = 0;
+static volatile int diag_iok_called = 0;    // IORegistryEntry
+static volatile int diag_iok_intercepted = 0;
+static volatile int diag_gifa_called = 0;
+static NSMutableArray *diag_urls = nil;   // getifaddrs
 
+// ============================================================
+// Spoofed values
+// ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
@@ -38,6 +57,9 @@ static char _c_hwmodel[32] = {0};
 static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
+// ============================================================
+// DYLD_INTERPOSE macros
+// ============================================================
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
       const void *replacement; \
@@ -48,25 +70,123 @@ static char _c_platformSerial[32] = {0};
       (const void *)(unsigned long)&_replacee, \
   };
 
+// ============================================================
+// Hook: sysctlbyname (string name)
+// ============================================================
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp, size_t newlen) {
     diag_sbn_called++;
+
     if (name && newp == NULL && newlen == 0) {
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
+            diag_sbn_intercepted++;
             size_t need = strlen(_c_machine) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_machine, need); *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_machine, need);
+                *oldlenp = need;
+                return 0;
+            }
         }
         if (strcmp(name, "hw.model") == 0 && _c_hwmodel[0] != 0) {
+            diag_sbn_intercepted++;
             size_t need = strlen(_c_hwmodel) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-            if (oldlenp && *oldlenp >= need) { memcpy(oldp, _c_hwmodel, need); *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_hwmodel, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.serialnumber") == 0 && _c_platformSerial[0] != 0) {
+            diag_sbn_intercepted++;
+            size_t need = strlen(_c_platformSerial) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _c_platformSerial, need);
+                *oldlenp = need;
+                return 0;
+            }
         }
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
+// ============================================================
+// Hook: sysctl (numeric ID)
+// ============================================================
+static int my_sysctl(int *name, u_int namelen, void *oldp,
+                     size_t *oldlenp, void *newp, size_t newlen) {
+    diag_sc_called++;
+
+    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
+        // CTL_HW = 6
+        if (name[0] == 6) {
+            // HW_MACHINE = 1
+            if (name[1] == 1 && _c_machine[0] != 0) {
+                diag_sc_intercepted++;
+                size_t need = strlen(_c_machine) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_machine, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+            // HW_MODEL = 2
+            if (name[1] == 2 && _c_hwmodel[0] != 0) {
+                diag_sc_intercepted++;
+                size_t need = strlen(_c_hwmodel) + 1;
+                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+                if (oldlenp && *oldlenp >= need) {
+                    memcpy(oldp, _c_hwmodel, need);
+                    *oldlenp = need;
+                    return 0;
+                }
+            }
+        }
+    }
+    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+DYLD_INTERPOSE(my_sysctl, sysctl);
+
+// ============================================================
+// Hook: IORegistryEntryCreateCFProperty
+// ============================================================
+static CFTypeRef my_IORegistryEntryCreateCFProperty(
+    io_registry_entry_t entry, CFStringRef key,
+    CFAllocatorRef allocator, IOOptionBits options) {
+    diag_iok_called++;
+
+    if (key && _c_platformUUID[0] != 0) {
+        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
+            diag_iok_intercepted++;
+            return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
+        }
+        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
+            diag_iok_intercepted++;
+            return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
+        }
+    }
+    return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+}
+DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
+
+// ============================================================
+// Hook: getifaddrs (MAC address)
+// ============================================================
+static int my_getifaddrs(struct ifaddrs **ifap) {
+    diag_gifa_called++;
+    // Return empty list — no MAC address leak
+    *ifap = NULL;
+    return 0;
+}
+DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
+
+// ============================================================
+// Spoofed value initialization
+// ============================================================
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
 }
@@ -225,116 +345,56 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// URL Spy: hook NSMutableURLRequest initWithURL:
-// This catches ALL URL requests regardless of networking API
-// ============================================================
-static IMP orig_req_init_url = NULL;
-static IMP orig_req_init_url_cache = NULL;
-
-static id my_req_init_url(id self, SEL _cmd, NSURL *url) {
-    if (url && diag_urls) {
-        NSString *host = url.host ?: @"";
-        NSString *path = url.path ?: @"/";
-        NSString *entry = [NSString stringWithFormat:@"%@%@", host, path];
-        @synchronized(diag_urls) {
-            if (diag_urls.count < 30) [diag_urls addObject:entry];
-        }
-    }
-    return ((id(*)(id, SEL, NSURL *))orig_req_init_url)(self, _cmd, url);
-}
-
-static id my_req_init_url_cache(id self, SEL _cmd, NSURL *url, id cachePolicy, id timeout) {
-    if (url && diag_urls) {
-        NSString *host = url.host ?: @"";
-        NSString *path = url.path ?: @"/";
-        NSString *query = url.query ?: @"";
-        if (query.length > 150) query = [query substringToIndex:150];
-        NSString *entry = [NSString stringWithFormat:@"%@%@?%@", host, path, query];
-        @synchronized(diag_urls) {
-            if (diag_urls.count < 30) [diag_urls addObject:entry];
-        }
-    }
-    return ((id(*)(id, SEL, NSURL *, id, id))orig_req_init_url_cache)(self, _cmd, url, cachePolicy, timeout);
-}
-
-// ============================================================
-// NSUserDefaults Spy: see what keys Baidu writes
-// ============================================================
-static IMP orig_defaults_set_object = NULL;
-
-static void my_defaults_set_object(id self, SEL _cmd, id value, NSString *key) {
-    if (key && diag_defaults) {
-        // Skip our own keys
-        if (![key hasPrefix:@"BaiduBox.cfg."]) {
-            NSString *valStr = @"";
-            if ([value isKindOfClass:[NSString class]]) {
-                valStr = value;
-                if (valStr.length > 80) valStr = [valStr substringToIndex:80];
-            } else if ([value isKindOfClass:[NSNumber class]]) {
-                valStr = [value stringValue];
-            } else {
-                valStr = NSStringFromClass([value class]);
-            }
-            NSString *entry = [NSString stringWithFormat:@"%@ = %@", key, valStr];
-            @synchronized(diag_defaults) {
-                if (diag_defaults.count < 30) [diag_defaults addObject:entry];
-            }
-        }
-    }
-    ((void(*)(id, SEL, id, NSString *))orig_defaults_set_object)(self, _cmd, value, key);
-}
-
-// ============================================================
-// Diagnostic popup — 30 second delay
+// Diagnostic popup
 // ============================================================
 static void showDiagnosticPopup(void) {
     NSString *urlReport = @"(none)";
     if (diag_urls && diag_urls.count > 0) {
         @synchronized(diag_urls) {
-            NSInteger max = MIN(diag_urls.count, 15);
+            NSInteger max = MIN(diag_urls.count, 20);
             urlReport = [[diag_urls subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
             if (diag_urls.count > max) urlReport = [urlReport stringByAppendingFormat:@"\n...+%d", (int)(diag_urls.count-max)];
         }
     }
-
-    NSString *defaultsReport = @"(none)";
-    if (diag_defaults && diag_defaults.count > 0) {
-        @synchronized(diag_defaults) {
-            NSInteger max = MIN(diag_defaults.count, 15);
-            defaultsReport = [[diag_defaults subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
-            if (diag_defaults.count > max) defaultsReport = [defaultsReport stringByAppendingFormat:@"\n...+%d", (int)(diag_defaults.count-max)];
-        }
-    }
-
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step17 Spy ===\n\n"
-        @"URL请求(%d):\n%@\n\n"
-        @"UserDefaults写入(%d):\n%@\n\n"
-        @"sysctlbyname: %d\n"
-        @"设备: %@ / %@",
+        @"=== Step17b URL Spy ===\n\nURL(%%d):\n%%@\n\nsbn:%%d dev:%%@/%%@",
         diag_urls ? (int)diag_urls.count : 0, urlReport,
-        diag_defaults ? (int)diag_defaults.count : 0, defaultsReport,
-        diag_sbn_called,
-        _spoofedDeviceName, _spoofedSysVersion];
-
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step17"
-                         message:msg
-                  preferredStyle:UIAlertControllerStyleAlert];
+        diag_sbn_called, _spoofedDeviceName, _spoofedSysVersion];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Step17b" message:msg preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-
-    // 30 second delay — user should interact with app
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if (s.activationState == UISceneActivationStateForegroundActive) {
-                scene = (UIWindowScene *)s; break;
-            }
+            if (s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
         }
         UIWindow *window = scene ? scene.windows.firstObject : nil;
         if (window) [window.rootViewController presentViewController:alert animated:YES completion:nil];
     });
+}
+
+
+// URL Spy
+static IMP orig_req_init_url = NULL;
+static IMP orig_req_init_url_cache = NULL;
+static id my_req_init_url(id self, SEL _cmd, NSURL *url) {
+    if (url && diag_urls) {
+        NSString *host = url.host ?: @""; NSString *path = url.path ?: @"/";
+        NSString *query = url.query ?: @"";
+        if (query.length > 120) query = [query substringToIndex:120];
+        NSString *entry = [NSString stringWithFormat:@"%@%@?%@", host, path, query];
+        @synchronized(diag_urls) { if (diag_urls.count < 30) [diag_urls addObject:entry]; }
+    }
+    return ((id(*)(id, SEL, NSURL *))orig_req_init_url)(self, _cmd, url);
+}
+static id my_req_init_url_cache(id self, SEL _cmd, NSURL *url, id cp, id to) {
+    if (url && diag_urls) {
+        NSString *host = url.host ?: @""; NSString *path = url.path ?: @"/";
+        NSString *query = url.query ?: @"";
+        if (query.length > 120) query = [query substringToIndex:120];
+        NSString *entry = [NSString stringWithFormat:@"%@%@?%@", host, path, query];
+        @synchronized(diag_urls) { if (diag_urls.count < 30) [diag_urls addObject:entry]; }
+    }
+    return ((id(*)(id, SEL, NSURL *, id, id))orig_req_init_url_cache)(self, _cmd, url, cp, to);
 }
 
 // ============================================================
@@ -371,9 +431,6 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        diag_urls = [NSMutableArray new];
-        diag_defaults = [NSMutableArray new];
-
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
@@ -444,26 +501,17 @@ static void initPrivacyHook(void) {
             if (m) { orig_wk_init_coder = method_getImplementation(m); class_replaceMethod(wkClass, @selector(initWithCoder:), (IMP)my_wk_init_coder, method_getTypeEncoding(m)); }
         }
 
-        // URL Spy: hook NSMutableURLRequest init
         Class reqClass = objc_getClass("NSMutableURLRequest");
         if (reqClass) {
-            Method m = class_getInstanceMethod(reqClass, @selector(initWithURL:));
+            Method m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+            if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
+            m = class_getInstanceMethod(reqClass, @selector(initWithURL:));
             if (m) { orig_req_init_url = method_getImplementation(m); class_replaceMethod(reqClass, @selector(initWithURL:), (IMP)my_req_init_url, method_getTypeEncoding(m)); }
-
             m = class_getInstanceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:));
             if (m) { orig_req_init_url_cache = method_getImplementation(m); class_replaceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:), (IMP)my_req_init_url_cache, method_getTypeEncoding(m)); }
-
-            m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
-            if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
         }
 
-        // NSUserDefaults spy
-        Class defaultsClass = objc_getClass("NSUserDefaults");
-        if (defaultsClass) {
-            Method m = class_getInstanceMethod(defaultsClass, @selector(setObject:forKey:));
-            if (m) { orig_defaults_set_object = method_getImplementation(m); class_replaceMethod(defaultsClass, @selector(setObject:forKey:), (IMP)my_defaults_set_object, method_getTypeEncoding(m)); }
-        }
-
+        diag_urls = [NSMutableArray new];
         showDiagnosticPopup();
     }
 }
