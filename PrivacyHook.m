@@ -1,12 +1,11 @@
 //
-//  PrivacyHook.m — Step 16: HTTP request spy
+//  PrivacyHook.m — Step 17: catch ALL URL creation + NSUserDefaults spy
 //
-//  Step15: ALL 0 calls — no keychain, no C functions
-//  Baidu must send device ID via HTTP headers/params.
+//  Step16: 0 NSURLSession requests — Baidu doesn't use NSURLSession
 //
-//  Step16: Hook NSURLSession to capture HTTP requests
-//  Show URL + headers in diagnostic popup.
-//  This will reveal EXACTLY what Baidu sends for device ID.
+//  Step17: Hook NSMutableURLRequest initWithURL: (catches ALL requests)
+//          + Hook NSUserDefaults setObject:forKey: (see what Baidu stores)
+//          + 30 second delay (let user interact with app)
 //
 
 #import <Foundation/Foundation.h>
@@ -19,21 +18,14 @@
 #import <sys/sysctl.h>
 #import <string.h>
 #import <CoreFoundation/CoreFoundation.h>
-#import <IOKit/IOKitLib.h>
-#import <ifaddrs.h>
 #import <mach-o/dyld.h>
 
 #define NSLog(...)
 
-// ============================================================
-// Diagnostic
-// ============================================================
-static NSMutableArray *diag_requests = nil;
+static NSMutableArray *diag_urls = nil;
+static NSMutableArray *diag_defaults = nil;
 static volatile int diag_sbn_called = 0;
 
-// ============================================================
-// Spoofed values
-// ============================================================
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
@@ -46,9 +38,6 @@ static char _c_hwmodel[32] = {0};
 static char _c_platformUUID[64] = {0};
 static char _c_platformSerial[32] = {0};
 
-// ============================================================
-// DYLD_INTERPOSE (keep sysctlbyname for hw.machine)
-// ============================================================
 #define DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { \
       const void *replacement; \
@@ -78,9 +67,6 @@ static int my_sysctlbyname(const char *name, void *oldp,
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
-// ============================================================
-// Spoofed value initialization
-// ============================================================
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
 }
@@ -239,136 +225,106 @@ static void clearWebViewData(void) {
 }
 
 // ============================================================
-// HTTP Request Spy — hook NSURLSession
+// URL Spy: hook NSMutableURLRequest initWithURL:
+// This catches ALL URL requests regardless of networking API
 // ============================================================
-static IMP orig_dataTask_request = NULL;
-static IMP orig_dataTask_request_complete = NULL;
+static IMP orig_req_init_url = NULL;
+static IMP orig_req_init_url_cache = NULL;
 
-static void logRequest(NSURLRequest *request) {
-    if (!request || !diag_requests) return;
-    NSURL *url = request.URL;
-    if (!url) return;
-    NSString *host = url.host ?: @"";
-    // Only log Baidu-related requests
-    NSString *hostLower = [host lowercaseString];
-    if (![hostLower containsString:@"baidu"] &&
-        ![hostLower containsString:@"bdstatic"] &&
-        ![hostLower containsString:@"bdimg"] &&
-        ![hostLower containsString:@"hm."] &&
-        ![hostLower containsString:@"dnspod"]) {
-        return;
-    }
-
-    NSDictionary *headers = [request allHTTPHeaderFields];
-    NSString *path = url.path ?: @"/";
-    NSString *query = url.query ?: @"";
-    // Truncate query to 200 chars
-    if (query.length > 200) query = [query substringToIndex:200];
-
-    // Extract device-related headers
-    NSMutableString *deviceHeaders = [NSMutableString string];
-    for (NSString *key in headers) {
-        NSString *keyLower = [key lowercaseString];
-        if ([keyLower containsString:@"device"] ||
-            [keyLower containsString:@"uuid"] ||
-            [keyLower containsString:@"idfa"] ||
-            [keyLower containsString:@"idfv"] ||
-            [keyLower containsString:@"mac"] ||
-            [keyLower containsString:@"imei"] ||
-            [keyLower containsString:@"serial"] ||
-            [keyLower containsString:@"android"] ||
-            [keyLower containsString:@"model"] ||
-            [keyLower containsString:@"machine"] ||
-            [keyLower containsString:@"fingerprint"] ||
-            [keyLower containsString:@"token"] ||
-            [keyLower containsString:@"cid"] ||
-            [keyLower containsString:@"uid"] ||
-            [keyLower containsString:@"user-agent"]) {
-            NSString *val = headers[key];
-            if (val.length > 100) val = [val substringToIndex:100];
-            [deviceHeaders appendFormat:@"  %@: %@\n", key, val];
+static id my_req_init_url(id self, SEL _cmd, NSURL *url) {
+    if (url && diag_urls) {
+        NSString *host = url.host ?: @"";
+        NSString *path = url.path ?: @"/";
+        NSString *entry = [NSString stringWithFormat:@"%@%@", host, path];
+        @synchronized(diag_urls) {
+            if (diag_urls.count < 30) [diag_urls addObject:entry];
         }
     }
-
-    // Also check query params for device IDs
-    NSMutableString *deviceParams = [NSMutableString string];
-    for (NSString *param in [query componentsSeparatedByString:@"&"]) {
-        NSString *paramLower = [param lowercaseString];
-        if ([paramLower containsString:@"device"] ||
-            [paramLower containsString:@"uuid"] ||
-            [paramLower containsString:@"idfa"] ||
-            [paramLower containsString:@"idfv"] ||
-            [paramLower containsString:@"mac"] ||
-            [paramLower containsString:@"imei"] ||
-            [paramLower containsString:@"model"] ||
-            [paramLower containsString:@"machine"] ||
-            [paramLower containsString:@"fingerprint"] ||
-            [paramLower containsString:@"cid"] ||
-            [paramLower containsString:@"uid"] ||
-            [paramLower hasPrefix:@"id="]) {
-            [deviceParams appendFormat:@"  ?%@\n", param];
-        }
-    }
-
-    NSString *entry = [NSString stringWithFormat:@"[%@]%@\nHeaders:\n%@Params:\n%@",
-                       request.HTTPMethod ?: @"GET",
-                       [NSString stringWithFormat:@"%@%@", host, path],
-                       deviceHeaders.length > 0 ? deviceHeaders : @"  (none)\n",
-                       deviceParams.length > 0 ? deviceParams : @"  (none)\n"];
-
-    @synchronized(diag_requests) {
-        if (diag_requests.count < 20) {
-            [diag_requests addObject:entry];
-        }
-    }
+    return ((id(*)(id, SEL, NSURL *))orig_req_init_url)(self, _cmd, url);
 }
 
-// Hook: -[NSURLSession dataTaskWithRequest:completionHandler:]
-static id my_dataTask_request_complete(id self, SEL _cmd, NSURLRequest *request, void(^completion)(NSData *, NSURLResponse *, NSError *)) {
-    logRequest(request);
-    return ((id(*)(id, SEL, NSURLRequest *, void(^)(NSData *, NSURLResponse *, NSError *)))orig_dataTask_request_complete)(self, _cmd, request, completion);
-}
-
-// Hook: -[NSURLSession dataTaskWithRequest:]
-static id my_dataTask_request(id self, SEL _cmd, NSURLRequest *request) {
-    logRequest(request);
-    return ((id(*)(id, SEL, NSURLRequest *))orig_dataTask_request)(self, _cmd, request);
+static id my_req_init_url_cache(id self, SEL _cmd, NSURL *url, id cachePolicy, id timeout) {
+    if (url && diag_urls) {
+        NSString *host = url.host ?: @"";
+        NSString *path = url.path ?: @"/";
+        NSString *query = url.query ?: @"";
+        if (query.length > 150) query = [query substringToIndex:150];
+        NSString *entry = [NSString stringWithFormat:@"%@%@?%@", host, path, query];
+        @synchronized(diag_urls) {
+            if (diag_urls.count < 30) [diag_urls addObject:entry];
+        }
+    }
+    return ((id(*)(id, SEL, NSURL *, id, id))orig_req_init_url_cache)(self, _cmd, url, cachePolicy, timeout);
 }
 
 // ============================================================
-// Diagnostic popup
+// NSUserDefaults Spy: see what keys Baidu writes
+// ============================================================
+static IMP orig_defaults_set_object = NULL;
+
+static void my_defaults_set_object(id self, SEL _cmd, id value, NSString *key) {
+    if (key && diag_defaults) {
+        // Skip our own keys
+        if (![key hasPrefix:@"BaiduBox.cfg."]) {
+            NSString *valStr = @"";
+            if ([value isKindOfClass:[NSString class]]) {
+                valStr = value;
+                if (valStr.length > 80) valStr = [valStr substringToIndex:80];
+            } else if ([value isKindOfClass:[NSNumber class]]) {
+                valStr = [value stringValue];
+            } else {
+                valStr = [value className];
+            }
+            NSString *entry = [NSString stringWithFormat:@"%@ = %@", key, valStr];
+            @synchronized(diag_defaults) {
+                if (diag_defaults.count < 30) [diag_defaults addObject:entry];
+            }
+        }
+    }
+    ((void(*)(id, SEL, id, NSString *))orig_defaults_set_object)(self, _cmd, value, key);
+}
+
+// ============================================================
+// Diagnostic popup — 30 second delay
 // ============================================================
 static void showDiagnosticPopup(void) {
-    NSString *reqReport = @"(no baidu requests)";
-    if (diag_requests && diag_requests.count > 0) {
-        @synchronized(diag_requests) {
-            NSInteger max = MIN(diag_requests.count, 10);
-            reqReport = [[diag_requests subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n---\n"];
-            if (diag_requests.count > max) {
-                reqReport = [reqReport stringByAppendingFormat:@"\n... +%d more", (int)(diag_requests.count - max)];
-            }
+    NSString *urlReport = @"(none)";
+    if (diag_urls && diag_urls.count > 0) {
+        @synchronized(diag_urls) {
+            NSInteger max = MIN(diag_urls.count, 15);
+            urlReport = [[diag_urls subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
+            if (diag_urls.count > max) urlReport = [urlReport stringByAppendingFormat:@"\n...+%d", (int)(diag_urls.count-max)];
+        }
+    }
+
+    NSString *defaultsReport = @"(none)";
+    if (diag_defaults && diag_defaults.count > 0) {
+        @synchronized(diag_defaults) {
+            NSInteger max = MIN(diag_defaults.count, 15);
+            defaultsReport = [[diag_defaults subarrayWithRange:NSMakeRange(0, max)] componentsJoinedByString:@"\n"];
+            if (diag_defaults.count > max) defaultsReport = [defaultsReport stringByAppendingFormat:@"\n...+%d", (int)(diag_defaults.count-max)];
         }
     }
 
     NSString *msg = [NSString stringWithFormat:
-        @"=== Step16 HTTP Spy ===\n\n"
-        @"sysctlbyname: %d calls\n"
-        @"捕获请求数: %d\n\n"
-        @"百度请求详情:\n%@\n"
-        @"ObjC: 已生效\n设备名: %@\n系统版本: %@",
+        @"=== Step17 Spy ===\n\n"
+        @"URL请求(%d):\n%@\n\n"
+        @"UserDefaults写入(%d):\n%@\n\n"
+        @"sysctlbyname: %d\n"
+        @"设备: %@ / %@",
+        diag_urls ? (int)diag_urls.count : 0, urlReport,
+        diag_defaults ? (int)diag_defaults.count : 0, defaultsReport,
         diag_sbn_called,
-        diag_requests ? (int)diag_requests.count : 0,
-        reqReport,
         _spoofedDeviceName, _spoofedSysVersion];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Step16"
+        alertControllerWithTitle:@"Step17"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 
-    // 10 second delay to let Baidu make requests
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+    // 30 second delay — user should interact with app
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -415,7 +371,8 @@ static void my_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        diag_requests = [NSMutableArray new];
+        diag_urls = [NSMutableArray new];
+        diag_defaults = [NSMutableArray new];
 
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
@@ -487,20 +444,24 @@ static void initPrivacyHook(void) {
             if (m) { orig_wk_init_coder = method_getImplementation(m); class_replaceMethod(wkClass, @selector(initWithCoder:), (IMP)my_wk_init_coder, method_getTypeEncoding(m)); }
         }
 
+        // URL Spy: hook NSMutableURLRequest init
         Class reqClass = objc_getClass("NSMutableURLRequest");
         if (reqClass) {
-            Method m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+            Method m = class_getInstanceMethod(reqClass, @selector(initWithURL:));
+            if (m) { orig_req_init_url = method_getImplementation(m); class_replaceMethod(reqClass, @selector(initWithURL:), (IMP)my_req_init_url, method_getTypeEncoding(m)); }
+
+            m = class_getInstanceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:));
+            if (m) { orig_req_init_url_cache = method_getImplementation(m); class_replaceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:), (IMP)my_req_init_url_cache, method_getTypeEncoding(m)); }
+
+            m = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
             if (m) { orig_setValue = method_getImplementation(m); class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), (IMP)my_setValue, method_getTypeEncoding(m)); }
         }
 
-        // HTTP spy: hook NSURLSession
-        Class sessionClass = objc_getClass("NSURLSession");
-        if (sessionClass) {
-            Method m = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:));
-            if (m) { orig_dataTask_request_complete = method_getImplementation(m); class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:), (IMP)my_dataTask_request_complete, method_getTypeEncoding(m)); }
-
-            m = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:));
-            if (m) { orig_dataTask_request = method_getImplementation(m); class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:), (IMP)my_dataTask_request, method_getTypeEncoding(m)); }
+        // NSUserDefaults spy
+        Class defaultsClass = objc_getClass("NSUserDefaults");
+        if (defaultsClass) {
+            Method m = class_getInstanceMethod(defaultsClass, @selector(setObject:forKey:));
+            if (m) { orig_defaults_set_object = method_getImplementation(m); class_replaceMethod(defaultsClass, @selector(setObject:forKey:), (IMP)my_defaults_set_object, method_getTypeEncoding(m)); }
         }
 
         showDiagnosticPopup();
