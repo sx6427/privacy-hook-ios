@@ -118,8 +118,10 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // 首次启动清理 Cookie（删除 BAIDUCUID → 新设备 → 要验证码）
-        clearCookiesFirstLaunch();
+        // 首次启动清理 Cookie（延迟到主线程，避免 constructor 里闪退）
+        dispatch_async(dispatch_get_main_queue(), ^{
+            clearCookiesFirstLaunch();
+        });
 
         // Clear keychain every launch
         clearKeychainEveryLaunch();
