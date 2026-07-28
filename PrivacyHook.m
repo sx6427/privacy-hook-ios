@@ -1,11 +1,9 @@
 //
-//  PrivacyHook.m — Step27: Step3 (payment-proven) + sandbox nuke
+//  PrivacyHook.m — Step27b: Step3 + sandbox nuke (Caches only, keep Preferences)
 //
-//  Based on Step3 which had WORKING PAYMENT.
-//  Only adds: sandbox nuke + UserDefaults clear (first launch only).
-//  NO keychain clearing (breaks payment SDK).
-//  NO sysctlbyname/uname interpose (wasn't working anyway).
-//  NO systemVersion/NSProcessInfo/WKWebView/NSFileManager hooks.
+//  Fix: Previous version deleted ALL of Library/ which broke payment SDK.
+//  Now only deletes Library/Caches (Baidu device ID) and Documents.
+//  Keeps Library/Preferences (payment SDK config) intact.
 //
 
 #import <Foundation/Foundation.h>
@@ -70,11 +68,10 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 
 // ============================================================
 // First-launch-only: clear Baidu UserDefaults
-// Baidu stores device_id, cuid here (confirmed Step23)
 // ============================================================
 static void clearBaiduUserDefaultsOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *flagKey = kKey(@"ud_cleaned_v2");
+    NSString *flagKey = kKey(@"ud_cleaned_v3");
     if ([defaults boolForKey:flagKey]) return;
 
     NSMutableDictionary *myConfig = [NSMutableDictionary dictionary];
@@ -104,12 +101,12 @@ static void clearBaiduUserDefaultsOnce(void) {
 }
 
 // ============================================================
-// First-launch-only: nuke sandbox
-// Baidu stores device ID in sandbox files (confirmed Step26)
+// First-launch-only: nuke sandbox — Caches only!
+// DO NOT delete Library/Preferences (payment SDK config lives here)
 // ============================================================
 static void nukeSandboxOnce(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *flagKey = kKey(@"sandbox_nuked_v2");
+    NSString *flagKey = kKey(@"sandbox_nuked_v3");
     if ([defaults boolForKey:flagKey]) return;
 
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -131,11 +128,12 @@ static void nukeSandboxOnce(void) {
         [fm removeItemAtPath:[docsDir stringByAppendingPathComponent:f] error:nil];
     }
 
-    // Delete Library
-    NSString *libDir = [home stringByAppendingPathComponent:@"Library"];
-    NSArray *libFiles = [fm contentsOfDirectoryAtPath:libDir error:nil];
-    for (NSString *f in libFiles) {
-        [fm removeItemAtPath:[libDir stringByAppendingPathComponent:f] error:nil];
+    // Delete Library/Caches ONLY (not Library/Preferences!)
+    // Payment SDK stores config in Library/Preferences — must keep it.
+    NSString *cachesDir = [home stringByAppendingPathComponent:@"Library/Caches"];
+    NSArray *cachesFiles = [fm contentsOfDirectoryAtPath:cachesDir error:nil];
+    for (NSString *f in cachesFiles) {
+        [fm removeItemAtPath:[cachesDir stringByAppendingPathComponent:f] error:nil];
     }
 
     // Delete tmp
@@ -147,9 +145,7 @@ static void nukeSandboxOnce(void) {
 
     // Recreate dirs
     [fm createDirectoryAtPath:docsDir withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:libDir withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:[libDir stringByAppendingPathComponent:@"Caches"] withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:[libDir stringByAppendingPathComponent:@"Preferences"] withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:cachesDir withIntermediateDirectories:YES attributes:nil error:nil];
 
     // Restore config
     for (NSString *key in savedConfig) {
@@ -169,13 +165,13 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // First-launch-only cleanup (uses v2 flags so upgrade triggers fresh clean)
+        // First-launch-only cleanup (v3 flags)
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        BOOL isFirstLaunch = ![ud boolForKey:kKey(@"first_launch_v2")];
+        BOOL isFirstLaunch = ![ud boolForKey:kKey(@"first_launch_v3")];
         if (isFirstLaunch) {
             clearBaiduUserDefaultsOnce();
             nukeSandboxOnce();
-            [ud setBool:YES forKey:kKey(@"first_launch_v2")];
+            [ud setBool:YES forKey:kKey(@"first_launch_v3")];
             [ud synchronize];
         }
 
