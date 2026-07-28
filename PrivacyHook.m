@@ -1,12 +1,14 @@
 //
-//  PrivacyHook.m — Step32: Bundle ID hook + keychain + UD clear + cache delete
+//  PrivacyHook.m — Step33: ONLY Bundle ID hook + keychain clear
 //
-//  NEW IDEA: Hook [[NSBundle mainBundle] bundleIdentifier] to return
-//  the ORIGINAL bundle ID (com.baidu.BaiduMobile). This way:
-//  - iOS sees different Bundle ID (.test) → installs as separate app
-//  - Payment SDK sees original Bundle ID → payment works
+//  Error: "支付环境风险，发现非正版应用"
+//  Payment SDK detects modified Bundle ID → refuses payment.
 //
-//  Plus: keychain clear every launch + UD clear first launch + Caches delete
+//  Fix: Hook bundleIdentifier to return original "com.baidu.BaiduMobile"
+//  so payment SDK thinks it's the genuine app.
+//
+//  NO UserDefaults clearing. NO Library deletion. NO pasteboard hooks.
+//  ONLY: Bundle ID hook + keychain clear (every launch) + IDFA/IDFV.
 //
 
 #import <Foundation/Foundation.h>
@@ -88,68 +90,9 @@ static void clearKeychainEveryLaunch(void) {
     }
 }
 
-// First launch: clear ALL UserDefaults + delete Library/Caches
-static void clearBaiduDataFirstLaunch(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *flagKey = kKey(@"clean_v6");
-    if ([defaults boolForKey:flagKey]) return;
-
-    // Save our config
-    NSMutableDictionary *myConfig = [NSMutableDictionary dictionary];
-    NSDictionary *allDict = [defaults dictionaryRepresentation];
-    for (NSString *key in allDict) {
-        if ([key hasPrefix:@"BaiduBox.cfg."]) {
-            myConfig[key] = allDict[key];
-        }
-    }
-
-    // Clear ALL UserDefaults (first install = no payment SDK data yet)
-    for (NSString *key in allDict) {
-        if ([key hasPrefix:@"AKService"]) continue;
-        if ([key hasPrefix:@"Apple"]) continue;
-        if ([key hasPrefix:@"NS"]) continue;
-        if ([key hasPrefix:@"com.apple"]) continue;
-        if ([key hasPrefix:@"ITF"]) continue;
-        if ([key hasPrefix:@"MSV"]) continue;
-        if ([key hasPrefix:@"WebKit"]) continue;
-        if ([key hasPrefix:@"CFUser"]) continue;
-        if ([key hasPrefix:@"pkc"]) continue;
-        [defaults removeObjectForKey:key];
-    }
-    for (NSString *key in myConfig) {
-        [defaults setObject:myConfig[key] forKey:key];
-    }
-
-    // Delete Library/Caches
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *home = NSHomeDirectory();
-    NSString *cachesDir = [home stringByAppendingPathComponent:@"Library/Caches"];
-    NSArray *cachesFiles = [fm contentsOfDirectoryAtPath:cachesDir error:nil];
-    for (NSString *f in cachesFiles) {
-        [fm removeItemAtPath:[cachesDir stringByAppendingPathComponent:f] error:nil];
-    }
-
-    // Delete Documents
-    NSString *docsDir = [home stringByAppendingPathComponent:@"Documents"];
-    NSArray *docsFiles = [fm contentsOfDirectoryAtPath:docsDir error:nil];
-    for (NSString *f in docsFiles) {
-        [fm removeItemAtPath:[docsDir stringByAppendingPathComponent:f] error:nil];
-    }
-
-    // Delete tmp
-    NSString *tmpDir = [home stringByAppendingPathComponent:@"tmp"];
-    NSArray *tmpFiles = [fm contentsOfDirectoryAtPath:tmpDir error:nil];
-    for (NSString *f in tmpFiles) {
-        [fm removeItemAtPath:[tmpDir stringByAppendingPathComponent:f] error:nil];
-    }
-
-    [fm createDirectoryAtPath:docsDir withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:cachesDir withIntermediateDirectories:YES attributes:nil error:nil];
-
-    [defaults setBool:YES forKey:flagKey];
-    [defaults synchronize];
-}
-
+// ============================================================
+// Constructor
+// ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
@@ -157,19 +100,19 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
+        // Clear keychain every launch
         clearKeychainEveryLaunch();
-        clearBaiduDataFirstLaunch();
 
-        // 1. *** Bundle ID hook ***
-        // Payment SDK checks [[NSBundle mainBundle] bundleIdentifier].
-        // Return original "com.baidu.BaiduMobile" so payment SDK is happy.
+        // *** Bundle ID hook ***
+        // Return original "com.baidu.BaiduMobile" so payment SDK
+        // doesn't detect "non-genuine app".
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
             if (m) {
                 orig_bundleIdentifier = method_getImplementation(m);
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    if (s == [NSBundle mainBundle]) return _originalBundleID;
+                    if ([s isEqual:[NSBundle mainBundle]]) return _originalBundleID;
                     return ((NSString *(*)(id, SEL))orig_bundleIdentifier)(s, @selector(bundleIdentifier));
                 });
                 class_replaceMethod(bundleClass, @selector(bundleIdentifier), imp, method_getTypeEncoding(m));
@@ -179,18 +122,31 @@ static void initPrivacyHook(void) {
                 orig_infoDictionary = method_getImplementation(m2);
                 IMP imp2 = imp_implementationWithBlock(^NSDictionary *(id s) {
                     NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(s, @selector(infoDictionary));
-                    if (s == [NSBundle mainBundle] && dict) {
-                        NSMutableDictionary *mDict = [dict mutableCopy];
-                        mDict[@"CFBundleIdentifier"] = _originalBundleID;
-                        return mDict;
+                    if ([s isEqual:[NSBundle mainBundle]] && dict) {
+                        NSMutableDictionary *md = [dict mutableCopy];
+                        md[@"CFBundleIdentifier"] = _originalBundleID;
+                        return md;
                     }
                     return dict;
                 });
                 class_replaceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
             }
+            // Also hook objectForInfoDictionaryKey: which many SDKs use
+            Method m3 = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
+            if (m3) {
+                IMP orig3 = method_getImplementation(m3);
+                IMP imp3 = imp_implementationWithBlock(^id(id s, SEL _cmd, NSString *key) {
+                    id val = ((id(*)(id, SEL, NSString *))orig3)(s, _cmd, key);
+                    if ([s isEqual:[NSBundle mainBundle]] && [key isEqualToString:@"CFBundleIdentifier"]) {
+                        return _originalBundleID;
+                    }
+                    return val;
+                });
+                class_replaceMethod(bundleClass, @selector(objectForInfoDictionaryKey:), imp3, method_getTypeEncoding(m3));
+            }
         }
 
-        // 2. IDFA
+        // IDFA
         Class asmClass = objc_getClass("ASIdentifierManager");
         if (asmClass) {
             Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
@@ -205,7 +161,7 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // 3. ATTrackingManager
+        // ATTrackingManager
         Class attClass = objc_getClass("ATTrackingManager");
         if (attClass) {
             Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
@@ -215,7 +171,7 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // 4. IDFV + device name
+        // IDFV + device name
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
