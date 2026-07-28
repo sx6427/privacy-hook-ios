@@ -1,14 +1,9 @@
 //
-//  PrivacyHook.m — Step33: ONLY Bundle ID hook + keychain clear
+//  PrivacyHook.m — Step35: Step33 + sysctlbyname hook (设备型号伪装)
 //
-//  Error: "支付环境风险，发现非正版应用"
-//  Payment SDK detects modified Bundle ID → refuses payment.
-//
-//  Fix: Hook bundleIdentifier to return original "com.baidu.BaiduMobile"
-//  so payment SDK thinks it's the genuine app.
-//
-//  NO UserDefaults clearing. NO Library deletion. NO pasteboard hooks.
-//  ONLY: Bundle ID hook + keychain clear (every launch) + IDFA/IDFV.
+//  Step33: Bundle ID hook (支付成功) + Keychain清理 + IDFA/IDFV
+//  Step35 新增: fishhook hook sysctlbyname("hw.machine") 返回随机设备型号
+//  每个副本不同设备型号 → 百度设备指纹不同 → 新设备 → 要验证码
 //
 
 #import <Foundation/Foundation.h>
@@ -17,6 +12,9 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <string.h>
+#import <sys/sysctl.h>
+#import "fishhook.h"
 
 #define NSLog(...)
 
@@ -26,6 +24,9 @@ static NSString *_spoofedDeviceName = nil;
 static NSString *_originalBundleID = @"com.baidu.BaiduMobile";
 static IMP orig_bundleIdentifier = NULL;
 static IMP orig_infoDictionary = NULL;
+
+// 设备型号 (如 "iPhone14,5")
+static char _spoofedMachine[32] = {0};
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -56,6 +57,49 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     [defaults setObject:name forKey:key];
     [defaults synchronize];
     return name;
+}
+
+// 随机设备型号
+static void initSpoofedMachine(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(@"machine");
+    NSString *saved = [defaults stringForKey:key];
+    if (!saved) {
+        NSArray *models = @[
+            @"iPhone14,5", @"iPhone14,2", @"iPhone14,3",
+            @"iPhone14,7", @"iPhone14,8", @"iPhone15,2",
+            @"iPhone15,3", @"iPhone15,4", @"iPhone15,5",
+            @"iPhone16,1", @"iPhone16,2",
+        ];
+        saved = models[arc4random_uniform((uint32_t)models.count)];
+        [defaults setObject:saved forKey:key];
+        [defaults synchronize];
+    }
+    strlcpy(_spoofedMachine, [saved UTF8String], sizeof(_spoofedMachine));
+}
+
+// fishhook: sysctlbyname replacement
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+
+static int my_sysctlbyname(const char *name, void *oldp,
+                           size_t *oldlenp, void *newp, size_t newlen) {
+    // 只拦截读取（newp==NULL, newlen==0）
+    if (name && newp == NULL && newlen == 0) {
+        // hw.machine = 设备型号 (如 iPhone14,5)
+        if (strcmp(name, "hw.machine") == 0 && _spoofedMachine[0] != 0) {
+            size_t need = strlen(_spoofedMachine) + 1;
+            if (oldp == NULL) {
+                if (oldlenp) *oldlenp = need;
+                return 0;
+            }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, _spoofedMachine, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
@@ -100,12 +144,16 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
+        // 初始化随机设备型号
+        initSpoofedMachine();
+
+        // fishhook: hook sysctlbyname
+        rebind_symbols((struct rebinding[1]){{"sysctlbyname", my_sysctlbyname, (void *)&orig_sysctlbyname}}, 1);
+
         // Clear keychain every launch
         clearKeychainEveryLaunch();
 
         // *** Bundle ID hook ***
-        // Return original "com.baidu.BaiduMobile" so payment SDK
-        // doesn't detect "non-genuine app".
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
@@ -131,7 +179,6 @@ static void initPrivacyHook(void) {
                 });
                 class_replaceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
             }
-            // Also hook objectForInfoDictionaryKey: which many SDKs use
             Method m3 = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
             if (m3) {
                 IMP orig3 = method_getImplementation(m3);
