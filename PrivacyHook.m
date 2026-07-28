@@ -74,6 +74,7 @@ static void clearBaiduUserDefaultsOnce(void) {
     NSString *flagKey = kKey(@"ud_cleaned_v3");
     if ([defaults boolForKey:flagKey]) return;
 
+    // Save our own config
     NSMutableDictionary *myConfig = [NSMutableDictionary dictionary];
     NSDictionary *allDict = [defaults dictionaryRepresentation];
     for (NSString *key in allDict) {
@@ -81,7 +82,15 @@ static void clearBaiduUserDefaultsOnce(void) {
             myConfig[key] = allDict[key];
         }
     }
+
+    // Only delete Baidu-specific keys. Keep everything else
+    // (payment SDK, login state, other app data).
+    NSArray *baiduPatterns = @[@"cuid", @"device_id", @"deviceid",
+                               @"bduss", @"STOKEN", @"BDID",
+                               @"baidu", @"BIDU", @"bd_",
+                               @"BaiduBox", @"BDSDK"];
     for (NSString *key in allDict) {
+        // Skip system keys
         if ([key hasPrefix:@"AKService"]) continue;
         if ([key hasPrefix:@"Apple"]) continue;
         if ([key hasPrefix:@"NS"]) continue;
@@ -91,8 +100,26 @@ static void clearBaiduUserDefaultsOnce(void) {
         if ([key hasPrefix:@"WebKit"]) continue;
         if ([key hasPrefix:@"CFUser"]) continue;
         if ([key hasPrefix:@"pkc"]) continue;
-        [defaults removeObjectForKey:key];
+        // Skip payment SDK keys
+        NSString *lowerKey = [key lowercaseString];
+        if ([lowerKey containsString:@"alipay"]) continue;
+        if ([lowerKey containsString:@"wechat"]) continue;
+        if ([lowerKey containsString:@"tencent"]) continue;
+        if ([lowerKey containsString:@"xauth"]) continue;
+        // Only delete if it matches a Baidu pattern
+        BOOL isBaidu = NO;
+        for (NSString *pattern in baiduPatterns) {
+            if ([lowerKey containsString:[pattern lowercaseString]]) {
+                isBaidu = YES;
+                break;
+            }
+        }
+        if (isBaidu) {
+            [defaults removeObjectForKey:key];
+        }
     }
+
+    // Restore our config
     for (NSString *key in myConfig) {
         [defaults setObject:myConfig[key] forKey:key];
     }
