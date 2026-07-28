@@ -1,14 +1,10 @@
 //
-//  PrivacyHook.m — Step33: ONLY Bundle ID hook + keychain clear
+//  PrivacyHook.m — Step34: Step33 + Cookie清理 + 系统版本伪装
 //
-//  Error: "支付环境风险，发现非正版应用"
-//  Payment SDK detects modified Bundle ID → refuses payment.
-//
-//  Fix: Hook bundleIdentifier to return original "com.baidu.BaiduMobile"
-//  so payment SDK thinks it's the genuine app.
-//
-//  NO UserDefaults clearing. NO Library deletion. NO pasteboard hooks.
-//  ONLY: Bundle ID hook + keychain clear (every launch) + IDFA/IDFV.
+//  Step33: Bundle ID hook (支付成功) + Keychain清理 + IDFA/IDFV
+//  Step34 新增:
+//    1. 首次启动清理 Cookie (删除 BAIDUCUID → 百度认为是新设备 → 要验证码)
+//    2. Hook systemVersion (每个副本随机不同的 iOS 版本)
 //
 
 #import <Foundation/Foundation.h>
@@ -23,6 +19,7 @@
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
+static NSString *_spoofedSystemVersion = nil;
 static NSString *_originalBundleID = @"com.baidu.BaiduMobile";
 static IMP orig_bundleIdentifier = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -58,6 +55,22 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     return name;
 }
 
+// 随机生成 iOS 系统版本 (16.0 ~ 17.5)
+static NSString *getOrCreateSpoofedSystemVersion(NSString *key) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *existing = [defaults stringForKey:key];
+    if (existing) return existing;
+
+    NSArray *versions = @[
+        @"16.0", @"16.1", @"16.2", @"16.3", @"16.4", @"16.5", @"16.6", @"16.7",
+        @"17.0", @"17.1", @"17.2", @"17.3", @"17.4", @"17.5"
+    ];
+    NSString *ver = versions[arc4random_uniform((uint32_t)versions.count)];
+    [defaults setObject:ver forKey:key];
+    [defaults synchronize];
+    return ver;
+}
+
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
@@ -90,6 +103,31 @@ static void clearKeychainEveryLaunch(void) {
     }
 }
 
+// Cookie: 首次启动清理 (删除 BAIDUCUID 等设备标识)
+// 之后启动保留 Cookie (保持登录状态)
+static void clearCookiesFirstLaunch(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *key = kKey(@"cookieCleared");
+
+    if ([defaults boolForKey:key]) {
+        // 非首次启动，保留 Cookie（保持登录）
+        return;
+    }
+
+    // 首次启动 — 清理所有 HTTP Cookie
+    NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    if (storage) {
+        NSArray *cookies = [[storage cookies] copy];
+        for (NSHTTPCookie *cookie in cookies) {
+            [storage deleteCookie:cookie];
+        }
+    }
+
+    // 标记已清理
+    [defaults setBool:YES forKey:key];
+    [defaults synchronize];
+}
+
 // ============================================================
 // Constructor
 // ============================================================
@@ -99,6 +137,10 @@ static void initPrivacyHook(void) {
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
+        _spoofedSystemVersion = getOrCreateSpoofedSystemVersion(kKey(@"sv"));
+
+        // 首次启动清理 Cookie（删除 BAIDUCUID → 新设备 → 要验证码）
+        clearCookiesFirstLaunch();
 
         // Clear keychain every launch
         clearKeychainEveryLaunch();
@@ -171,7 +213,7 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // IDFV + device name
+        // IDFV + device name + system version
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
@@ -183,6 +225,12 @@ static void initPrivacyHook(void) {
             if (m) {
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; });
                 hookInstanceMethod(uiDeviceClass, @selector(name), imp, method_getTypeEncoding(m));
+            }
+            // Step34: Hook systemVersion
+            m = class_getInstanceMethod(uiDeviceClass, @selector(systemVersion));
+            if (m) {
+                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedSystemVersion; });
+                hookInstanceMethod(uiDeviceClass, @selector(systemVersion), imp, method_getTypeEncoding(m));
             }
         }
     }
