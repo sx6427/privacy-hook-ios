@@ -22,6 +22,8 @@ static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
 static NSString *_spoofedDeviceName = nil;
 static NSString *_originalBundleID = @"com.baidu.BaiduMobile";
+static IMP orig_bundleIdentifier = NULL;
+static IMP orig_infoDictionary = NULL;
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -163,22 +165,20 @@ static void initPrivacyHook(void) {
         // Return original "com.baidu.BaiduMobile" so payment SDK is happy.
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
-            // Hook instance method bundleIdentifier
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
             if (m) {
+                orig_bundleIdentifier = method_getImplementation(m);
                 IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    // Only spoof for mainBundle
                     if (s == [NSBundle mainBundle]) return _originalBundleID;
-                    // For other bundles, return real value
-                    return ((NSString *(*)(id, SEL))method_getImplementation(m))(s, @selector(bundleIdentifier));
+                    return ((NSString *(*)(id, SEL))orig_bundleIdentifier)(s, @selector(bundleIdentifier));
                 });
-                hookInstanceMethod(bundleClass, @selector(bundleIdentifier), imp, method_getTypeEncoding(m));
+                class_replaceMethod(bundleClass, @selector(bundleIdentifier), imp, method_getTypeEncoding(m));
             }
-            // Also hook infoDictionary to fix bundleIdentifier there
             Method m2 = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
             if (m2) {
+                orig_infoDictionary = method_getImplementation(m2);
                 IMP imp2 = imp_implementationWithBlock(^NSDictionary *(id s) {
-                    NSDictionary *dict = ((NSDictionary *(*)(id, SEL))method_getImplementation(m2))(s, @selector(infoDictionary));
+                    NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(s, @selector(infoDictionary));
                     if (s == [NSBundle mainBundle] && dict) {
                         NSMutableDictionary *mDict = [dict mutableCopy];
                         mDict[@"CFBundleIdentifier"] = _originalBundleID;
@@ -186,7 +186,7 @@ static void initPrivacyHook(void) {
                     }
                     return dict;
                 });
-                hookInstanceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
+                class_replaceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
             }
         }
 
