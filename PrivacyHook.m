@@ -1,10 +1,9 @@
 //
-//  PrivacyHook.m — Step29: Keychain clear + IDFA/IDFV only
+//  PrivacyHook.m — Step30: Keychain clear EVERY launch + UD clear first launch
 //
-//  NO sandbox deletion (preserves payment SDK config)
-//  NO pasteboard hooks (preserves payment flow)
-//  NO App Group blocking
-//  ONLY: keychain clear (once) + IDFA/IDFV spoof + device name
+//  Payment works on first launch (clean keychain) but fails on second
+//  (dirty keychain). Fix: clear keychain on EVERY launch.
+//  Also clear Baidu UserDefaults on first launch for verification code.
 //
 
 #import <Foundation/Foundation.h>
@@ -69,14 +68,11 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
 }
 
 // ============================================================
-// Keychain clearing — first launch only
-// This is what made Step26 require verification code.
+// Keychain clearing — EVERY launch (not just first)
+// Payment SDK stores bad data in keychain after first session.
+// Clearing every launch keeps payment SDK fresh → payment works.
 // ============================================================
-static void clearKeychainOnce(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"kc_v4");
-    if ([defaults boolForKey:key]) return;
-
+static void clearKeychainEveryLaunch(void) {
     NSArray *secItemClasses = @[
         (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecClassInternetPassword,
@@ -88,7 +84,47 @@ static void clearKeychainOnce(void) {
         NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
         SecItemDelete((__bridge CFDictionaryRef)query);
     }
-    [defaults setBool:YES forKey:key];
+}
+
+// ============================================================
+// Baidu UserDefaults clearing — first launch only
+// Baidu stores device_id, cuid here.
+// Only delete Baidu-related keys, keep payment SDK data.
+// ============================================================
+static void clearBaiduUserDefaultsOnce(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *flagKey = kKey(@"ud_v4");
+    if ([defaults boolForKey:flagKey]) return;
+
+    // Save our own config
+    NSMutableDictionary *myConfig = [NSMutableDictionary dictionary];
+    NSDictionary *allDict = [defaults dictionaryRepresentation];
+    for (NSString *key in allDict) {
+        if ([key hasPrefix:@"BaiduBox.cfg."]) {
+            myConfig[key] = allDict[key];
+        }
+    }
+
+    // Delete ALL non-system keys (payment SDK hasn't written anything yet
+    // on first launch, so this is safe)
+    for (NSString *key in allDict) {
+        if ([key hasPrefix:@"AKService"]) continue;
+        if ([key hasPrefix:@"Apple"]) continue;
+        if ([key hasPrefix:@"NS"]) continue;
+        if ([key hasPrefix:@"com.apple"]) continue;
+        if ([key hasPrefix:@"ITF"]) continue;
+        if ([key hasPrefix:@"MSV"]) continue;
+        if ([key hasPrefix:@"WebKit"]) continue;
+        if ([key hasPrefix:@"CFUser"]) continue;
+        if ([key hasPrefix:@"pkc"]) continue;
+        [defaults removeObjectForKey:key];
+    }
+
+    // Restore our config
+    for (NSString *key in myConfig) {
+        [defaults setObject:myConfig[key] forKey:key];
+    }
+    [defaults setBool:YES forKey:flagKey];
     [defaults synchronize];
 }
 
@@ -102,8 +138,11 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // Keychain clear — first launch only
-        clearKeychainOnce();
+        // Clear keychain EVERY launch — keeps payment SDK fresh
+        clearKeychainEveryLaunch();
+
+        // Clear Baidu UserDefaults — first launch only
+        clearBaiduUserDefaultsOnce();
 
         // 1. IDFA
         Class asmClass = objc_getClass("ASIdentifierManager");
