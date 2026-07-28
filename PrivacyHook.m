@@ -72,6 +72,7 @@ static uint64_t _spoof_diskFree = 0;
 static int my_sysctlbyname(const char *name, void *oldp,
                             size_t *oldlenp, void *newp, size_t newlen) {
     if (name && newp == NULL && newlen == 0) {
+        // Device model
         if (strcmp(name, "hw.machine") == 0 && _c_machine[0] != 0) {
             size_t need = strlen(_c_machine) + 1;
             if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
@@ -99,68 +100,50 @@ static int my_sysctlbyname(const char *name, void *oldp,
                 return 0;
             }
         }
+        // OS version — must match _spoofedSysVersion!
+        if (strcmp(name, "kern.osproductversion") == 0 && _spoofedSysVersion) {
+            const char *v = [_spoofedSysVersion UTF8String];
+            size_t need = strlen(v) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, v, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
+        if (strcmp(name, "kern.osversion") == 0 && _spoofedSysVersion) {
+            // kern.osversion returns build number like 21F90
+            // Use a fake build that matches our spoofed iOS version
+            const char *v = [_spoofedSysVersion UTF8String];
+            size_t need = strlen(v) + 1;
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
+            if (oldlenp && *oldlenp >= need) {
+                memcpy(oldp, v, need);
+                *oldlenp = need;
+                return 0;
+            }
+        }
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
 // ============================================================
-// Hook: sysctl (numeric ID)
+// Hook: uname — many apps use this instead of sysctlbyname
 // ============================================================
-static int my_sysctl(int *name, u_int namelen, void *oldp,
-                     size_t *oldlenp, void *newp, size_t newlen) {
-    if (name && namelen >= 2 && newp == NULL && newlen == 0) {
-        if (name[0] == 6) {  // CTL_HW
-            if (name[1] == 1 && _c_machine[0] != 0) {  // HW_MACHINE
-                size_t need = strlen(_c_machine) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_machine, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-            }
-            if (name[1] == 2 && _c_hwmodel[0] != 0) {  // HW_MODEL
-                size_t need = strlen(_c_hwmodel) + 1;
-                if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
-                if (oldlenp && *oldlenp >= need) {
-                    memcpy(oldp, _c_hwmodel, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-            }
-        }
+#include <sys/utsname.h>
+static int my_uname(struct utsname *buf) {
+    int ret = uname(buf);
+    if (ret == 0 && _c_machine[0] != 0) {
+        strlcpy(buf->machine, _c_machine, sizeof(buf->machine));
     }
-    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    return ret;
 }
-DYLD_INTERPOSE(my_sysctl, sysctl);
+DYLD_INTERPOSE(my_uname, uname);
 
-// ============================================================
-// Hook: IORegistryEntryCreateCFProperty
-// ============================================================
-static CFTypeRef my_IORegistryEntryCreateCFProperty(
-    io_registry_entry_t entry, CFStringRef key,
-    CFAllocatorRef allocator, IOOptionBits options) {
-    if (key && _c_platformUUID[0] != 0) {
-        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == kCFCompareEqualTo) {
-            return CFStringCreateWithCString(allocator, _c_platformUUID, kCFStringEncodingUTF8);
-        }
-        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == kCFCompareEqualTo) {
-            return CFStringCreateWithCString(allocator, _c_platformSerial, kCFStringEncodingUTF8);
-        }
-    }
-    return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
-}
-DYLD_INTERPOSE(my_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty);
-
-// ============================================================
-// Hook: getifaddrs
-// ============================================================
-static int my_getifaddrs(struct ifaddrs **ifap) {
-    *ifap = NULL;
-    return 0;
-}
-DYLD_INTERPOSE(my_getifaddrs, getifaddrs);
+// NOTE: sysctl(), IORegistryEntryCreateCFProperty(), getifaddrs() interpose hooks REMOVED.
+// Step14 proved that multiple DYLD_INTERPOSE entries cause ALL hooks to stop working (0 calls).
+// Only keeping sysctlbyname + uname interpose (Step13b proved single interpose works).
 
 // ============================================================
 // Spoofed value initialization
@@ -484,6 +467,14 @@ static NSInteger my_screen_maxFps(id self, SEL _cmd) {
 // NSProcessInfo hooks — RAM, CPU, OS version
 // ============================================================
 static IMP orig_pi_osVersion = NULL;
+static IMP orig_pi_osVersionString = NULL;
+static NSString *my_pi_osVersionString(id self, SEL _cmd) {
+    if (_spoofedSysVersion) {
+        return [NSString stringWithFormat:@"Version %@", _spoofedSysVersion];
+    }
+    return ((NSString *(*)(id, SEL))orig_pi_osVersionString)(self, _cmd);
+}
+
 static NSOperatingSystemVersion my_pi_osVersion(id self, SEL _cmd) {
     if (_spoofedSysVersion) {
         NSArray *parts = [_spoofedSysVersion componentsSeparatedByString:@"."];
@@ -689,10 +680,12 @@ static void initPrivacyHook(void) {
         NSUserDefaults *_ud = [NSUserDefaults standardUserDefaults];
         BOOL isFirstLaunch = ![_ud boolForKey:kKey(@"first_launch_done")];
         if (isFirstLaunch) {
-            clearKeychainOnce();
-            clearSharedCookies();
-            clearURLCache();
-            clearWebViewData();
+            // ONLY clear what Baidu uses for device ID:
+            // - UserDefaults (device_id, cuid) — confirmed in Step23
+            // - Sandbox files (Library/Caches etc) — confirmed in Step26
+            // DO NOT clear keychain — Baidu doesn't use it (Step15: 0 calls)
+            // and clearing it breaks payment SDK data across clones.
+            // DO NOT clear cookies/cache/webview — may break payment flow.
             clearBaiduUserDefaultsOnce();
             nukeSandboxOnce();
             [_ud setBool:YES forKey:kKey(@"first_launch_done")];
@@ -740,6 +733,8 @@ static void initPrivacyHook(void) {
         if (piClass) {
             Method m = class_getInstanceMethod(piClass, @selector(operatingSystemVersion));
             if (m) { orig_pi_osVersion = method_getImplementation(m); class_replaceMethod(piClass, @selector(operatingSystemVersion), (IMP)my_pi_osVersion, method_getTypeEncoding(m)); }
+            m = class_getInstanceMethod(piClass, @selector(operatingSystemVersionString));
+            if (m) { orig_pi_osVersionString = method_getImplementation(m); class_replaceMethod(piClass, @selector(operatingSystemVersionString), (IMP)my_pi_osVersionString, method_getTypeEncoding(m)); }
             m = class_getInstanceMethod(piClass, @selector(physicalMemory));
             if (m) { orig_pi_physMem = method_getImplementation(m); class_replaceMethod(piClass, @selector(physicalMemory), (IMP)my_pi_physMem, method_getTypeEncoding(m)); }
             m = class_getInstanceMethod(piClass, @selector(processorCount));
