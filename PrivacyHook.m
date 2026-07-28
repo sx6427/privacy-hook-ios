@@ -1,9 +1,14 @@
 //
-//  PrivacyHook.m — Step34b: Step33 + Cookie清理 (去掉systemVersion)
+//  PrivacyHook.m — Step33: ONLY Bundle ID hook + keychain clear
 //
-//  Step33: Bundle ID hook (支付成功) + Keychain清理 + IDFA/IDFV
-//  Step34b: 首次启动清理 Cookie (删除 BAIDUCUID → 新设备 → 要验证码)
-//  去掉 systemVersion hook (导致闪退)
+//  Error: "支付环境风险，发现非正版应用"
+//  Payment SDK detects modified Bundle ID → refuses payment.
+//
+//  Fix: Hook bundleIdentifier to return original "com.baidu.BaiduMobile"
+//  so payment SDK thinks it's the genuine app.
+//
+//  NO UserDefaults clearing. NO Library deletion. NO pasteboard hooks.
+//  ONLY: Bundle ID hook + keychain clear (every launch) + IDFA/IDFV.
 //
 
 #import <Foundation/Foundation.h>
@@ -85,29 +90,6 @@ static void clearKeychainEveryLaunch(void) {
     }
 }
 
-// Cookie: 首次启动清理 (删除 BAIDUCUID 等设备标识)
-// 之后启动保留 Cookie (保持登录状态)
-static void clearCookiesFirstLaunch(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"cookieCleared");
-
-    if ([defaults boolForKey:key]) {
-        return;
-    }
-
-    // 首次启动 — 清理所有 HTTP Cookie
-    NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-    if (storage) {
-        NSArray *cookies = [[storage cookies] copy];
-        for (NSHTTPCookie *cookie in cookies) {
-            [storage deleteCookie:cookie];
-        }
-    }
-
-    [defaults setBool:YES forKey:key];
-    [defaults synchronize];
-}
-
 // ============================================================
 // Constructor
 // ============================================================
@@ -118,15 +100,12 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // 首次启动清理 Cookie（延迟到主线程，避免 constructor 里闪退）
-        dispatch_async(dispatch_get_main_queue(), ^{
-            clearCookiesFirstLaunch();
-        });
-
         // Clear keychain every launch
         clearKeychainEveryLaunch();
 
         // *** Bundle ID hook ***
+        // Return original "com.baidu.BaiduMobile" so payment SDK
+        // doesn't detect "non-genuine app".
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
@@ -152,6 +131,7 @@ static void initPrivacyHook(void) {
                 });
                 class_replaceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
             }
+            // Also hook objectForInfoDictionaryKey: which many SDKs use
             Method m3 = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
             if (m3) {
                 IMP orig3 = method_getImplementation(m3);
