@@ -1,9 +1,5 @@
 //
-//  PrivacyHook.m — Step35b: Step33 + DYLD_INTERPOSE sysctlbyname
-//
-//  Step33: Bundle ID hook (支付成功) + Keychain清理 + IDFA/IDFV
-//  Step35b: DYLD_INTERPOSE sysctlbyname (单条 interpose, Step13b 验证过安全)
-//  每个副本不同设备型号 → 百度设备指纹不同 → 新设备
+//  PrivacyHook.m — Step33: ONLY Bundle ID hook + keychain clear
 //
 
 #import <Foundation/Foundation.h>
@@ -12,21 +8,8 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <string.h>
-#import <sys/sysctl.h>
 
 #define NSLog(...)
-
-// DYLD_INTERPOSE 宏 (单条使用, Step13b 验证过不会导致其他 hook 失效)
-#define DYLD_INTERPOSE(_replacement, _replacee) \
-  __attribute__((used)) static struct { \
-      const void *replacement; \
-      const void *replacee; \
-  } _interpose_##_replacee \
-  __attribute__ ((section ("__DATA,__interpose"))) = { \
-      (const void *)(unsigned long)&_replacement, \
-      (const void *)(unsigned long)&_replacee, \
-  };
 
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
@@ -34,9 +17,6 @@ static NSString *_spoofedDeviceName = nil;
 static NSString *_originalBundleID = @"com.baidu.BaiduMobile";
 static IMP orig_bundleIdentifier = NULL;
 static IMP orig_infoDictionary = NULL;
-
-// 设备型号 (如 "iPhone14,5")
-static char _spoofedMachine[32] = {0};
 
 static NSString *kKey(NSString *suffix) {
     return [NSString stringWithFormat:@"BaiduBox.cfg.%@", suffix];
@@ -69,46 +49,6 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     return name;
 }
 
-// 随机设备型号
-static void initSpoofedMachine(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *key = kKey(@"machine");
-    NSString *saved = [defaults stringForKey:key];
-    if (!saved) {
-        NSArray *models = @[
-            @"iPhone14,5", @"iPhone14,2", @"iPhone14,3",
-            @"iPhone14,7", @"iPhone14,8", @"iPhone15,2",
-            @"iPhone15,3", @"iPhone15,4", @"iPhone15,5",
-            @"iPhone16,1", @"iPhone16,2",
-        ];
-        saved = models[arc4random_uniform((uint32_t)models.count)];
-        [defaults setObject:saved forKey:key];
-        [defaults synchronize];
-    }
-    strlcpy(_spoofedMachine, [saved UTF8String], sizeof(_spoofedMachine));
-}
-
-// DYLD_INTERPOSE: sysctlbyname replacement
-static int my_sysctlbyname(const char *name, void *oldp,
-                           size_t *oldlenp, void *newp, size_t newlen) {
-    if (name && newp == NULL && newlen == 0) {
-        if (strcmp(name, "hw.machine") == 0 && _spoofedMachine[0] != 0) {
-            size_t need = strlen(_spoofedMachine) + 1;
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
-            if (oldlenp && *oldlenp >= need) {
-                memcpy(oldp, _spoofedMachine, need);
-                *oldlenp = need;
-                return 0;
-            }
-        }
-    }
-    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
-}
-DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
-
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
@@ -126,7 +66,6 @@ static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     }
 }
 
-// Keychain: clear EVERY launch
 static void clearKeychainEveryLaunch(void) {
     NSArray *secItemClasses = @[
         (__bridge id)kSecClassGenericPassword,
@@ -141,9 +80,6 @@ static void clearKeychainEveryLaunch(void) {
     }
 }
 
-// ============================================================
-// Constructor
-// ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
@@ -151,13 +87,8 @@ static void initPrivacyHook(void) {
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
 
-        // 初始化随机设备型号
-        initSpoofedMachine();
-
-        // Clear keychain every launch
         clearKeychainEveryLaunch();
 
-        // *** Bundle ID hook ***
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
@@ -197,7 +128,6 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // IDFA
         Class asmClass = objc_getClass("ASIdentifierManager");
         if (asmClass) {
             Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
@@ -212,7 +142,6 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // ATTrackingManager
         Class attClass = objc_getClass("ATTrackingManager");
         if (attClass) {
             Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
@@ -222,7 +151,6 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // IDFV + device name
         Class uiDeviceClass = objc_getClass("UIDevice");
         if (uiDeviceClass) {
             Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
