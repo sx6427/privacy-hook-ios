@@ -1,4 +1,4 @@
-// fishhook.c
+﻿// fishhook.c
 // Copyright (c) Meta Platforms, Inc. and affiliates. (BSD License)
 // A library that enables rebinding of symbols in dynamically linked Mach-O binaries.
 
@@ -13,7 +13,6 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
-#include <mach/mach.h>
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -57,13 +56,6 @@ static void perform_rebinding_with_section(section_t *section,
                                             uint32_t *indirect_symtab) {
     uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
     void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
-
-    // Make the page writable (needed for __DATA_CONST on iOS 16+)
-    vm_size_t page_size = 0;
-    vm_protect(mach_task_self(), (vm_address_t)indirect_symbol_bindings,
-               (vm_size_t)section->size, FALSE,
-               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-
     for (uint i = 0; i < section->size / sizeof(void *); i++) {
         uint32_t symtab_index = indirect_symbol_indices[i];
         if (symtab_index == INDIRECT_SYMBOL_ABS ||
