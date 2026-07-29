@@ -1,6 +1,5 @@
 #
 # Makefile for building PrivacyHook.dylib
-# With iOS 16 compatibility: -no_fixup_chains + vtool SDK version fix
 #
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
@@ -8,21 +7,23 @@ SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 DYLIB = PrivacyHook.dylib
 SRC   = PrivacyHook.m
 
+# Also build a minimal test dylib
+MIN_DYLIB = PrivacyHookMin.dylib
+MIN_SRC   = PrivacyHookMin.m
+
 # Compiler flags
 CFLAGS  = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
-          -target arm64-apple-ios14.0 \
           -fobjc-arc \
           -fobjc-weak \
           -Wall \
           -Wno-deprecated-declarations
 
-# Linker flags with iOS 16 compatibility
+# Linker flags
 LDFLAGS = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
-          -target arm64-apple-ios14.0 \
           -dynamiclib \
           -framework Foundation \
           -framework UIKit \
@@ -30,28 +31,34 @@ LDFLAGS = -arch arm64 \
           -framework Security \
           -framework IOKit \
           -install_name @executable_path/PrivacyHook.dylib \
-          -Wl,-weak_framework,AppTrackingTransparency \
-          -Wl,-no_fixup_chains
+          -Wl,-no_fixup_chains \
+          -Wl,-weak_framework,AppTrackingTransparency
+
+# Minimal dylib: only links Foundation
+MIN_LDFLAGS = -arch arm64 \
+          -isysroot $(SDKROOT) \
+          -miphoneos-version-min=14.0 \
+          -dynamiclib \
+          -framework Foundation \
+          -install_name @executable_path/PrivacyHookMin.dylib
 
 .PHONY: all clean
 
-all: $(DYLIB)
-	@echo "=== Build Complete ==="
+all: $(DYLIB) $(MIN_DYLIB)
 
 $(DYLIB): $(SRC)
 	@echo "Building PrivacyHook.dylib..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
-	@echo "Fixing SDK version with vtool..."
-	@xcrun vtool -set-build-version ios 14.0 14.0 -output PrivacyHook_fixed.dylib $@ && mv PrivacyHook_fixed.dylib $@
 	@echo "Done: $(DYLIB)"
-	@echo "=== Architecture ==="
 	@lipo -info $@ || true
-	@echo "=== Linked Libraries ==="
 	@otool -L $@ || true
-	@echo "=== Version Info ==="
-	@xcrun vtool -show-build $@ || true
-	@echo "=== Check for chained fixups ==="
-	@otool -l $@ | grep -A2 "DYLD_CHAINED_FIXUPS\|LC_DYLD_CHAINED_FIXUPS" || echo "No chained fixups (good!)"
+
+$(MIN_DYLIB): $(MIN_SRC)
+	@echo "Building PrivacyHookMin.dylib..."
+	clang $(CFLAGS) $(MIN_LDFLAGS) -o $@ $<
+	@echo "Done: $(MIN_DYLIB)"
+	@lipo -info $@ || true
+	@otool -L $@ || true
 
 clean:
-	rm -f $(DYLIB)
+	rm -f $(DYLIB) $(MIN_DYLIB)
