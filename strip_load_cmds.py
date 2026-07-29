@@ -54,10 +54,11 @@ LC_NAMES = {
     0x24: "LC_VERSION_MIN_MACOSX",
     0x25: "LC_VERSION_MIN_IPHONEOS",
     0x26: "LC_FUNCTION_STARTS",
-    0x28: "LC_DYLD_ENVIRONMENT",
-    0x29: "LC_MAIN",
-    0x2A: "LC_DATA_IN_CODE",
-    0x2B: "LC_SOURCE_VERSION",
+    0x27: "LC_DYLD_ENVIRONMENT",
+    0x29: "LC_DATA_IN_CODE",
+    0x2A: "LC_SOURCE_VERSION",
+    0x2B: "LC_DYLIB_CODE_SIGN_DRS",
+    0x2C: "LC_ENCRYPTION_INFO_64",
     0x32: "LC_BUILD_VERSION",
     0x33: "LC_DYLD_EXPORTS_TRIE",
     0x34: "LC_DYLD_CHAINED_FIXUPS",
@@ -84,7 +85,7 @@ LC_NAMES = {
 }
 
 # Whitelist: load commands that iOS 16 dyld understands
-# Everything else gets stripped
+# Values from <loader.h> — note: modern Xcode emits WITHOUT LC_REQ_DYLD bit
 SAFE_LC_TYPES = {
     0x01,               # LC_SEGMENT
     0x02,               # LC_SYMTAB
@@ -98,14 +99,15 @@ SAFE_LC_TYPES = {
     0x1E,               # LC_SEGMENT_SPLIT_INFO
     0x22,               # LC_DYLD_INFO
     0x25,               # LC_VERSION_MIN_IPHONEOS
+    0x26,               # LC_FUNCTION_STARTS (modern: no REQ_DYLD)
+    0x29,               # LC_DATA_IN_CODE (modern: no REQ_DYLD)
+    0x2A,               # LC_SOURCE_VERSION (modern: no REQ_DYLD)
     0x32,               # LC_BUILD_VERSION
     0x80000018,         # LC_LOAD_WEAK_DYLIB
     0x8000001C,         # LC_RPATH
     0x8000001F,         # LC_REEXPORT_DYLIB
     0x80000022,         # LC_DYLD_INFO_ONLY  (traditional fixups - needed!)
-    0x80000026,         # LC_FUNCTION_STARTS
-    0x8000002B,         # LC_SOURCE_VERSION
-    0x8000002A,         # LC_DATA_IN_CODE
+    0x80000028,         # LC_MAIN
 }
 
 
