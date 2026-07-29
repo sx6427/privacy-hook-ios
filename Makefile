@@ -1,6 +1,6 @@
 #
 # Makefile for building PrivacyHook.dylib
-# With iOS 16 compatibility flags
+# With iOS 16 compatibility: -no_fixup_chains + vtool SDK version fix
 #
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
@@ -19,9 +19,6 @@ CFLAGS  = -arch arm64 \
           -Wno-deprecated-declarations
 
 # Linker flags with iOS 16 compatibility
-# -no_fixup_chains: disable chained fixups (newer format may crash on iOS 16)
-# -no_objc_relative_method_lists: use old ObjC method list format
-# -no_pie: disable PIE for better compatibility (optional)
 LDFLAGS = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
@@ -40,21 +37,19 @@ LDFLAGS = -arch arm64 \
 
 all: $(DYLIB)
 	@echo "=== Build Complete ==="
-	@echo "SDK: $(shell xcrun --sdk iphoneos --show-sdk-version)"
-	@echo ""
 
 $(DYLIB): $(SRC)
 	@echo "Building PrivacyHook.dylib..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
+	@echo "Fixing SDK version with vtool..."
+	@xcrun vtool -set-build-version ios 14.0 14.0 -output PrivacyHook_fixed.dylib $@ && mv PrivacyHook_fixed.dylib $@
 	@echo "Done: $(DYLIB)"
 	@echo "=== Architecture ==="
 	@lipo -info $@ || true
 	@echo "=== Linked Libraries ==="
 	@otool -L $@ || true
-	@echo "=== Load Commands (version info) ==="
-	@otool -l $@ | grep -A5 "LC_BUILD_VERSION\|LC_VERSION_MIN" || true
-	@echo "=== vtool ==="
-	@xcrun vtool -show-build $@ 2>/dev/null || true
+	@echo "=== Version Info ==="
+	@xcrun vtool -show-build $@ || true
 	@echo "=== Check for chained fixups ==="
 	@otool -l $@ | grep -A2 "DYLD_CHAINED_FIXUPS\|LC_DYLD_CHAINED_FIXUPS" || echo "No chained fixups (good!)"
 
