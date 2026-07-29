@@ -1,8 +1,9 @@
 //
-//  PrivacyHook.m — Step36c: Step33 + minimal cookie hook test
+//  PrivacyHook.m — Step37: NSURLProtocol approach for cookie replacement
 //
-//  This is EXACTLY Step33 + a no-op cookiesForURL: hook
-//  If this crashes, the hook installation itself is the problem
+//  No method swizzling on NSHTTPCookieStorage (caused crashes).
+//  Instead, use NSURLProtocol to intercept HTTP requests to baidu.com
+//  and replace device fingerprint cookies.
 //
 
 #import <Foundation/Foundation.h>
@@ -39,7 +40,6 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSString *existing = [defaults stringForKey:key];
     if (existing) return existing;
-
     NSArray *prefixes = @[@"张", @"李", @"王", @"刘", @"陈", @"杨", @"赵", @"黄",
                           @"周", @"吴", @"徐", @"孙", @"马", @"朱", @"胡", @"林"];
     NSArray *suffixes = @[@"的 iPhone", @"的 iPhone", @"的 iPhone",
@@ -52,47 +52,164 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     return name;
 }
 
+// ---- Fake cookie values ----
+static NSString *genRandStr(NSUInteger len, NSString *cs) {
+    NSMutableString *s = [NSMutableString stringWithCapacity:len];
+    for (NSUInteger i = 0; i < len; i++)
+        [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    return s;
+}
+
+static NSString *genFakeCookie(NSString *name) {
+    NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    NSString *hexCS = @"0123456789abcdef";
+    if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
+        return genRandStr(arc4random_uniform(7) + 58, cuidCS);
+    if ([name isEqualToString:@"DVIF"]) {
+        NSString *num = [NSString stringWithFormat:@"%lu",
+            (unsigned long)(arc4random_uniform(9000000000000000ULL) + 1000000000000000ULL)];
+        NSMutableData *d = [NSMutableData dataWithLength:300];
+        arc4random_buf([d mutableBytes], 300);
+        return [NSString stringWithFormat:@"%@_%@_%@", num, [d base64EncodedStringWithOptions:0], genRandStr(6, hexCS)];
+    }
+    if ([name isEqualToString:@"tcuid"])
+        return [genRandStr(40, hexCS).uppercaseString stringByAppendingString:genRandStr(4, @"ABCDEFGHIJ")];
+    if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
+    if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
+    return genRandStr(32, cuidCS);
+}
+
+static NSString *getFakeCookie(NSString *name) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *key = [NSString stringWithFormat:@"BaiduBox.cfg.ck.%@", name];
+    NSString *v = [d stringForKey:key];
+    if (v) return v;
+    v = genFakeCookie(name);
+    [d setObject:v forKey:key];
+    [d synchronize];
+    return v;
+}
+
+// Replace device cookies in a Cookie header string
+static NSString *replaceDeviceCookiesInString(NSString *cookie) {
+    NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                       @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
+    NSString *modified = cookie;
+    for (NSString *name in names) {
+        NSString *fake = getFakeCookie(name);
+        NSString *pattern = [NSString stringWithFormat:@"%@=[^;]+", name];
+        NSRegularExpression *regex = [NSRegularExpression
+            regularExpressionWithPattern:pattern
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        modified = [regex stringByReplacingMatchesInString:modified
+            options:0 range:NSMakeRange(0, modified.length)
+            withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
+    }
+    // cuid= (but not BAIDUCUID= or c3_aid=)
+    NSString *cuidFake = getFakeCookie(@"cuid");
+    NSRegularExpression *cuidRegex = [NSRegularExpression
+        regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
+    modified = [cuidRegex stringByReplacingMatchesInString:modified
+        options:0 range:NSMakeRange(0, modified.length)
+        withTemplate:[NSString stringWithFormat:@"cuid=%@", cuidFake]];
+    return modified;
+}
+
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
-        const char *existingTypes = types ?: method_getTypeEncoding(method);
-        class_replaceMethod(cls, sel, newImp, existingTypes);
+        const char *t = types ?: method_getTypeEncoding(method);
+        class_replaceMethod(cls, sel, newImp, t);
     }
 }
 
 static void hookClassMethod(Class cls, SEL sel, IMP newImp, const char *types) {
-    Class metaClass = object_getClass(cls);
+    Class meta = object_getClass(cls);
     Method method = class_getClassMethod(cls, sel);
     if (method) {
-        const char *existingTypes = types ?: method_getTypeEncoding(method);
-        class_replaceMethod(metaClass, sel, newImp, existingTypes);
+        const char *t = types ?: method_getTypeEncoding(method);
+        class_replaceMethod(meta, sel, newImp, t);
     }
 }
 
 static void clearKeychainEveryLaunch(void) {
-    NSArray *secItemClasses = @[
-        (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecClassInternetPassword,
-        (__bridge id)kSecClassKey,
-        (__bridge id)kSecClassCertificate,
-        (__bridge id)kSecClassIdentity
-    ];
-    for (id secItemClass in secItemClasses) {
-        NSDictionary *query = @{(__bridge id)kSecClass: secItemClass};
-        SecItemDelete((__bridge CFDictionaryRef)query);
-    }
+    NSArray *cls = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
+                     (__bridge id)kSecClassKey, (__bridge id)kSecClassCertificate, (__bridge id)kSecClassIdentity];
+    for (id c in cls) { NSDictionary *q = @{(__bridge id)kSecClass: c}; SecItemDelete((__bridge CFDictionaryRef)q); }
 }
 
+// ============================================================
+// NSURLProtocol for intercepting baidu HTTP requests
+// ============================================================
+static NSString *const kMarker = @"X-BaiduIntercept";
+
+@interface BaiduCookieProtocol : NSURLProtocol
+@end
+
+@implementation BaiduCookieProtocol {
+    NSURLSessionDataTask *_task;
+}
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSString *host = request.URL.host;
+    if (!host || ![host containsString:@"baidu"]) return NO;
+    NSString *m = [request valueForHTTPHeaderField:kMarker];
+    return ![m isEqualToString:@"1"];
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [req setValue:@"1" forHTTPHeaderField:kMarker];
+
+    // Replace device cookies
+    NSString *cookie = [req valueForHTTPHeaderField:@"Cookie"];
+    if (cookie && [cookie length] > 0) {
+        [req setValue:replaceDeviceCookiesInString(cookie) forHTTPHeaderField:@"Cookie"];
+    }
+
+    // Use a session with no protocol interception (prevent recursion)
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.protocolClasses = @[];
+
+    __weak typeof(self) ws = self;
+    _task = [[NSURLSession sessionWithConfiguration:config] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            __strong typeof(ws) ss = ws;
+            if (!ss) return;
+            if (error) {
+                [ss.client URLProtocol:ss didFailWithError:error];
+            } else {
+                [ss.client URLProtocol:ss didReceiveResponse:response cacheRequest:nil];
+                [ss.client URLProtocol:ss didLoadData:data];
+                [ss.client URLProtocolDidFinishLoading:ss];
+            }
+        }];
+    [_task resume];
+}
+
+- (void)stopLoading {
+    [_task cancel];
+    _task = nil;
+}
+
+@end
+
+// ============================================================
+// Constructor
+// ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
         _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
         _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
         _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
-
         clearKeychainEveryLaunch();
 
-        // === 1. Bundle ID hook (for payment SDK) ===
+        // === Bundle ID hook (payment) ===
         Class bundleClass = objc_getClass("NSBundle");
         if (bundleClass) {
             Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
@@ -123,69 +240,46 @@ static void initPrivacyHook(void) {
                 IMP orig3 = method_getImplementation(m3);
                 IMP imp3 = imp_implementationWithBlock(^id(id s, SEL _cmd, NSString *key) {
                     id val = ((id(*)(id, SEL, NSString *))orig3)(s, _cmd, key);
-                    if ([s isEqual:[NSBundle mainBundle]] && [key isEqualToString:@"CFBundleIdentifier"]) {
+                    if ([s isEqual:[NSBundle mainBundle]] && [key isEqualToString:@"CFBundleIdentifier"])
                         return _originalBundleID;
-                    }
                     return val;
                 });
                 class_replaceMethod(bundleClass, @selector(objectForInfoDictionaryKey:), imp3, method_getTypeEncoding(m3));
             }
         }
 
-        // === 2. IDFA hook ===
-        Class asmClass = objc_getClass("ASIdentifierManager");
-        if (asmClass) {
-            Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFA; });
-                hookInstanceMethod(asmClass, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
-            }
-            m = class_getInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; });
-                hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled), imp, method_getTypeEncoding(m));
-            }
+        // === IDFA ===
+        Class asm = objc_getClass("ASIdentifierManager");
+        if (asm) {
+            Method m = class_getInstanceMethod(asm, @selector(advertisingIdentifier));
+            if (m) hookInstanceMethod(asm, @selector(advertisingIdentifier),
+                imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFA; }), method_getTypeEncoding(m));
+            m = class_getInstanceMethod(asm, @selector(isAdvertisingTrackingEnabled));
+            if (m) hookInstanceMethod(asm, @selector(isAdvertisingTrackingEnabled),
+                imp_implementationWithBlock(^BOOL(id s) { return YES; }), method_getTypeEncoding(m));
         }
 
-        // === 3. ATT tracking authorization ===
-        Class attClass = objc_getClass("ATTrackingManager");
-        if (attClass) {
-            Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSInteger(id s) { return 3; });
-                hookClassMethod(attClass, @selector(trackingAuthorizationStatus), imp, method_getTypeEncoding(m));
-            }
+        // === ATT ===
+        Class att = objc_getClass("ATTrackingManager");
+        if (att) {
+            Method m = class_getClassMethod(att, @selector(trackingAuthorizationStatus));
+            if (m) hookClassMethod(att, @selector(trackingAuthorizationStatus),
+                imp_implementationWithBlock(^NSInteger(id s) { return 3; }), method_getTypeEncoding(m));
         }
 
-        // === 4. IDFV + device name hook ===
-        Class uiDeviceClass = objc_getClass("UIDevice");
-        if (uiDeviceClass) {
-            Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFV; });
-                hookInstanceMethod(uiDeviceClass, @selector(identifierForVendor), imp, method_getTypeEncoding(m));
-            }
-            m = class_getInstanceMethod(uiDeviceClass, @selector(name));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; });
-                hookInstanceMethod(uiDeviceClass, @selector(name), imp, method_getTypeEncoding(m));
-            }
+        // === IDFV + device name ===
+        Class ud = objc_getClass("UIDevice");
+        if (ud) {
+            Method m = class_getInstanceMethod(ud, @selector(identifierForVendor));
+            if (m) hookInstanceMethod(ud, @selector(identifierForVendor),
+                imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFV; }), method_getTypeEncoding(m));
+            m = class_getInstanceMethod(ud, @selector(name));
+            if (m) hookInstanceMethod(ud, @selector(name),
+                imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; }), method_getTypeEncoding(m));
         }
 
-        // === 5. Cookie hook — NO-OP TEST ===
-        // Just call original, don't modify anything.
-        // If this crashes, hooking NSHTTPCookieStorage itself is the problem.
-        Class cookieStorageClass = objc_getClass("NSHTTPCookieStorage");
-        if (cookieStorageClass) {
-            Method cm = class_getInstanceMethod(cookieStorageClass, @selector(cookiesForURL:));
-            if (cm) {
-                IMP orig = method_getImplementation(cm);
-                IMP newImp = imp_implementationWithBlock(^NSArray *(id self, NSURL *url) {
-                    return ((NSArray *(*)(id, SEL, NSURL *))orig)(self, @selector(cookiesForURL:), url);
-                });
-                class_replaceMethod(cookieStorageClass, @selector(cookiesForURL:),
-                                    newImp, method_getTypeEncoding(cm));
-            }
-        }
+        // === NSURLProtocol: intercept baidu requests, replace device cookies ===
+        // NO method swizzling on system classes — just register a protocol
+        [NSURLProtocol registerClass:[BaiduCookieProtocol class]];
     }
 }
