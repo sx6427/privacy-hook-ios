@@ -12,6 +12,7 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #define NSLog(...)
 
@@ -183,7 +184,7 @@ static NSString *const kMarker = @"X-BaiduIntercept";
             if (error) {
                 [ss.client URLProtocol:ss didFailWithError:error];
             } else {
-                [ss.client URLProtocol:ss didReceiveResponse:response cacheRequest:nil];
+                ((void(*)(id,SEL,id,NSURLResponse*,id))objc_msgSend)(ss.client, @selector(URLProtocol:didReceiveResponse:cacheRequest:), ss, response, nil);
                 [ss.client URLProtocol:ss didLoadData:data];
                 [ss.client URLProtocolDidFinishLoading:ss];
             }
@@ -249,13 +250,13 @@ static void initPrivacyHook(void) {
         }
 
         // === IDFA ===
-        Class asm = objc_getClass("ASIdentifierManager");
-        if (asm) {
-            Method m = class_getInstanceMethod(asm, @selector(advertisingIdentifier));
-            if (m) hookInstanceMethod(asm, @selector(advertisingIdentifier),
+        Class asmCls = objc_getClass("ASIdentifierManager");
+        if (asmCls) {
+            Method m = class_getInstanceMethod(asmCls, @selector(advertisingIdentifier));
+            if (m) hookInstanceMethod(asmCls, @selector(advertisingIdentifier),
                 imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFA; }), method_getTypeEncoding(m));
-            m = class_getInstanceMethod(asm, @selector(isAdvertisingTrackingEnabled));
-            if (m) hookInstanceMethod(asm, @selector(isAdvertisingTrackingEnabled),
+            m = class_getInstanceMethod(asmCls, @selector(isAdvertisingTrackingEnabled));
+            if (m) hookInstanceMethod(asmCls, @selector(isAdvertisingTrackingEnabled),
                 imp_implementationWithBlock(^BOOL(id s) { return YES; }), method_getTypeEncoding(m));
         }
 
