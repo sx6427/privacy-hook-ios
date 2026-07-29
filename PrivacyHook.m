@@ -1,9 +1,9 @@
 //
-//  PrivacyHook.m — Step35: Step33 + sysctlbyname hook (设备型号伪装)
+//  PrivacyHook.m — Step35b: Step33 + DYLD_INTERPOSE sysctlbyname
 //
 //  Step33: Bundle ID hook (支付成功) + Keychain清理 + IDFA/IDFV
-//  Step35 新增: fishhook hook sysctlbyname("hw.machine") 返回随机设备型号
-//  每个副本不同设备型号 → 百度设备指纹不同 → 新设备 → 要验证码
+//  Step35b: DYLD_INTERPOSE sysctlbyname (单条 interpose, Step13b 验证过安全)
+//  每个副本不同设备型号 → 百度设备指纹不同 → 新设备
 //
 
 #import <Foundation/Foundation.h>
@@ -14,9 +14,19 @@
 #import <objc/runtime.h>
 #import <string.h>
 #import <sys/sysctl.h>
-#import "fishhook.h"
 
 #define NSLog(...)
+
+// DYLD_INTERPOSE 宏 (单条使用, Step13b 验证过不会导致其他 hook 失效)
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+  __attribute__((used)) static struct { \
+      const void *replacement; \
+      const void *replacee; \
+  } _interpose_##_replacee \
+  __attribute__ ((section ("__DATA,__interpose"))) = { \
+      (const void *)(unsigned long)&_replacement, \
+      (const void *)(unsigned long)&_replacee, \
+  };
 
 static NSUUID *_spoofedIDFA = nil;
 static NSUUID *_spoofedIDFV = nil;
@@ -78,14 +88,10 @@ static void initSpoofedMachine(void) {
     strlcpy(_spoofedMachine, [saved UTF8String], sizeof(_spoofedMachine));
 }
 
-// fishhook: sysctlbyname replacement
-static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
-
+// DYLD_INTERPOSE: sysctlbyname replacement
 static int my_sysctlbyname(const char *name, void *oldp,
                            size_t *oldlenp, void *newp, size_t newlen) {
-    // 只拦截读取（newp==NULL, newlen==0）
     if (name && newp == NULL && newlen == 0) {
-        // hw.machine = 设备型号 (如 iPhone14,5)
         if (strcmp(name, "hw.machine") == 0 && _spoofedMachine[0] != 0) {
             size_t need = strlen(_spoofedMachine) + 1;
             if (oldp == NULL) {
@@ -99,8 +105,9 @@ static int my_sysctlbyname(const char *name, void *oldp,
             }
         }
     }
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
+DYLD_INTERPOSE(my_sysctlbyname, sysctlbyname);
 
 static void hookInstanceMethod(Class cls, SEL sel, IMP newImp, const char *types) {
     Method method = class_getInstanceMethod(cls, sel);
@@ -146,9 +153,6 @@ static void initPrivacyHook(void) {
 
         // 初始化随机设备型号
         initSpoofedMachine();
-
-        // fishhook: hook sysctlbyname
-        rebind_symbols((struct rebinding[1]){{"sysctlbyname", my_sysctlbyname, (void *)&orig_sysctlbyname}}, 1);
 
         // Clear keychain every launch
         clearKeychainEveryLaunch();
