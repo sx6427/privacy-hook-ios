@@ -57,7 +57,7 @@ $(DYLIB): $(SRC)
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 	@echo "=== Post-build: vtool (set SDK 16.0) ==="
-	-vtool -set-build-version iphoneos 14.0 16.0 -output $@.tmp $@ && mv $@.tmp $@
+	-vtool -set-build-version ios 14.0 16.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "vtool done"
 
 	@echo "=== Post-build: strip LC_OBJC_LINK_LAYOUT ==="
@@ -74,7 +74,7 @@ $(DYLIB): $(SRC)
 $(MIN_DYLIB): $(MIN_SRC)
 	@echo "Building PrivacyHookMin.dylib..."
 	clang $(CFLAGS) $(MIN_LDFLAGS) -o $@ $<
-	-vtool -set-build-version iphoneos 14.0 16.0 -output $@.tmp $@ && mv $@.tmp $@
+	-vtool -set-build-version ios 14.0 16.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "Done: $(MIN_DYLIB)"
 
 clean:
