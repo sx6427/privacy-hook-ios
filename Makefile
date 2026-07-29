@@ -1,8 +1,7 @@
 #
 # Makefile for building PrivacyHook.dylib
+# Self-selects oldest Xcode for iOS 16 compatibility.
 #
-
-SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 DYLIB = PrivacyHook.dylib
 SRC   = PrivacyHook.m
@@ -10,6 +9,15 @@ SRC   = PrivacyHook.m
 # Also build a minimal test dylib
 MIN_DYLIB = PrivacyHookMin.dylib
 MIN_SRC   = PrivacyHookMin.m
+
+# Auto-select oldest available Xcode (for iOS 16 compat)
+# This runs before SDK detection
+SELECT_XCODE := $(shell \
+	xc=$(shell ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | head -1); \
+	if [ -n "$$xc" ]; then sudo xcode-select -s "$$xc" 2>/dev/null; echo "$$xc"; \
+	else echo "default"; fi)
+
+SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 # Compiler flags
 CFLAGS  = -arch arm64 \
@@ -20,7 +28,7 @@ CFLAGS  = -arch arm64 \
           -Wall \
           -Wno-deprecated-declarations
 
-# Linker flags
+# Linker flags — -no_fixup_chains critical for iOS 16 compat
 LDFLAGS = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
@@ -47,6 +55,11 @@ MIN_LDFLAGS = -arch arm64 \
 all: $(DYLIB) $(MIN_DYLIB)
 
 $(DYLIB): $(SRC)
+	@echo "=== Build Info ==="
+	@echo "Xcode: $(SELECT_XCODE)"
+	@xcodebuild -version 2>/dev/null || true
+	@echo "SDK: $(SDKROOT)"
+	@echo "=================="
 	@echo "Building PrivacyHook.dylib..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
