@@ -1,14 +1,7 @@
 //
-//  PrivacyHook.m — Step36: Bundle ID + IDFA/IDFV + Cookie device fingerprint replacement
+//  PrivacyHook.m — Step36b: Bundle ID + IDFA/IDFV + Cookie device fingerprint replacement
 //
-//  Hooks:
-//  1. Bundle ID -> original (for payment SDK)
-//  2. IDFA -> random per clone
-//  3. IDFV -> random per clone
-//  4. Device name -> random per clone
-//  5. Keychain clear on launch
-//  6. NSHTTPCookieStorage cookiesForURL: -> replace DVIF, tcuid, __bid_n, fuid, BAIDUCUID, cuid
-//     (Each clone generates its own fake values, stored in NSUserDefaults)
+//  Simplified: only cookiesForURL: hook (no NSMutableURLRequest hooks)
 //
 
 #import <Foundation/Foundation.h>
@@ -58,12 +51,11 @@ static NSString *getOrCreateSpoofedDeviceName(NSString *key) {
     return name;
 }
 
-// ---- Generate fake cookie values (per-clone, stored in NSUserDefaults) ----
+// ---- Fake cookie values ----
 static NSString *generateRandomString(NSUInteger length, NSString *charset) {
     NSMutableString *s = [NSMutableString stringWithCapacity:length];
     for (NSUInteger i = 0; i < length; i++) {
-        NSUInteger idx = arc4random_uniform((uint32_t)charset.length);
-        [s appendFormat:@"%C", [charset characterAtIndex:idx]];
+        [s appendFormat:@"%C", [charset characterAtIndex:arc4random_uniform((uint32_t)charset.length)]];
     }
     return s;
 }
@@ -78,30 +70,24 @@ static NSString *generateFakeCookieValue(NSString *cookieName) {
         [cookieName isEqualToString:@"cuid"]) {
         return generateRandomString(arc4random_uniform(7) + 58, cuidCharset);
     }
-
     if ([cookieName isEqualToString:@"DVIF"]) {
-        NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)(arc4random_uniform(9000000000000000ULL) + 1000000000000000ULL)];
+        NSString *num = [NSString stringWithFormat:@"%lu",
+            (unsigned long)(arc4random_uniform(9000000000000000ULL) + 1000000000000000ULL)];
         NSMutableData *rawData = [NSMutableData dataWithLength:300];
         arc4random_buf([rawData mutableBytes], 300);
         NSString *b64 = [rawData base64EncodedStringWithOptions:0];
-        NSString *suffix = generateRandomString(6, hexCharset);
-        return [NSString stringWithFormat:@"%@_%@_%@", num, b64, suffix];
+        return [NSString stringWithFormat:@"%@_%@_%@", num, b64, generateRandomString(6, hexCharset)];
     }
-
     if ([cookieName isEqualToString:@"tcuid"]) {
-        NSString *hex = generateRandomString(40, hexCharset).uppercaseString;
-        NSString *letters = generateRandomString(4, @"ABCDEFGHIJ");
-        return [NSString stringWithFormat:@"%@%@", hex, letters];
+        return [generateRandomString(40, hexCharset).uppercaseString
+            stringByAppendingString:generateRandomString(4, @"ABCDEFGHIJ")];
     }
-
     if ([cookieName isEqualToString:@"__bid_n"]) {
         return generateRandomString(22, hexCharset);
     }
-
     if ([cookieName isEqualToString:@"fuid"]) {
         return generateRandomString(32, hexCharset);
     }
-
     return generateRandomString(32, cuidCharset);
 }
 
@@ -110,7 +96,6 @@ static NSString *getOrCreateFakeCookieValue(NSString *cookieName) {
     NSString *key = [NSString stringWithFormat:@"BaiduBox.cfg.ck.%@", cookieName];
     NSString *existing = [defaults stringForKey:key];
     if (existing) return existing;
-
     NSString *value = generateFakeCookieValue(cookieName);
     [defaults setObject:value forKey:key];
     [defaults synchronize];
@@ -148,6 +133,7 @@ static void clearKeychainEveryLaunch(void) {
     }
 }
 
+// Set of device cookie names to replace
 static NSSet *deviceCookieNames(void) {
     static dispatch_once_t once;
     static NSSet *names = nil;
@@ -157,6 +143,33 @@ static NSSet *deviceCookieNames(void) {
             @"DVIF", @"tcuid", @"__bid_n", @"fuid", @"cuid", nil];
     });
     return names;
+}
+
+// Replace device cookies in a cookie array (only for baidu domains)
+static NSArray *replaceDeviceCookies(NSArray *cookies) {
+    NSSet *replaceNames = deviceCookieNames();
+    NSMutableArray *modified = [NSMutableArray arrayWithCapacity:cookies.count];
+    BOOL changed = NO;
+
+    for (NSHTTPCookie *cookie in cookies) {
+        if ([replaceNames containsObject:cookie.name]) {
+            NSString *fakeVal = getOrCreateFakeCookieValue(cookie.name);
+            NSDictionary *props = cookie.properties;
+            if (props && fakeVal) {
+                NSMutableDictionary *md = [props mutableCopy];
+                md[NSHTTPCookieValue] = fakeVal;
+                NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:md];
+                if (newCookie) {
+                    [modified addObject:newCookie];
+                    changed = YES;
+                    continue;
+                }
+            }
+        }
+        [modified addObject:cookie];
+    }
+
+    return changed ? [modified copy] : cookies;
 }
 
 __attribute__((constructor))
@@ -248,148 +261,31 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // === 5. NSHTTPCookieStorage hook — replace device fingerprint cookies ===
+        // === 5. NSHTTPCookieStorage cookiesForURL: hook ===
+        // Only hook this one method — safest approach
         Class cookieStorageClass = objc_getClass("NSHTTPCookieStorage");
         if (cookieStorageClass) {
             Method cm = class_getInstanceMethod(cookieStorageClass, @selector(cookiesForURL:));
             if (cm) {
                 IMP orig_cookiesForURL = method_getImplementation(cm);
                 IMP cookieImp = imp_implementationWithBlock(^NSArray *(id self, NSURL *url) {
-                    NSArray *cookies = ((NSArray *(*)(id, SEL, NSURL *))orig_cookiesForURL)(self, @selector(cookiesForURL:), url);
+                    // Call original first
+                    NSArray *cookies = ((NSArray *(*)(id, SEL, NSURL *))orig_cookiesForURL)(
+                        self, @selector(cookiesForURL:), url);
 
+                    // Only modify for baidu domains
                     NSString *host = [url host];
-                    if (!host || ![host containsString:@"baidu.com"]) {
+                    if (!host || ![host containsString:@"baidu"]) {
+                        return cookies;
+                    }
+                    if (!cookies || cookies.count == 0) {
                         return cookies;
                     }
 
-                    NSSet *replaceNames = deviceCookieNames();
-                    NSMutableArray *modified = [NSMutableArray arrayWithCapacity:cookies.count];
-                    BOOL changed = NO;
-
-                    for (NSHTTPCookie *cookie in cookies) {
-                        if ([replaceNames containsObject:cookie.name]) {
-                            NSString *fakeVal = getOrCreateFakeCookieValue(cookie.name);
-                            if (fakeVal) {
-                                NSMutableDictionary *props = [cookie.properties mutableCopy];
-                                props[NSHTTPCookieValue] = fakeVal;
-                                NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
-                                if (newCookie) {
-                                    [modified addObject:newCookie];
-                                    changed = YES;
-                                    continue;
-                                }
-                            }
-                        }
-                        [modified addObject:cookie];
-                    }
-
-                    return changed ? [modified copy] : cookies;
+                    return replaceDeviceCookies(cookies);
                 });
-                class_replaceMethod(cookieStorageClass, @selector(cookiesForURL:), cookieImp, method_getTypeEncoding(cm));
-            }
-
-            // Also hook cookies (returns all cookies)
-            Method cm2 = class_getInstanceMethod(cookieStorageClass, @selector(cookies));
-            if (cm2) {
-                IMP orig_cookies = method_getImplementation(cm2);
-                IMP cookiesImp = imp_implementationWithBlock(^NSArray *(id self) {
-                    NSArray *cookies = ((NSArray *(*)(id, SEL))orig_cookies)(self, @selector(cookies));
-
-                    NSSet *replaceNames = deviceCookieNames();
-                    NSMutableArray *modified = [NSMutableArray arrayWithCapacity:cookies.count];
-                    BOOL changed = NO;
-
-                    for (NSHTTPCookie *cookie in cookies) {
-                        if ([replaceNames containsObject:cookie.name]) {
-                            NSString *fakeVal = getOrCreateFakeCookieValue(cookie.name);
-                            if (fakeVal) {
-                                NSMutableDictionary *props = [cookie.properties mutableCopy];
-                                props[NSHTTPCookieValue] = fakeVal;
-                                NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
-                                if (newCookie) {
-                                    [modified addObject:newCookie];
-                                    changed = YES;
-                                    continue;
-                                }
-                            }
-                        }
-                        [modified addObject:cookie];
-                    }
-
-                    return changed ? [modified copy] : cookies;
-                });
-                class_replaceMethod(cookieStorageClass, @selector(cookies), cookiesImp, method_getTypeEncoding(cm2));
-            }
-        }
-
-        // === 6. Hook NSMutableURLRequest setValue:forHTTPHeaderField: ===
-        Class mutableReqClass = objc_getClass("NSMutableURLRequest");
-        if (mutableReqClass) {
-            Method sm = class_getInstanceMethod(mutableReqClass, @selector(setValue:forHTTPHeaderField:));
-            if (sm) {
-                IMP orig_setValue = method_getImplementation(sm);
-                IMP setValueImp = imp_implementationWithBlock(^void(id self, SEL _cmd, NSString *value, NSString *field) {
-                    if ([field isEqualToString:@"Cookie"] && value && [value containsString:@"baidu"]) {
-                        NSString *modified = value;
-                        NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
-                                           @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
-                        for (NSString *name in names) {
-                            NSString *fakeVal = getOrCreateFakeCookieValue(name);
-                            NSString *pattern = [NSString stringWithFormat:@"%@=[^;]+", name];
-                            NSRegularExpression *regex = [NSRegularExpression
-                                regularExpressionWithPattern:pattern
-                                options:NSRegularExpressionCaseInsensitive
-                                error:nil];
-                            modified = [regex stringByReplacingMatchesInString:modified
-                                options:0 range:NSMakeRange(0, modified.length)
-                                withTemplate:[NSString stringWithFormat:@"%@=%@", name, fakeVal]];
-                        }
-                        NSString *cuidFake = getOrCreateFakeCookieValue(@"cuid");
-                        NSRegularExpression *cuidRegex = [NSRegularExpression
-                            regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+"
-                            options:0 error:nil];
-                        modified = [cuidRegex stringByReplacingMatchesInString:modified
-                            options:0 range:NSMakeRange(0, modified.length)
-                            withTemplate:[NSString stringWithFormat:@"cuid=%@", cuidFake]];
-
-                        ((void(*)(id, SEL, NSString *, NSString *))orig_setValue)(
-                            self, @selector(setValue:forHTTPHeaderField:), modified, field);
-                        return;
-                    }
-                    ((void(*)(id, SEL, NSString *, NSString *))orig_setValue)(
-                        self, @selector(setValue:forHTTPHeaderField:), value, field);
-                });
-                class_replaceMethod(mutableReqClass, @selector(setValue:forHTTPHeaderField:),
-                                    setValueImp, method_getTypeEncoding(sm));
-            }
-
-            Method am = class_getInstanceMethod(mutableReqClass, @selector(addValue:forHTTPHeaderField:));
-            if (am) {
-                IMP orig_addValue = method_getImplementation(am);
-                IMP addValueImp = imp_implementationWithBlock(^void(id self, SEL _cmd, NSString *value, NSString *field) {
-                    if ([field isEqualToString:@"Cookie"] && value) {
-                        NSString *modified = value;
-                        NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
-                                           @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
-                        for (NSString *name in names) {
-                            NSString *fakeVal = getOrCreateFakeCookieValue(name);
-                            NSString *pattern = [NSString stringWithFormat:@"%@=[^;]+", name];
-                            NSRegularExpression *regex = [NSRegularExpression
-                                regularExpressionWithPattern:pattern
-                                options:NSRegularExpressionCaseInsensitive error:nil];
-                            modified = [regex stringByReplacingMatchesInString:modified
-                                options:0 range:NSMakeRange(0, modified.length)
-                                withTemplate:[NSString stringWithFormat:@"%@=%@", name, fakeVal]];
-                        }
-                        ((void(*)(id, SEL, NSString *, NSString *))orig_addValue)(
-                            self, @selector(addValue:forHTTPHeaderField:), modified, field);
-                        return;
-                    }
-                    ((void(*)(id, SEL, NSString *, NSString *))orig_addValue)(
-                        self, @selector(addValue:forHTTPHeaderField:), value, field);
-                });
-                class_replaceMethod(mutableReqClass, @selector(addValue:forHTTPHeaderField:),
-                                    addValueImp, method_getTypeEncoding(am));
+                class_replaceMethod(cookieStorageClass, @selector(cookiesForURL:),
+                                    cookieImp, method_getTypeEncoding(cm));
             }
         }
     }
