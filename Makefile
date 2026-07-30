@@ -1,17 +1,16 @@
 #
-# Makefile — v9: Step33 + Cookie hooks
+# Makefile — TEST: empty dylib (diagnostic)
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHookTest.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-arc -Wall
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
-          -dynamiclib -framework Foundation -framework UIKit \
-          -framework AdSupport -framework Security \
+          -dynamiclib -framework Foundation \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
