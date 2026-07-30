@@ -1,7 +1,6 @@
 //
-// PrivacyHook.m — v7: Full-chain device spoof
-// NSHTTPCookieStorage (Cookie) + NSURLProtocol (URL params + POST body)
-// v6 only changed cookies but not URL/body params → "下单人数过多"
+// PrivacyHook.m — v7b: URL params + POST body only (no cookie hook)
+// Testing payment without cookie modification
 //
 
 #import <Foundation/Foundation.h>
@@ -281,19 +280,7 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. Clear cookie storage (first launch) ----
-        // This is THE key fix. Old CUID cookies must be deleted so the
-        // server doesn't recognize the device.
-        @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.cc"), kCFPreferencesCurrentApplication);
-            if (!cleared) {
-                clearCookieStorage();
-                CFPreferencesSetAppValue(CFSTR("Bdhk.cc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
-                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-            } else { CFRelease(cleared); }
-        } @catch (id e) {}
-
-        // ---- 2. Clear keychain (first launch) ----
+        // ---- 1. Clear keychain (first launch) ----
         @try {
             CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.kc"), kCFPreferencesCurrentApplication);
             if (!cleared) {
@@ -397,136 +384,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. CRITICAL: Hook NSHTTPCookieStorage ----
-        // This is where CUID actually lives. The system automatically
-        // attaches cookies from here to all requests. By replacing
-        // device cookies at the source, ALL requests get fake CUID
-        // regardless of networking stack used.
-        @try {
-            Class cs = objc_getClass("NSHTTPCookieStorage");
-
-            // Hook cookiesForURL: — called when system attaches cookies to a request
-            Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
-            if (cfuM) {
-                IMP origCFU = method_getImplementation(cfuM);
-                IMP newCFU = imp_implementationWithBlock(^NSArray *(id s, NSURL *url) {
-                    NSArray *cookies = ((NSArray *(*)(id, SEL, NSURL *))origCFU)(s, @selector(cookiesForURL:), url);
-                    if (g_inCookieHook) return cookies;
-                    g_inCookieHook = YES;
-                    @try {
-                        NSArray *modified = modifiedCookies(cookies);
-                        g_inCookieHook = NO;
-                        return modified;
-                    } @catch (id e) {
-                        g_inCookieHook = NO;
-                        return cookies;
-                    }
-                });
-                class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
-            }
-
-            // Hook setCookie: — called when server sets a cookie, intercept and modify
-            Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
-            if (scM) {
-                IMP origSC = method_getImplementation(scM);
-                IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
-                    if (cookie && isDeviceCookie(cookie.name)) {
-                        @try {
-                            NSString *fakeVal = getFakeID(cookie.name);
-                            NSMutableDictionary *props = [NSMutableDictionary dictionary];
-                            props[NSHTTPCookieName] = cookie.name;
-                            props[NSHTTPCookieValue] = fakeVal;
-                            if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
-                            if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
-                            if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
-                            props[NSHTTPCookieVersion] = @(cookie.version);
-                            if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
-                            NSHTTPCookie *fakeCookie = [[NSHTTPCookie alloc] initWithProperties:props];
-                            if (fakeCookie) {
-                                ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), fakeCookie);
-                                return;
-                            }
-                        } @catch (id e) {}
-                    }
-                    ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), cookie);
-                });
-                class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
-            }
-
-            // Hook setCookies:forURL:mainDocumentURL: — bulk cookie set
-            Method scsM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
-            if (scsM) {
-                IMP origSCS = method_getImplementation(scsM);
-                IMP newSCS = imp_implementationWithBlock(^void(id s, NSArray *cookies, NSURL *url, NSURL *docURL) {
-                    NSArray *modified = modifiedCookies(cookies);
-                    ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCS)(s, @selector(setCookies:forURL:mainDocumentURL:), modified, url, docURL);
-                });
-                class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCS, method_getTypeEncoding(scsM));
-            }
-
-            // Hook cookies (property) — returns all cookies
-            Method allM = class_getInstanceMethod(cs, @selector(cookies));
-            if (allM) {
-                IMP origAll = method_getImplementation(allM);
-                IMP newAll = imp_implementationWithBlock(^NSArray *(id s) {
-                    NSArray *cookies = ((NSArray *(*)(id, SEL))origAll)(s, @selector(cookies));
-                    if (g_inCookieHook) return cookies;
-                    g_inCookieHook = YES;
-                    @try {
-                        NSArray *modified = modifiedCookies(cookies);
-                        g_inCookieHook = NO;
-                        return modified;
-                    } @catch (id e) {
-                        g_inCookieHook = NO;
-                        return cookies;
-                    }
-                });
-                class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
-            }
-        } @catch (id e) {}
-
-        // ---- 8. Hook NSMutableURLRequest setValue:forHTTPHeaderField: ----
-        // Catch cases where app manually sets Cookie header
-        @try {
-            Class reqClass = objc_getClass("NSMutableURLRequest");
-            if (reqClass) {
-                Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
-                if (svM) {
-                    IMP origSV = method_getImplementation(svM);
-                    IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
-                        if (value && field && [field isEqualToString:@"Cookie"]) {
-                            // Replace device cookies in the Cookie header value
-                            NSString *lk = [field lowercaseString];
-                            if ([lk isEqualToString:@"cookie"]) {
-                                NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
-                                                   @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
-                                NSString *modified = value;
-                                for (NSString *name in names) {
-                                    NSString *fake = getFakeID(name);
-                                    NSRegularExpression *regex = [NSRegularExpression
-                                        regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
-                                        options:NSRegularExpressionCaseInsensitive error:nil];
-                                    modified = [regex stringByReplacingMatchesInString:modified options:0
-                                        range:NSMakeRange(0, modified.length)
-                                        withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
-                                }
-                                NSRegularExpression *cuidRegex = [NSRegularExpression
-                                    regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
-                                modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
-                                    range:NSMakeRange(0, modified.length)
-                                    withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
-                                ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), modified, field);
-                                return;
-                            }
-                        }
-                        ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
-                    });
-                    class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 9. Hook NSURLSessionConfiguration.protocolClasses ----
+        // ---- 7. Hook NSURLSessionConfiguration.protocolClasses ----
         @try {
             Class cfgClass = objc_getClass(@"NSURLSessionConfiguration");
             if (cfgClass) {
@@ -545,7 +403,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 10. Register NSURLProtocol globally ----
+        // ---- 8. Register NSURLProtocol globally ----
         @try { [NSURLProtocol registerClass:[BdhkProtocol class]]; } @catch (id e) {}
     }
 }
