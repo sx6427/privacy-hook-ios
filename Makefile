@@ -1,5 +1,5 @@
 #
-# Makefile — MINIMAL: only Foundation, only Bundle ID hook
+# Makefile — Foundation only: Bundle ID hook + NSURLProtocol device ID replacement
 #
 
 DYLIB = PrivacyHook.dylib
@@ -26,7 +26,7 @@ LDFLAGS = -arch arm64 \
 all: $(DYLIB)
 
 $(DYLIB): $(SRC)
-	@echo "Building MINIMAL Bundle ID hook only..."
+	@echo "Building PrivacyHook.dylib (Bundle ID + NSURLProtocol)..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
 	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "FAIL!" || echo "OK: no chained fixups"
