@@ -1,5 +1,6 @@
 //
-//  PrivacyHook.m — Step33: ONLY Bundle ID hook + keychain clear
+// PrivacyHook.m — Step34: Step33 with @try/@catch around each module
+// Isolates which hook causes the crash
 //
 
 #import <Foundation/Foundation.h>
@@ -83,86 +84,104 @@ static void clearKeychainEveryLaunch(void) {
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-        _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
-        _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
-        _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
+        // === Module 1: Generate spoofed IDs ===
+        @try {
+            _spoofedIDFA = getOrCreateSpoofedUUID(kKey(@"id1"));
+            _spoofedIDFV = getOrCreateSpoofedUUID(kKey(@"id2"));
+            _spoofedDeviceName = getOrCreateSpoofedDeviceName(kKey(@"dn"));
+        } @catch (NSException *e) {}
 
-        clearKeychainEveryLaunch();
+        // === Module 2: Keychain clear ===
+        @try {
+            clearKeychainEveryLaunch();
+        } @catch (NSException *e) {}
 
-        Class bundleClass = objc_getClass("NSBundle");
-        if (bundleClass) {
-            Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
-            if (m) {
-                orig_bundleIdentifier = method_getImplementation(m);
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    if ([s isEqual:[NSBundle mainBundle]]) return _originalBundleID;
-                    return ((NSString *(*)(id, SEL))orig_bundleIdentifier)(s, @selector(bundleIdentifier));
-                });
-                class_replaceMethod(bundleClass, @selector(bundleIdentifier), imp, method_getTypeEncoding(m));
+        // === Module 3: Bundle ID hook (payment critical) ===
+        @try {
+            Class bundleClass = objc_getClass("NSBundle");
+            if (bundleClass) {
+                Method m = class_getInstanceMethod(bundleClass, @selector(bundleIdentifier));
+                if (m) {
+                    orig_bundleIdentifier = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        if ([s isEqual:[NSBundle mainBundle]]) return _originalBundleID;
+                        return ((NSString *(*)(id, SEL))orig_bundleIdentifier)(s, @selector(bundleIdentifier));
+                    });
+                    class_replaceMethod(bundleClass, @selector(bundleIdentifier), imp, method_getTypeEncoding(m));
+                }
+                Method m2 = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
+                if (m2) {
+                    orig_infoDictionary = method_getImplementation(m2);
+                    IMP imp2 = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(s, @selector(infoDictionary));
+                        if ([s isEqual:[NSBundle mainBundle]] && dict) {
+                            NSMutableDictionary *md = [dict mutableCopy];
+                            md[@"CFBundleIdentifier"] = _originalBundleID;
+                            return md;
+                        }
+                        return dict;
+                    });
+                    class_replaceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
+                }
+                Method m3 = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
+                if (m3) {
+                    IMP orig3 = method_getImplementation(m3);
+                    IMP imp3 = imp_implementationWithBlock(^id(id s, SEL _cmd, NSString *key) {
+                        id val = ((id(*)(id, SEL, NSString *))orig3)(s, _cmd, key);
+                        if ([s isEqual:[NSBundle mainBundle]] && [key isEqualToString:@"CFBundleIdentifier"]) {
+                            return _originalBundleID;
+                        }
+                        return val;
+                    });
+                    class_replaceMethod(bundleClass, @selector(objectForInfoDictionaryKey:), imp3, method_getTypeEncoding(m3));
+                }
             }
-            Method m2 = class_getInstanceMethod(bundleClass, @selector(infoDictionary));
-            if (m2) {
-                orig_infoDictionary = method_getImplementation(m2);
-                IMP imp2 = imp_implementationWithBlock(^NSDictionary *(id s) {
-                    NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(s, @selector(infoDictionary));
-                    if ([s isEqual:[NSBundle mainBundle]] && dict) {
-                        NSMutableDictionary *md = [dict mutableCopy];
-                        md[@"CFBundleIdentifier"] = _originalBundleID;
-                        return md;
-                    }
-                    return dict;
-                });
-                class_replaceMethod(bundleClass, @selector(infoDictionary), imp2, method_getTypeEncoding(m2));
-            }
-            Method m3 = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
-            if (m3) {
-                IMP orig3 = method_getImplementation(m3);
-                IMP imp3 = imp_implementationWithBlock(^id(id s, SEL _cmd, NSString *key) {
-                    id val = ((id(*)(id, SEL, NSString *))orig3)(s, _cmd, key);
-                    if ([s isEqual:[NSBundle mainBundle]] && [key isEqualToString:@"CFBundleIdentifier"]) {
-                        return _originalBundleID;
-                    }
-                    return val;
-                });
-                class_replaceMethod(bundleClass, @selector(objectForInfoDictionaryKey:), imp3, method_getTypeEncoding(m3));
-            }
-        }
+        } @catch (NSException *e) {}
 
-        Class asmClass = objc_getClass("ASIdentifierManager");
-        if (asmClass) {
-            Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFA; });
-                hookInstanceMethod(asmClass, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
+        // === Module 4: IDFA hook ===
+        @try {
+            Class asmClass = objc_getClass("ASIdentifierManager");
+            if (asmClass) {
+                Method m = class_getInstanceMethod(asmClass, @selector(advertisingIdentifier));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFA; });
+                    hookInstanceMethod(asmClass, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
+                }
+                m = class_getInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; });
+                    hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled), imp, method_getTypeEncoding(m));
+                }
             }
-            m = class_getInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; });
-                hookInstanceMethod(asmClass, @selector(isAdvertisingTrackingEnabled), imp, method_getTypeEncoding(m));
-            }
-        }
+        } @catch (NSException *e) {}
 
-        Class attClass = objc_getClass("ATTrackingManager");
-        if (attClass) {
-            Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSInteger(id s) { return 3; });
-                hookClassMethod(attClass, @selector(trackingAuthorizationStatus), imp, method_getTypeEncoding(m));
+        // === Module 5: ATT hook ===
+        @try {
+            Class attClass = objc_getClass("ATTrackingManager");
+            if (attClass) {
+                Method m = class_getClassMethod(attClass, @selector(trackingAuthorizationStatus));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSInteger(id s) { return 3; });
+                    hookClassMethod(attClass, @selector(trackingAuthorizationStatus), imp, method_getTypeEncoding(m));
+                }
             }
-        }
+        } @catch (NSException *e) {}
 
-        Class uiDeviceClass = objc_getClass("UIDevice");
-        if (uiDeviceClass) {
-            Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFV; });
-                hookInstanceMethod(uiDeviceClass, @selector(identifierForVendor), imp, method_getTypeEncoding(m));
+        // === Module 6: IDFV + device name hook ===
+        @try {
+            Class uiDeviceClass = objc_getClass("UIDevice");
+            if (uiDeviceClass) {
+                Method m = class_getInstanceMethod(uiDeviceClass, @selector(identifierForVendor));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSUUID *(id s) { return _spoofedIDFV; });
+                    hookInstanceMethod(uiDeviceClass, @selector(identifierForVendor), imp, method_getTypeEncoding(m));
+                }
+                m = class_getInstanceMethod(uiDeviceClass, @selector(name));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; });
+                    hookInstanceMethod(uiDeviceClass, @selector(name), imp, method_getTypeEncoding(m));
+                }
             }
-            m = class_getInstanceMethod(uiDeviceClass, @selector(name));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return _spoofedDeviceName; });
-                hookInstanceMethod(uiDeviceClass, @selector(name), imp, method_getTypeEncoding(m));
-            }
-        }
+        } @catch (NSException *e) {}
     }
 }
