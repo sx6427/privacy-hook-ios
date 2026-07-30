@@ -1,6 +1,11 @@
 //
-// PrivacyHook.m — Device fingerprint spoofing v4
-// Key fix: delete CUID files from sandbox + replace CUID in ALL HTTP headers
+// PrivacyHook.m — Device fingerprint spoofing v5
+// Based on memory file lessons:
+//   - DO NOT delete files (breaks payment)
+//   - DO NOT hook sysctl (useless on iOS)
+//   - DO NOT purge UserDefaults aggressively (breaks payment)
+// Key fix: swizzle NSURLSession dataTaskWithRequest: directly
+//   (NSURLProtocol may not intercept Baidu's custom network stack)
 //
 
 #import <Foundation/Foundation.h>
@@ -12,7 +17,7 @@
 #define NSLog(...)
 
 static BOOL g_inUDHook = NO;
-static __thread BOOL g_inProtocol = NO;
+static __thread BOOL g_inHook = NO;  // thread-local: prevent network hook recursion
 
 // ============================================================
 // Persistent fake IDs — uses CFPreferences to avoid recursion
@@ -78,111 +83,12 @@ static NSString *getFakeID(NSString *name) {
 }
 
 // ============================================================
-// Keychain clear
+// Keychain clear (first launch only, per memory file)
 // ============================================================
 static void clearKeychain(void) {
     NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
                          (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
     for (id cls in classes) { SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls}); }
-}
-
-// ============================================================
-// NEW: Delete CUID/device-ID files from sandbox
-// Baidu stores CUID in files, not NSUserDefaults
-// ============================================================
-static void deleteDeviceFiles(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    // Get all app directories
-    NSString *home = NSHomeDirectory();
-    NSArray *searchDirs = @[
-        [home stringByAppendingPathComponent:@"Library"],
-        [home stringByAppendingPathComponent:@"Documents"],
-    ];
-
-    // Keywords in file names that indicate device ID files
-    NSArray *fileKeywords = @[@"cuid", @"device", @"udid", @"bdudid", @"baiduid",
-                              @"bdid", @"imei", @"serial", @"fingerprint",
-                              @"deviceid", @"machine_id", @"boxcuid"];
-
-    for (NSString *searchDir in searchDirs) {
-        if (![fm fileExistsAtPath:searchDir]) continue;
-
-        NSDirectoryEnumerator *en = [fm enumeratorAtPath:searchDir];
-        NSMutableArray *toDelete = [NSMutableArray array];
-
-        for (NSString *relPath in en) {
-            NSString *filename = [[relPath lastPathComponent] lowercaseString];
-
-            // Check if filename contains any device keyword
-            for (NSString *kw in fileKeywords) {
-                if ([filename containsString:kw]) {
-                    [toDelete addObject:[searchDir stringByAppendingPathComponent:relPath]];
-                    break;
-                }
-            }
-        }
-
-        for (NSString *path in toDelete) {
-            [fm removeItemAtPath:path error:nil];
-        }
-    }
-
-    // Also delete the entire Caches directory (forces re-generation)
-    NSString *cachesDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-    if (cachesDir && [fm fileExistsAtPath:cachesDir]) {
-        NSArray *cacheFiles = [fm contentsOfDirectoryAtPath:cachesDir error:nil];
-        for (NSString *f in cacheFiles) {
-            NSString *fp = [cachesDir stringByAppendingPathComponent:f];
-            // Delete plist files and dat files in Caches (likely contain cached device IDs)
-            NSString *ext = [[f pathExtension] lowercaseString];
-            if ([ext isEqualToString:@"plist"] || [ext isEqualToString:@"dat"] ||
-                [ext isEqualToString:@"db"] || [ext isEqualToString:@"sqlite"]) {
-                [fm removeItemAtPath:fp error:nil];
-            }
-        }
-    }
-
-    // Delete Library/Preferences plist (forces NSUserDefaults regeneration)
-    // Our hooks will intercept and provide fake values when app reads them
-    NSString *bid = @"com.baidu.BaiduMobileA1";
-    NSString *prefPlist = [home stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"Library/Preferences/%@.plist", bid]];
-    if ([fm fileExistsAtPath:prefPlist]) {
-        [fm removeItemAtPath:prefPlist error:nil];
-    }
-    // Also try the original bundle ID plist
-    NSString *origPrefPlist = [home stringByAppendingPathComponent:
-                              [NSString stringWithFormat:@"Library/Preferences/com.baidu.BaiduMobile.BaiduBoxAppA1.plist"]];
-    if ([fm fileExistsAtPath:origPrefPlist]) {
-        [fm removeItemAtPath:origPrefPlist error:nil];
-    }
-}
-
-// ============================================================
-// Purge NSUserDefaults device keys
-// ============================================================
-static void purgeDeviceIDs(void) {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSArray *keysToPurge = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
-                             @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
-                             @"DVIF", @"tcuid", @"__bid_n", @"fuid",
-                             @"bdudid", @"baiduid", @"bdid",
-                             @"device_id", @"deviceId",
-                             @"BaiduBoxApp.cuid", @"BaiduBoxApp.CUID",
-                             @"baidu_cuid", @"BaiduBoxCuid"];
-    for (NSString *key in keysToPurge) {
-        if ([ud objectForKey:key]) [ud removeObjectForKey:key];
-    }
-    NSDictionary *all = [ud dictionaryRepresentation];
-    for (NSString *key in [all allKeys]) {
-        if ([key hasPrefix:@"Bdhk"]) continue;
-        if ([key.lowercaseString hasPrefix:@"cuid"] || [key.lowercaseString isEqualToString:@"bdudid"] ||
-            [key.lowercaseString isEqualToString:@"baiduid"]) {
-            [ud removeObjectForKey:key];
-        }
-    }
-    [ud synchronize];
 }
 
 // ============================================================
@@ -200,6 +106,7 @@ static NSString *replaceDeviceCookiesInString(NSString *cookie) {
             range:NSMakeRange(0, modified.length)
             withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
     }
+    // standalone cuid= (not BAIDUCUID= etc)
     NSRegularExpression *cuidRegex = [NSRegularExpression
         regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
     modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
@@ -269,7 +176,13 @@ static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
     return body;
 }
 
-// NEW: Replace CUID in ALL HTTP headers, not just Cookie
+static BOOL isBaiduHost(NSString *host) {
+    if (!host) return NO;
+    return [host containsString:@"baidu"] || [host containsString:@"bdstatic"] ||
+           [host containsString:@"bdimg"] || [host containsString:@"hao123"] ||
+           [host containsString:@"baidustatic"];
+}
+
 static NSMutableURLRequest *modifiedRequest(NSURLRequest *req) {
     NSMutableURLRequest *m = [req mutableCopy];
 
@@ -278,28 +191,11 @@ static NSMutableURLRequest *modifiedRequest(NSURLRequest *req) {
     if (cookie.length > 0)
         [m setValue:replaceDeviceCookiesInString(cookie) forHTTPHeaderField:@"Cookie"];
 
-    // 2. Scan ALL headers for CUID values
-    NSDictionary *allHeaders = [m allHTTPHeaderFields];
-    for (NSString *hName in [allHeaders allKeys]) {
-        NSString *hVal = allHeaders[hName];
-        if (!hVal || ![hVal isKindOfClass:[NSString class]]) continue;
-        NSString *lh = hName.lowercaseString;
-
-        // Headers that might contain CUID
-        if ([lh containsString:@"cuid"] || [lh containsString:@"device"] ||
-            [lh containsString:@"bd-"] || [lh containsString:@"x-bd"]) {
-            // If header value looks like a CUID (long alphanumeric string), replace it
-            if (hVal.length > 20) {
-                [m setValue:getFakeID(@"cuid") forHTTPHeaderField:hName];
-            }
-        }
-    }
-
-    // 3. URL query params
+    // 2. URL query params
     NSURL *newURL = replaceDeviceParamsInURL(m.URL);
     if (newURL && ![newURL isEqual:m.URL]) [m setURL:newURL];
 
-    // 4. POST body
+    // 3. POST body
     NSData *body = m.HTTPBody;
     if (body) {
         NSString *ct = [m valueForHTTPHeaderField:@"Content-Type"];
@@ -310,7 +206,7 @@ static NSMutableURLRequest *modifiedRequest(NSURLRequest *req) {
 }
 
 // ============================================================
-// NSURLProtocol
+// NSURLProtocol (backup layer)
 // ============================================================
 static NSString *const kMarker = @"X-Bdhk-Int";
 
@@ -319,11 +215,8 @@ static NSString *const kMarker = @"X-Bdhk-Int";
 @implementation BdhkProtocol { NSURLSessionDataTask *_task; }
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if (g_inProtocol) return NO;
-    NSString *host = request.URL.host;
-    if (!host) return NO;
-    if (![host containsString:@"baidu"] && ![host containsString:@"bdstatic"] &&
-        ![host containsString:@"bdimg"] && ![host containsString:@"hao123"]) return NO;
+    if (g_inHook) return NO;
+    if (!isBaiduHost(request.URL.host)) return NO;
     return ![[request valueForHTTPHeaderField:kMarker] isEqualToString:@"1"];
 }
 
@@ -333,11 +226,11 @@ static NSString *const kMarker = @"X-Bdhk-Int";
     NSMutableURLRequest *req = modifiedRequest(self.request);
     [req setValue:@"1" forHTTPHeaderField:kMarker];
 
-    g_inProtocol = YES;
+    g_inHook = YES;
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
     config.protocolClasses = @[];
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-    g_inProtocol = NO;
+    g_inHook = NO;
 
     __weak typeof(self) ws = self;
     _task = [session dataTaskWithRequest:req
@@ -381,23 +274,7 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. Delete CUID/device files from sandbox ----
-        @try { deleteDeviceFiles(); } @catch (id e) {}
-
-        // ---- 2. Purge NSUserDefaults ----
-        @try { purgeDeviceIDs(); } @catch (id e) {}
-
-        // ---- 3. Keychain clear (first launch) ----
-        @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.kc"), kCFPreferencesCurrentApplication);
-            if (!cleared) {
-                clearKeychain();
-                CFPreferencesSetAppValue(CFSTR("Bdhk.kc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
-                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-            } else { CFRelease(cleared); }
-        } @catch (id e) {}
-
-        // ---- 4. Bundle ID hook ----
+        // ---- 1. Bundle ID hook (payment critical) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -413,7 +290,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. UIDevice hooks ----
+        // ---- 2. UIDevice hooks ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -444,7 +321,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. ASIdentifierManager IDFA hook ----
+        // ---- 3. ASIdentifierManager IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -458,7 +335,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. NSUserDefaults hooks ----
+        // ---- 4. NSUserDefaults hooks (exact match only) ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
@@ -491,15 +368,70 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 8. Hook NSURLSessionConfiguration.protocolClasses ----
+        // ---- 5. Keychain clear (first launch only) ----
         @try {
-            Class sc = objc_getClass("NSURLSessionConfiguration");
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.kc"), kCFPreferencesCurrentApplication);
+            if (!cleared) {
+                clearKeychain();
+                CFPreferencesSetAppValue(CFSTR("Bdhk.kc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            } else { CFRelease(cleared); }
+        } @catch (id e) {}
+
+        // ---- 6. CRITICAL: Swizzle NSURLSession dataTaskWithRequest: ----
+        // This is the REAL fix. NSURLProtocol may not intercept Baidu's
+        // custom network stack. Swizzling the method directly catches ALL
+        // requests regardless of which session configuration is used.
+        @try {
+            Class sc = objc_getClass("NSURLSession");
             if (sc) {
-                Method pcM = class_getInstanceMethod(sc, @selector(protocolClasses));
+                // dataTaskWithRequest:
+                Method dtM = class_getInstanceMethod(sc, @selector(dataTaskWithRequest:));
+                if (dtM) {
+                    IMP origDT = method_getImplementation(dtM);
+                    IMP newDT = imp_implementationWithBlock(^NSURLSessionDataTask *(id s, NSURLRequest *request) {
+                        if (!g_inHook && isBaiduHost(request.URL.host)) {
+                            g_inHook = YES;
+                            @try {
+                                NSMutableURLRequest *m = modifiedRequest(request);
+                                g_inHook = NO;
+                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))origDT)(s, @selector(dataTaskWithRequest:), m);
+                            } @catch (id e) { g_inHook = NO; }
+                        }
+                        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))origDT)(s, @selector(dataTaskWithRequest:), request);
+                    });
+                    class_replaceMethod(sc, @selector(dataTaskWithRequest:), newDT, method_getTypeEncoding(dtM));
+                }
+
+                // dataTaskWithRequest:completionHandler:
+                Method dtcM = class_getInstanceMethod(sc, @selector(dataTaskWithRequest:completionHandler:));
+                if (dtcM) {
+                    IMP origDTC = method_getImplementation(dtcM);
+                    IMP newDTC = imp_implementationWithBlock(^NSURLSessionDataTask *(id s, NSURLRequest *request, void (^ch)(NSData *, NSURLResponse *, NSError *)) {
+                        if (!g_inHook && isBaiduHost(request.URL.host)) {
+                            g_inHook = YES;
+                            @try {
+                                NSMutableURLRequest *m = modifiedRequest(request);
+                                g_inHook = NO;
+                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))origDTC)(s, @selector(dataTaskWithRequest:completionHandler:), m, ch);
+                            } @catch (id e) { g_inHook = NO; }
+                        }
+                        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))origDTC)(s, @selector(dataTaskWithRequest:completionHandler:), request, ch);
+                    });
+                    class_replaceMethod(sc, @selector(dataTaskWithRequest:completionHandler:), newDTC, method_getTypeEncoding(dtcM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 7. Hook NSURLSessionConfiguration (backup for NSURLProtocol) ----
+        @try {
+            Class cfgClass = objc_getClass("NSURLSessionConfiguration");
+            if (cfgClass) {
+                Method pcM = class_getInstanceMethod(cfgClass, @selector(protocolClasses));
                 if (pcM) {
                     IMP origPC = method_getImplementation(pcM);
                     IMP newPC = imp_implementationWithBlock(^NSArray *(id s) {
-                        if (g_inProtocol) {
+                        if (g_inHook) {
                             return ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
                         }
                         NSArray *orig = ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
@@ -509,12 +441,12 @@ static void initPrivacyHook(void) {
                         }
                         return arr;
                     });
-                    class_replaceMethod(sc, @selector(protocolClasses), newPC, method_getTypeEncoding(pcM));
+                    class_replaceMethod(cfgClass, @selector(protocolClasses), newPC, method_getTypeEncoding(pcM));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 9. Register globally ----
+        // ---- 8. Register NSURLProtocol globally ----
         @try { [NSURLProtocol registerClass:[BdhkProtocol class]]; } @catch (id e) {}
     }
 }
