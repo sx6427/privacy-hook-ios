@@ -1,7 +1,7 @@
 //
-// PrivacyHook.m — Device fingerprint spoofing + Bundle ID + NSURLProtocol
-// Hooks: UIDevice (name, identifierForVendor), ASIdentifierManager (IDFA),
-//        Keychain clear, NSURLProtocol (network-level cookie/param replacement)
+// PrivacyHook.m — Comprehensive device fingerprint spoofing
+// Layers: sysctl hook + NSUserDefaults hook + NSURLSession swizzle +
+//         UIDevice/ASIdentifierManager hooks + Bundle ID + keychain clear
 //
 
 #import <Foundation/Foundation.h>
@@ -9,11 +9,14 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <sys/sysctl.h>
+#import <string.h>
+#import "fishhook.h"
 
 #define NSLog(...)
 
 // ============================================================
-// Persistent fake IDs — one set per clone, stored in NSUserDefaults
+// Persistent fake IDs
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -46,11 +49,33 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
     return s;
 }
 
+static NSString *genCUID(void) {
+    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < 63; i++) {
+        if (i > 0 && i % 10 == 3) [s appendString:@"-"];
+        else [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    }
+    return s;
+}
+
+static NSString *genIMEI(void) {
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < 15; i++)
+        [s appendFormat:@"%d", arc4random_uniform(10)];
+    return s;
+}
+
+static NSString *genSerial(void) {
+    NSString *cs = @"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    return [NSString stringWithFormat:@"F2L%@", genRandStr(11, cs)];
+}
+
 static NSString *genFakeCookie(NSString *name) {
     NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
     NSString *hexCS = @"0123456789abcdef";
     if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
-        return genRandStr(arc4random_uniform(7) + 58, cuidCS);
+        return genCUID();
     if ([name isEqualToString:@"DVIF"]) {
         NSString *num = [NSString stringWithFormat:@"%lu",
             (unsigned long)(arc4random_uniform(9000000000000000ULL) + 1000000000000000ULL)];
@@ -72,7 +97,7 @@ static NSString *getFakeID(NSString *name) {
 }
 
 // ============================================================
-// Keychain clear — remove cached device tokens
+// Keychain clear
 // ============================================================
 static void clearKeychain(void) {
     NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
@@ -87,7 +112,7 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// Cookie header replacement
+// Network request modification functions
 // ============================================================
 static NSString *replaceDeviceCookiesInString(NSString *cookie) {
     NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
@@ -111,9 +136,6 @@ static NSString *replaceDeviceCookiesInString(NSString *cookie) {
     return modified;
 }
 
-// ============================================================
-// URL query param replacement
-// ============================================================
 static NSURL *replaceDeviceParamsInURL(NSURL *url) {
     if (!url) return url;
     NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
@@ -124,11 +146,15 @@ static NSURL *replaceDeviceParamsInURL(NSURL *url) {
     BOOL modified = NO;
     NSMutableArray *newItems = [NSMutableArray array];
     for (NSURLQueryItem *item in items) {
-        if ([item.name isEqualToString:@"cuid"] || [item.name hasPrefix:@"cuid_"] ||
-            [item.name isEqualToString:@"cfrom"] || [item.name isEqualToString:@"c3_aid"] ||
-            [item.name isEqualToString:@"idfa"] || [item.name isEqualToString:@"idfv"]) {
-            NSString *fakeVal = [item.name isEqualToString:@"idfa"] ? getPersistent(@"fake.idfa", ^{ return genUUIDStr(); })
-                          : [item.name isEqualToString:@"idfv"] ? getPersistent(@"fake.idfv", ^{ return genUUIDStr(); })
+        NSString *n = item.name.lowercaseString;
+        if ([n isEqualToString:@"cuid"] || [n hasPrefix:@"cuid_"] ||
+            [n isEqualToString:@"cfrom"] || [n isEqualToString:@"c3_aid"] ||
+            [n isEqualToString:@"idfa"] || [n isEqualToString:@"idfv"] ||
+            [n isEqualToString:@"imei"] || [n isEqualToString:@"device_id"] ||
+            [n isEqualToString:@"deviceid"]) {
+            NSString *fakeVal = [n isEqualToString:@"idfa"] ? getPersistent(@"fake.idfa", ^{ return genUUIDStr(); })
+                          : [n isEqualToString:@"idfv"] ? getPersistent(@"fake.idfv", ^{ return genUUIDStr(); })
+                          : [n isEqualToString:@"imei"] ? getPersistent(@"fake.imei", ^{ return genIMEI(); })
                           : getFakeID(@"cuid");
             [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:fakeVal]];
             modified = YES;
@@ -143,9 +169,6 @@ static NSURL *replaceDeviceParamsInURL(NSURL *url) {
     return url;
 }
 
-// ============================================================
-// POST body replacement
-// ============================================================
 static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
     if (!body || body.length == 0) return body;
 
@@ -157,11 +180,13 @@ static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
 
         BOOL modified = NO;
         NSArray *deviceKeys = @[@"cuid", @"cuid_galaxy2", @"cuid_gid", @"cfrom", @"c3_aid",
-                                @"idfa", @"idfv", @"device_id", @"udid"];
+                                @"idfa", @"idfv", @"device_id", @"udid", @"imei"];
         for (NSString *key in [json allKeys]) {
-            if ([deviceKeys containsObject:key] || [key hasPrefix:@"cuid"]) {
-                NSString *fakeVal = [key isEqualToString:@"idfa"] ? getPersistent(@"fake.idfa", ^{ return genUUIDStr(); })
-                              : [key isEqualToString:@"idfv"] ? getPersistent(@"fake.idfv", ^{ return genUUIDStr(); })
+            NSString *lk = key.lowercaseString;
+            if ([deviceKeys containsObject:lk] || [lk hasPrefix:@"cuid"]) {
+                NSString *fakeVal = [lk isEqualToString:@"idfa"] ? getPersistent(@"fake.idfa", ^{ return genUUIDStr(); })
+                              : [lk isEqualToString:@"idfv"] ? getPersistent(@"fake.idfv", ^{ return genUUIDStr(); })
+                              : [lk isEqualToString:@"imei"] ? getPersistent(@"fake.imei", ^{ return genIMEI(); })
                               : getFakeID(@"cuid");
                 json[key] = fakeVal;
                 modified = YES;
@@ -177,14 +202,16 @@ static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
         NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
         NSMutableArray *newPairs = [NSMutableArray array];
         BOOL modified = NO;
-        NSArray *deviceKeys = @[@"cuid", @"cfrom", @"c3_aid", @"idfa", @"idfv"];
+        NSArray *deviceKeys = @[@"cuid", @"cfrom", @"c3_aid", @"idfa", @"idfv", @"imei"];
         for (NSString *pair in pairs) {
             NSRange eqRange = [pair rangeOfString:@"="];
             if (eqRange.location == NSNotFound) { [newPairs addObject:pair]; continue; }
             NSString *name = [pair substringToIndex:eqRange.location];
-            if ([deviceKeys containsObject:name] || [name hasPrefix:@"cuid"]) {
-                NSString *fakeVal = [name isEqualToString:@"idfa"] ? getPersistent(@"fake.idfa", ^{ return genUUIDStr(); })
-                              : [name isEqualToString:@"idfv"] ? getPersistent(@"fake.idfv", ^{ return genUUIDStr(); })
+            NSString *lk = name.lowercaseString;
+            if ([deviceKeys containsObject:lk] || [lk hasPrefix:@"cuid"]) {
+                NSString *fakeVal = [lk isEqualToString:@"idfa"] ? getPersistent(@"fake.idfa", ^{ return genUUIDStr(); })
+                              : [lk isEqualToString:@"idfv"] ? getPersistent(@"fake.idfv", ^{ return genUUIDStr(); })
+                              : [lk isEqualToString:@"imei"] ? getPersistent(@"fake.imei", ^{ return genIMEI(); })
                               : getFakeID(@"cuid");
                 [newPairs addObject:[NSString stringWithFormat:@"%@=%@", name, fakeVal]];
                 modified = YES;
@@ -200,8 +227,128 @@ static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
     return body;
 }
 
+// Apply all modifications to a request, return new mutable request
+static NSMutableURLRequest *modifiedRequest(NSURLRequest *req) {
+    NSMutableURLRequest *m = [req mutableCopy];
+
+    // Cookie
+    NSString *cookie = [m valueForHTTPHeaderField:@"Cookie"];
+    if (cookie.length > 0)
+        [m setValue:replaceDeviceCookiesInString(cookie) forHTTPHeaderField:@"Cookie"];
+
+    // URL
+    NSURL *newURL = replaceDeviceParamsInURL(m.URL);
+    if (newURL && ![newURL isEqual:m.URL])
+        [m setURL:newURL];
+
+    // Body
+    NSData *body = m.HTTPBody;
+    if (body) {
+        NSString *ct = [m valueForHTTPHeaderField:@"Content-Type"];
+        NSData *newBody = replaceDeviceParamsInBody(body, ct);
+        if (newBody && ![newBody isEqual:body])
+            [m setHTTPBody:newBody];
+    }
+    return m;
+}
+
 // ============================================================
-// NSURLProtocol — intercept baidu HTTP requests
+// Layer 1: fishhook sysctlbyname — fake hardware identifiers
+// ============================================================
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
+
+static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (name) {
+        // Fake device model
+        if (strcmp(name, "hw.machine") == 0) {
+            NSArray *models = @[@"iPhone14,7", @"iPhone15,2", @"iPhone13,2", @"iPhone14,5",
+                                @"iPhone12,1", @"iPhone15,3", @"iPhone13,3", @"iPhone14,3"];
+            const char *fake = [[models objectAtIndex:arc4random_uniform((uint32_t)models.count)]
+                                UTF8String];
+            if (oldp && oldlenp) {
+                size_t len = strlen(fake) + 1;
+                if (*oldlenp >= len) memcpy(oldp, fake, len);
+                *oldlenp = len;
+            }
+            return 0;
+        }
+        // Fake serial number
+        if (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.serial") == 0) {
+            NSString *serial = getPersistent(@"fake.serial", ^{ return genSerial(); });
+            const char *fake = [serial UTF8String];
+            if (oldp && oldlenp) {
+                size_t len = strlen(fake) + 1;
+                if (*oldlenp >= len) memcpy(oldp, fake, len);
+                *oldlenp = len;
+            }
+            return 0;
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// ============================================================
+// Layer 2: NSUserDefaults swizzle — intercept CUID reads
+// ============================================================
+static BOOL isDeviceKey(NSString *key) {
+    if (!key) return NO;
+    NSString *lk = key.lowercaseString;
+    NSArray *patterns = @[@"cuid", @"dvif", @"tcuid", @"__bid_n", @"fuid",
+                          @"device_id", @"deviceid", @"imei", @"serial",
+                          @"idfa", @"idfv", @"udid", @"bdid"];
+    for (NSString *p in patterns) {
+        if ([lk containsString:p]) return YES;
+    }
+    return NO;
+}
+
+static NSString *fakeValueForKey(NSString *key) {
+    NSString *lk = key.lowercaseString;
+    if ([lk containsString:@"idfa"]) return getPersistent(@"fake.idfa", ^{ return genUUIDStr(); });
+    if ([lk containsString:@"idfv"]) return getPersistent(@"fake.idfv", ^{ return genUUIDStr(); });
+    if ([lk containsString:@"imei"]) return getPersistent(@"fake.imei", ^{ return genIMEI(); });
+    if ([lk containsString:@"serial"]) return getPersistent(@"fake.serial", ^{ return genSerial(); });
+    if ([lk containsString:@"dvif"]) return getFakeID(@"DVIF");
+    if ([lk containsString:@"tcuid"]) return getFakeID(@"tcuid");
+    if ([lk containsString:@"__bid_n"]) return getFakeID(@"__bid_n");
+    if ([lk containsString:@"fuid"]) return getFakeID(@"fuid");
+    // Default: treat as CUID
+    return getFakeID(@"cuid");
+}
+
+// ============================================================
+// Layer 3: NSURLSession swizzle — intercept ALL network requests
+// ============================================================
+static IMP orig_dataTaskWithRequest = NULL;
+static IMP orig_dataTaskWithRequestCompletion = NULL;
+
+static NSURLSessionDataTask *hook_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
+    @try {
+        NSString *host = request.URL.host;
+        if (host && [host containsString:@"baidu"]) {
+            NSMutableURLRequest *m = modifiedRequest(request);
+            return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))orig_dataTaskWithRequest)(self, _cmd, m);
+        }
+    } @catch (id e) {}
+    return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))orig_dataTaskWithRequest)(self, _cmd, request);
+}
+
+static NSURLSessionDataTask *hook_dataTaskWithRequestCompletion(id self, SEL _cmd,
+        NSURLRequest *request, void (^completionHandler)(NSData *, NSURLResponse *, NSError *)) {
+    @try {
+        NSString *host = request.URL.host;
+        if (host && [host containsString:@"baidu"]) {
+            NSMutableURLRequest *m = modifiedRequest(request);
+            return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))
+                    orig_dataTaskWithRequestCompletion)(self, _cmd, m, completionHandler);
+        }
+    } @catch (id e) {}
+    return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))
+            orig_dataTaskWithRequestCompletion)(self, _cmd, request, completionHandler);
+}
+
+// ============================================================
+// Layer 4: NSURLProtocol (backup)
 // ============================================================
 static NSString *const kMarker = @"X-BaiduIntercept";
 
@@ -215,48 +362,24 @@ static NSString *const kMarker = @"X-BaiduIntercept";
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     NSString *host = request.URL.host;
     if (!host || ![host containsString:@"baidu"]) return NO;
-    NSString *m = [request valueForHTTPHeaderField:kMarker];
-    return ![m isEqualToString:@"1"];
+    return ![[request valueForHTTPHeaderField:kMarker] isEqualToString:@"1"];
 }
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 
 - (void)startLoading {
-    NSMutableURLRequest *req = [self.request mutableCopy];
+    NSMutableURLRequest *req = modifiedRequest(self.request);
     [req setValue:@"1" forHTTPHeaderField:kMarker];
-
-    // 1. Cookie header
-    NSString *cookie = [req valueForHTTPHeaderField:@"Cookie"];
-    if (cookie && cookie.length > 0)
-        [req setValue:replaceDeviceCookiesInString(cookie) forHTTPHeaderField:@"Cookie"];
-
-    // 2. URL query params
-    NSURL *newURL = replaceDeviceParamsInURL(req.URL);
-    if (newURL && ![newURL isEqual:req.URL])
-        [req setURL:newURL];
-
-    // 3. POST body
-    NSString *ct = [req valueForHTTPHeaderField:@"Content-Type"];
-    NSData *body = req.HTTPBody;
-    if (body) {
-        NSData *newBody = replaceDeviceParamsInBody(body, ct);
-        if (newBody && ![newBody isEqual:body])
-            [req setHTTPBody:newBody];
-    }
 
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
     config.protocolClasses = @[];
-
     __weak typeof(self) ws = self;
     _task = [[NSURLSession sessionWithConfiguration:config] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             __strong typeof(ws) ss = ws;
             if (!ss) return;
-            if (error) {
-                [ss.client URLProtocol:ss didFailWithError:error];
-            } else {
+            if (error) [ss.client URLProtocol:ss didFailWithError:error];
+            else {
                 [ss.client URLProtocol:ss didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
                 [ss.client URLProtocol:ss didLoadData:data];
                 [ss.client URLProtocolDidFinishLoading:ss];
@@ -265,15 +388,12 @@ static NSString *const kMarker = @"X-BaiduIntercept";
     [_task resume];
 }
 
-- (void)stopLoading {
-    [_task cancel];
-    _task = nil;
-}
+- (void)stopLoading { [_task cancel]; _task = nil; }
 
 @end
 
 // ============================================================
-// Constructor — install all hooks
+// Constructor — install ALL hooks
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
@@ -293,26 +413,29 @@ static void initPrivacyHook(void) {
             }
         }
 
-        // ---- 2. UIDevice name hook ----
+        // ---- 2. UIDevice hooks ----
         Class deviceClass = objc_getClass("UIDevice");
         if (deviceClass) {
-            // name → fake device name
             Method nameM = class_getInstanceMethod(deviceClass, @selector(name));
             if (nameM) {
                 IMP nameImp = imp_implementationWithBlock(^NSString *(id s) {
-                    return getPersistent(@"fake.devname", ^NSString *{ return genDeviceName(); });
+                    return getPersistent(@"fake.devname", ^{ return genDeviceName(); });
                 });
                 class_replaceMethod(deviceClass, @selector(name), nameImp, method_getTypeEncoding(nameM));
             }
-
-            // identifierForVendor → fake NSUUID
             Method idfvM = class_getInstanceMethod(deviceClass, @selector(identifierForVendor));
             if (idfvM) {
                 IMP idfvImp = imp_implementationWithBlock(^NSUUID *(id s) {
-                    NSString *uuidStr = getPersistent(@"fake.idfv", ^NSString *{ return genUUIDStr(); });
+                    NSString *uuidStr = getPersistent(@"fake.idfv", ^{ return genUUIDStr(); });
                     return [[NSUUID alloc] initWithUUIDString:uuidStr];
                 });
                 class_replaceMethod(deviceClass, @selector(identifierForVendor), idfvImp, method_getTypeEncoding(idfvM));
+            }
+            // model → return fake model string
+            Method modelM = class_getInstanceMethod(deviceClass, @selector(model));
+            if (modelM) {
+                IMP modelImp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
+                class_replaceMethod(deviceClass, @selector(model), modelImp, method_getTypeEncoding(modelM));
             }
         }
 
@@ -322,14 +445,66 @@ static void initPrivacyHook(void) {
             Method idfaM = class_getInstanceMethod(asidClass, @selector(advertisingIdentifier));
             if (idfaM) {
                 IMP idfaImp = imp_implementationWithBlock(^NSUUID *(id s) {
-                    NSString *uuidStr = getPersistent(@"fake.idfa", ^NSString *{ return genUUIDStr(); });
+                    NSString *uuidStr = getPersistent(@"fake.idfa", ^{ return genUUIDStr(); });
                     return [[NSUUID alloc] initWithUUIDString:uuidStr];
                 });
                 class_replaceMethod(asidClass, @selector(advertisingIdentifier), idfaImp, method_getTypeEncoding(idfaM));
             }
         }
 
-        // ---- 4. Keychain clear (first launch only) ----
+        // ---- 4. NSUserDefaults hooks ----
+        Class udClass = objc_getClass("NSUserDefaults");
+        if (udClass) {
+            // objectForKey:
+            Method ofkM = class_getInstanceMethod(udClass, @selector(objectForKey:));
+            if (ofkM) {
+                IMP origOfk = method_getImplementation(ofkM);
+                IMP ofkImp = imp_implementationWithBlock(^id(id s, SEL _c, NSString *key) {
+                    if (isDeviceKey(key)) {
+                        NSString *fake = fakeValueForKey(key);
+                        if (fake) return fake;
+                    }
+                    return ((id (*)(id, SEL, NSString *))origOfk)(s, _c, key);
+                });
+                class_replaceMethod(udClass, @selector(objectForKey:), ofkImp, method_getTypeEncoding(ofkM));
+            }
+            // stringForKey:
+            Method sfkM = class_getInstanceMethod(udClass, @selector(stringForKey:));
+            if (sfkM) {
+                IMP origSfk = method_getImplementation(sfkM);
+                IMP sfkImp = imp_implementationWithBlock(^NSString *(id s, SEL _c, NSString *key) {
+                    if (isDeviceKey(key)) {
+                        NSString *fake = fakeValueForKey(key);
+                        if (fake) return fake;
+                    }
+                    return ((NSString *(*)(id, SEL, NSString *))origSfk)(s, _c, key);
+                });
+                class_replaceMethod(udClass, @selector(stringForKey:), sfkImp, method_getTypeEncoding(sfkM));
+            }
+        }
+
+        // ---- 5. NSURLSession swizzle ----
+        Class sessionClass = objc_getClass("NSURLSession");
+        if (sessionClass) {
+            Method dtM = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:));
+            if (dtM) {
+                orig_dataTaskWithRequest = method_getImplementation(dtM);
+                class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:),
+                    (IMP)hook_dataTaskWithRequest, method_getTypeEncoding(dtM));
+            }
+            Method dtcM = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:));
+            if (dtcM) {
+                orig_dataTaskWithRequestCompletion = method_getImplementation(dtcM);
+                class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:),
+                    (IMP)hook_dataTaskWithRequestCompletion, method_getTypeEncoding(dtcM));
+            }
+        }
+
+        // ---- 6. fishhook sysctlbyname ----
+        struct rebinding r = {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
+        rebind_symbols(&r, 1);
+
+        // ---- 7. Keychain clear (first launch only) ----
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         if (![ud boolForKey:@"keychain.cleared"]) {
             clearKeychain();
@@ -337,7 +512,7 @@ static void initPrivacyHook(void) {
             [ud synchronize];
         }
 
-        // ---- 5. Register NSURLProtocol ----
+        // ---- 8. NSURLProtocol (backup) ----
         [NSURLProtocol registerClass:[BaiduDeviceProtocol class]];
     }
 }
