@@ -19,11 +19,8 @@ CFLAGS  = -arch arm64 \
           -Wall \
           -Wno-deprecated-declarations
 
-# Force classic linker binary directly
-# ld_prime generates LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE (iOS 16 incompatible)
+# Force classic linker — ld_prime generates LC_DYLD_CHAINED_FIXUPS (iOS 16 incompatible)
 # ld_classic generates LC_DYLD_INFO_ONLY (iOS 16 compatible)
-LINKER := $(shell xcrun -f ld_classic 2>/dev/null || echo /usr/bin/ld_classic)
-
 LDFLAGS = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
@@ -34,7 +31,7 @@ LDFLAGS = -arch arm64 \
           -framework Security \
           -framework IOKit \
           -install_name @executable_path/PrivacyHook.dylib \
-          -fuse-ld=$(LINKER) \
+          -fuse-ld=ld_classic \
           -Wl,-weak_framework,AppTrackingTransparency
 
 MIN_LDFLAGS = -arch arm64 \
@@ -43,7 +40,7 @@ MIN_LDFLAGS = -arch arm64 \
           -dynamiclib \
           -framework Foundation \
           -install_name @executable_path/PrivacyHookMin.dylib \
-          -fuse-ld=$(LINKER)
+          -fuse-ld=ld_classic
 
 .PHONY: all clean
 
@@ -52,7 +49,6 @@ all: $(DYLIB) $(MIN_DYLIB)
 $(DYLIB): $(SRC)
 	@echo "=== Build Info ==="
 	@xcodebuild -version 2>/dev/null || true
-	@echo "Linker: $(LINKER)"
 	@echo "=================="
 	@echo "Building PrivacyHook.dylib (fuse-ld=ld_classic)..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
