@@ -1,7 +1,7 @@
 //
-// PrivacyHook.m — v6: Hook NSHTTPCookieStorage (the real source of CUID)
-// MITM proxy worked by replacing Cookie values. The cookies come from
-// NSHTTPCookieStorage, not from app code. Hook the cookie storage directly.
+// PrivacyHook.m — v7: Full-chain device spoof
+// NSHTTPCookieStorage (Cookie) + NSURLProtocol (URL params + POST body)
+// v6 only changed cookies but not URL/body params → "下单人数过多"
 //
 
 #import <Foundation/Foundation.h>
@@ -14,6 +14,7 @@
 
 static BOOL g_inUDHook = NO;
 static __thread BOOL g_inCookieHook = NO;
+static __thread BOOL g_inProtocol = NO;
 
 // ============================================================
 // Persistent fake IDs — uses CFPreferences to avoid recursion
@@ -119,6 +120,122 @@ static NSArray *modifiedCookies(NSArray *cookies) {
     }
     return result;
 }
+
+// ============================================================
+// Network request modification (URL params + POST body)
+// ============================================================
+static NSURL *replaceDeviceParamsInURL(NSURL *url) {
+    if (!url) return url;
+    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (!comp) return url;
+    NSArray *items = comp.queryItems;
+    if (!items || items.count == 0) return url;
+    BOOL modified = NO;
+    NSMutableArray *newItems = [NSMutableArray array];
+    for (NSURLQueryItem *item in items) {
+        NSString *n = item.name.lowercaseString;
+        if ([n isEqualToString:@"cuid"] || [n hasPrefix:@"cuid_"] ||
+            [n isEqualToString:@"cfrom"] || [n isEqualToString:@"c3_aid"]) {
+            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:getFakeID(@"cuid")]];
+            modified = YES;
+        } else { [newItems addObject:item]; }
+    }
+    if (modified) { comp.queryItems = newItems; return comp.URL ?: url; }
+    return url;
+}
+
+static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
+    if (!body || body.length == 0) return body;
+    if ([contentType containsString:@"json"]) {
+        NSError *err = nil;
+        NSMutableDictionary *json = [NSJSONSerialization JSONObjectWithData:body
+            options:NSJSONReadingMutableContainers error:&err];
+        if (err || !json || ![json isKindOfClass:[NSDictionary class]]) return body;
+        BOOL modified = NO;
+        for (NSString *key in [json allKeys]) {
+            NSString *lk = key.lowercaseString;
+            if ([lk isEqualToString:@"cuid"] || [lk hasPrefix:@"cuid"] ||
+                [lk isEqualToString:@"cfrom"] || [lk isEqualToString:@"c3_aid"]) {
+                json[key] = getFakeID(@"cuid"); modified = YES;
+            }
+        }
+        if (modified) return [NSJSONSerialization dataWithJSONObject:json options:0 error:nil] ?: body;
+    } else {
+        NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+        if (!bodyStr) return body;
+        NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
+        NSMutableArray *newPairs = [NSMutableArray array];
+        BOOL modified = NO;
+        for (NSString *pair in pairs) {
+            NSRange eq = [pair rangeOfString:@"="];
+            if (eq.location == NSNotFound) { [newPairs addObject:pair]; continue; }
+            NSString *name = [pair substringToIndex:eq.location];
+            NSString *lk = name.lowercaseString;
+            if ([lk isEqualToString:@"cuid"] || [lk hasPrefix:@"cuid"] ||
+                [lk isEqualToString:@"cfrom"] || [lk isEqualToString:@"c3_aid"]) {
+                [newPairs addObject:[NSString stringWithFormat:@"%@=%@", name, getFakeID(@"cuid")]];
+                modified = YES;
+            } else { [newPairs addObject:pair]; }
+        }
+        if (modified) return [[newPairs componentsJoinedByString:@"&"] dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    return body;
+}
+
+static BOOL isBaiduHost(NSString *host) {
+    if (!host) return NO;
+    return [host containsString:@"baidu"] || [host containsString:@"bdstatic"] ||
+           [host containsString:@"bdimg"] || [host containsString:@"hao123"];
+}
+
+static NSMutableURLRequest *modifiedRequest(NSURLRequest *req) {
+    NSMutableURLRequest *m = [req mutableCopy];
+    NSURL *newURL = replaceDeviceParamsInURL(m.URL);
+    if (newURL && ![newURL isEqual:m.URL]) [m setURL:newURL];
+    NSData *body = m.HTTPBody;
+    if (body) {
+        NSString *ct = [m valueForHTTPHeaderField:@"Content-Type"];
+        NSData *newBody = replaceDeviceParamsInBody(body, ct);
+        if (newBody && ![newBody isEqual:body]) [m setHTTPBody:newBody];
+    }
+    return m;
+}
+
+// ============================================================
+// NSURLProtocol — intercept URL params + POST body
+// ============================================================
+static NSString *const kMarker = @"X-Bdhk-Int";
+@interface BdhkProtocol : NSURLProtocol @end
+@implementation BdhkProtocol { NSURLSessionDataTask *_task; }
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if (g_inProtocol) return NO;
+    if (!isBaiduHost(request.URL.host)) return NO;
+    return ![[request valueForHTTPHeaderField:kMarker] isEqualToString:@"1"];
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+- (void)startLoading {
+    NSMutableURLRequest *req = modifiedRequest(self.request);
+    [req setValue:@"1" forHTTPHeaderField:kMarker];
+    g_inProtocol = YES;
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.protocolClasses = @[];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    g_inProtocol = NO;
+    __weak typeof(self) ws = self;
+    _task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        __strong typeof(ws) ss = ws;
+        if (!ss) return;
+        if (error) [ss.client URLProtocol:ss didFailWithError:error];
+        else {
+            [ss.client URLProtocol:ss didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [ss.client URLProtocol:ss didLoadData:data];
+            [ss.client URLProtocolDidFinishLoading:ss];
+        }
+    }];
+    [_task resume];
+}
+- (void)stopLoading { [_task cancel]; _task = nil; }
+@end
 
 // ============================================================
 // Keychain clear
@@ -408,5 +525,27 @@ static void initPrivacyHook(void) {
                 }
             }
         } @catch (id e) {}
+
+        // ---- 9. Hook NSURLSessionConfiguration.protocolClasses ----
+        @try {
+            Class cfgClass = objc_getClass(@"NSURLSessionConfiguration");
+            if (cfgClass) {
+                Method pcM = class_getInstanceMethod(cfgClass, @selector(protocolClasses));
+                if (pcM) {
+                    IMP origPC = method_getImplementation(pcM);
+                    IMP newPC = imp_implementationWithBlock(^NSArray *(id s) {
+                        if (g_inProtocol) return ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
+                        NSArray *orig = ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
+                        NSMutableArray *arr = [NSMutableArray arrayWithArray:orig ?: @[]];
+                        if (![arr containsObject:[BdhkProtocol class]]) [arr insertObject:[BdhkProtocol class] atIndex:0];
+                        return arr;
+                    });
+                    class_replaceMethod(cfgClass, @selector(protocolClasses), newPC, method_getTypeEncoding(pcM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 10. Register NSURLProtocol globally ----
+        @try { [NSURLProtocol registerClass:[BdhkProtocol class]]; } @catch (id e) {}
     }
 }
