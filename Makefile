@@ -1,6 +1,6 @@
 #
 # Makefile for PrivacyHook.dylib
-# Force ld_classic via -fuse-ld to generate iOS 16-compatible Mach-O
+# Force traditional dyld info format for iOS 16 compatibility
 #
 
 DYLIB = PrivacyHook.dylib
@@ -19,8 +19,8 @@ CFLAGS  = -arch arm64 \
           -Wall \
           -Wno-deprecated-declarations
 
-# Force classic linker — ld_prime generates LC_DYLD_CHAINED_FIXUPS (iOS 16 incompatible)
-# ld_classic generates LC_DYLD_INFO_ONLY (iOS 16 compatible)
+# -no_fixup_chains tells ld_prime to use traditional LC_DYLD_INFO_ONLY
+# instead of LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE
 LDFLAGS = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
@@ -31,7 +31,7 @@ LDFLAGS = -arch arm64 \
           -framework Security \
           -framework IOKit \
           -install_name @executable_path/PrivacyHook.dylib \
-          -fuse-ld=ld_classic \
+          -Xlinker -no_fixup_chains \
           -Wl,-weak_framework,AppTrackingTransparency
 
 MIN_LDFLAGS = -arch arm64 \
@@ -40,7 +40,7 @@ MIN_LDFLAGS = -arch arm64 \
           -dynamiclib \
           -framework Foundation \
           -install_name @executable_path/PrivacyHookMin.dylib \
-          -fuse-ld=ld_classic
+          -Xlinker -no_fixup_chains
 
 .PHONY: all clean
 
@@ -50,7 +50,7 @@ $(DYLIB): $(SRC)
 	@echo "=== Build Info ==="
 	@xcodebuild -version 2>/dev/null || true
 	@echo "=================="
-	@echo "Building PrivacyHook.dylib (fuse-ld=ld_classic)..."
+	@echo "Building PrivacyHook.dylib (-Xlinker -no_fixup_chains)..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
 	@echo "=== Verify: no chained fixups ==="
