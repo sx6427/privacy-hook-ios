@@ -1,10 +1,9 @@
 #
-# Makefile — Comprehensive device fingerprint spoofing
-# Hooks: sysctl + NSUserDefaults + NSURLSession + UIDevice + IDFA + Bundle ID
+# Makefile — Device fingerprint spoofing (crash-free, no fishhook)
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m fishhook.c
+SRC   = PrivacyHook.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
@@ -29,9 +28,9 @@ LDFLAGS = -arch arm64 \
 
 all: $(DYLIB)
 
-$(DYLIB): $(SRC) fishhook.h
-	@echo "Building PrivacyHook.dylib (full device spoof)..."
-	clang $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
+$(DYLIB): $(SRC)
+	@echo "Building PrivacyHook.dylib (safe device spoof)..."
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
 	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "FAIL!" || echo "OK: no chained fixups"
 	@otool -L $@
