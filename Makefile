@@ -1,6 +1,6 @@
 #
 # Makefile for PrivacyHook.dylib
-# Uses ld_classic to generate iOS 16-compatible Mach-O
+# Force ld_classic via -fuse-ld to generate iOS 16-compatible Mach-O
 #
 
 DYLIB = PrivacyHook.dylib
@@ -19,7 +19,11 @@ CFLAGS  = -arch arm64 \
           -Wall \
           -Wno-deprecated-declarations
 
-# Use classic linker — ld_prime generates LC_DYLD_CHAINED_FIXUPS which iOS 16 dyld doesn't support
+# Force classic linker binary directly
+# ld_prime generates LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE (iOS 16 incompatible)
+# ld_classic generates LC_DYLD_INFO_ONLY (iOS 16 compatible)
+LINKER := $(shell xcrun -f ld_classic 2>/dev/null || echo /usr/bin/ld_classic)
+
 LDFLAGS = -arch arm64 \
           -isysroot $(SDKROOT) \
           -miphoneos-version-min=14.0 \
@@ -30,7 +34,7 @@ LDFLAGS = -arch arm64 \
           -framework Security \
           -framework IOKit \
           -install_name @executable_path/PrivacyHook.dylib \
-          -Wl,-ld_classic \
+          -fuse-ld=$(LINKER) \
           -Wl,-weak_framework,AppTrackingTransparency
 
 MIN_LDFLAGS = -arch arm64 \
@@ -39,22 +43,26 @@ MIN_LDFLAGS = -arch arm64 \
           -dynamiclib \
           -framework Foundation \
           -install_name @executable_path/PrivacyHookMin.dylib \
-          -Wl,-ld_classic
+          -fuse-ld=$(LINKER)
 
 .PHONY: all clean
 
 all: $(DYLIB) $(MIN_DYLIB)
 
 $(DYLIB): $(SRC)
-	@echo "Building PrivacyHook.dylib (ld_classic)..."
+	@echo "=== Build Info ==="
+	@xcodebuild -version 2>/dev/null || true
+	@echo "Linker: $(LINKER)"
+	@echo "=================="
+	@echo "Building PrivacyHook.dylib (fuse-ld=ld_classic)..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
-	@echo "=== Verify: load commands ==="
-	@otool -l $@ | grep -E "cmd |cmdsize" | head -50
 	@echo "=== Verify: no chained fixups ==="
-	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "WARNING: chained fixups present!" || echo "OK: no chained fixups"
-	@echo "=== Verify: dyld info ==="
-	@otool -l $@ | grep "LC_DYLD_INFO" && echo "OK: has LC_DYLD_INFO" || echo "WARNING: no LC_DYLD_INFO"
+	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "FAIL: chained fixups present!" || echo "OK: no chained fixups"
+	@echo "=== Verify: has dyld info ==="
+	@otool -l $@ | grep "LC_DYLD_INFO" && echo "OK: has LC_DYLD_INFO" || echo "FAIL: no LC_DYLD_INFO"
+	@echo "=== All load commands ==="
+	@otool -l $@ | grep -E "cmd " | head -30
 	@file $@
 
 $(MIN_DYLIB): $(MIN_SRC)
