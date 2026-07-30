@@ -359,7 +359,7 @@ static void initPrivacyHook(void) {
                 Method ofkM = class_getInstanceMethod(udClass, @selector(objectForKey:));
                 if (ofkM) {
                     IMP origOfk = method_getImplementation(ofkM);
-                    IMP ofkImp = imp_implementationWithBlock(^id(id s, SEL _c, NSString *key) {
+                    IMP ofkImp = imp_implementationWithBlock(^id(id s, NSString *key) {
                         if (!g_inHook && isDeviceKey(key)) {
                             g_inHook = YES;
                             @try {
@@ -370,7 +370,7 @@ static void initPrivacyHook(void) {
                                 g_inHook = NO;
                             }
                         }
-                        return ((id (*)(id, SEL, NSString *))origOfk)(s, _c, key);
+                        return ((id (*)(id, SEL, NSString *))origOfk)(s, @selector(objectForKey:), key);
                     });
                     class_replaceMethod(udClass, @selector(objectForKey:), ofkImp, method_getTypeEncoding(ofkM));
                 }
@@ -378,7 +378,7 @@ static void initPrivacyHook(void) {
                 Method sfkM = class_getInstanceMethod(udClass, @selector(stringForKey:));
                 if (sfkM) {
                     IMP origSfk = method_getImplementation(sfkM);
-                    IMP sfkImp = imp_implementationWithBlock(^NSString *(id s, SEL _c, NSString *key) {
+                    IMP sfkImp = imp_implementationWithBlock(^NSString *(id s, NSString *key) {
                         if (!g_inHook && isDeviceKey(key)) {
                             g_inHook = YES;
                             @try {
@@ -389,7 +389,7 @@ static void initPrivacyHook(void) {
                                 g_inHook = NO;
                             }
                         }
-                        return ((NSString *(*)(id, SEL, NSString *))origSfk)(s, _c, key);
+                        return ((NSString *(*)(id, SEL, NSString *))origSfk)(s, @selector(stringForKey:), key);
                     });
                     class_replaceMethod(udClass, @selector(stringForKey:), sfkImp, method_getTypeEncoding(sfkM));
                 }
