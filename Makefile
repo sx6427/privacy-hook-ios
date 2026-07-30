@@ -21,7 +21,7 @@ CFLAGS  = -arch arm64 \
           -Wall \
           -Wno-deprecated-declarations
 
-# Linker flags
+# Linker flags — -ld_classic uses old linker (ld_prime generates incompatible Mach-O)
 LDFLAGS = -arch arm64 \
           -target arm64-apple-ios14.0 \
           -isysroot $(SDKROOT) \
@@ -33,6 +33,7 @@ LDFLAGS = -arch arm64 \
           -framework Security \
           -framework IOKit \
           -install_name @executable_path/PrivacyHook.dylib \
+          -Wl,-ld_classic \
           -Wl,-no_fixup_chains \
           -Wl,-weak_framework,AppTrackingTransparency
 
@@ -42,7 +43,9 @@ MIN_LDFLAGS = -arch arm64 \
           -miphoneos-version-min=14.0 \
           -dynamiclib \
           -framework Foundation \
-          -install_name @executable_path/PrivacyHookMin.dylib
+          -install_name @executable_path/PrivacyHookMin.dylib \
+          -Wl,-ld_classic \
+          -Wl,-no_fixup_chains
 
 .PHONY: all clean
 
