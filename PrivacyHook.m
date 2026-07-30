@@ -1,8 +1,7 @@
 //
-// PrivacyHook.m — Device fingerprint spoofing v2
-// Key fix: hook NSURLSessionConfiguration.protocolClasses so ALL sessions
-// use our NSURLProtocol (Baidu uses custom sessions, not default)
-// + purge device IDs from NSUserDefaults on launch
+// PrivacyHook.m — Device fingerprint spoofing v3 (crash-free)
+// Fix: thread-local guard prevents NSURLProtocol recursion
+// Fix: exact key matching prevents false positives in NSUserDefaults
 //
 
 #import <Foundation/Foundation.h>
@@ -13,10 +12,11 @@
 
 #define NSLog(...)
 
-static BOOL g_inHook = NO;
+static BOOL g_inUDHook = NO;
+static __thread BOOL g_inProtocol = NO;  // thread-local: prevent NSURLProtocol recursion
 
 // ============================================================
-// Persistent fake IDs — uses CFPreferences to avoid recursion
+// Persistent fake IDs — uses CFPreferences to avoid NSUserDefaults hook
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -88,30 +88,32 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// Purge ALL device IDs from NSUserDefaults on launch
+// Purge specific baidu device keys from NSUserDefaults
 // ============================================================
 static void purgeDeviceIDs(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    // Only purge exact known baidu keys — don't use broad matching
+    NSArray *keysToPurge = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
+                             @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                             @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                             @"bdudid", @"baiduid", @"bdid",
+                             @"device_id", @"deviceId",
+                             @"BaiduBoxApp.cuid", @"BaiduBoxApp.CUID",
+                             @"baidu_cuid", @"BaiduBoxCuid",
+                             @"com.baidu.cuid"];
+    for (NSString *key in keysToPurge) {
+        if ([ud objectForKey:key]) {
+            [ud removeObjectForKey:key];
+        }
+    }
+    // Also scan for keys with exact "cuid" prefix (case insensitive)
     NSDictionary *all = [ud dictionaryRepresentation];
-
-    // Broad matching: any key containing these substrings
-    NSArray *patterns = @[@"cuid", @"dvif", @"tcuid", @"bid_n", @"fuid",
-                          @"device", @"udid", @"bdudid", @"baiduid", @"bdid",
-                          @"idfa", @"idfv", @"imei", @"serial", @"mac",
-                          @"android_id", @"uuid", @"guid"];
-
     for (NSString *key in [all allKeys]) {
+        if ([key hasPrefix:@"Bdhk"]) continue;
         NSString *lk = [key lowercaseString];
-        // Skip our own keys
-        if ([lk hasPrefix:@"bdhk"]) continue;
-        // Skip system keys
-        if ([lk hasPrefix:@"apple"] || [lk hasPrefix:@"ak"] || [lk hasPrefix:@"ns"] || [lk hasPrefix:@"ui"]) continue;
-
-        for (NSString *p in patterns) {
-            if ([lk containsString:p]) {
-                [ud removeObjectForKey:key];
-                break;
-            }
+        // Only match keys that START with "cuid" — very precise
+        if ([lk hasPrefix:@"cuid"] || [lk isEqualToString:@"bdudid"] || [lk isEqualToString:@"baiduid"]) {
+            [ud removeObjectForKey:key];
         }
     }
     [ud synchronize];
@@ -132,7 +134,6 @@ static NSString *replaceDeviceCookiesInString(NSString *cookie) {
             range:NSMakeRange(0, modified.length)
             withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
     }
-    // standalone cuid=
     NSRegularExpression *cuidRegex = [NSRegularExpression
         regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
     modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
@@ -228,12 +229,11 @@ static NSString *const kMarker = @"X-Bdhk-Int";
 @implementation BdhkProtocol { NSURLSessionDataTask *_task; }
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if (g_inProtocol) return NO;  // prevent recursion from our own session
     NSString *host = request.URL.host;
     if (!host) return NO;
-    // Broader host matching
     if (![host containsString:@"baidu"] && ![host containsString:@"bdstatic"] &&
-        ![host containsString:@"bdimg"] && ![host containsString:@"baidustatic"] &&
-        ![host containsString:@"hao123"]) return NO;
+        ![host containsString:@"bdimg"] && ![host containsString:@"hao123"]) return NO;
     return ![[request valueForHTTPHeaderField:kMarker] isEqualToString:@"1"];
 }
 
@@ -242,10 +242,16 @@ static NSString *const kMarker = @"X-Bdhk-Int";
 - (void)startLoading {
     NSMutableURLRequest *req = modifiedRequest(self.request);
     [req setValue:@"1" forHTTPHeaderField:kMarker];
+
+    // Set thread-local flag so protocolClasses hook skips us
+    g_inProtocol = YES;
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.protocolClasses = @[];
+    config.protocolClasses = @[];  // extra safety
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    g_inProtocol = NO;
+
     __weak typeof(self) ws = self;
-    _task = [[NSURLSession sessionWithConfiguration:config] dataTaskWithRequest:req
+    _task = [session dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
             __strong typeof(ws) ss = ws;
             if (!ss) return;
@@ -263,20 +269,22 @@ static NSString *const kMarker = @"X-Bdhk-Int";
 @end
 
 // ============================================================
-// NSUserDefaults device key matching (broad)
+// NSUserDefaults — exact key matching only (no containsString)
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
-    if (!key || g_inHook) return NO;
-    NSString *lk = [key lowercaseString];
-    if ([lk hasPrefix:@"bdhk"]) return NO;  // skip our own keys
-    if ([lk hasPrefix:@"apple"] || [lk hasPrefix:@"ak"] || [lk hasPrefix:@"ns"] || [lk hasPrefix:@"ui"]) return NO;
+    if (!key || g_inUDHook) return NO;
+    if ([key hasPrefix:@"Bdhk"]) return NO;
 
-    NSArray *patterns = @[@"cuid", @"dvif", @"tcuid", @"bid_n", @"fuid",
-                          @"device", @"udid", @"bdudid", @"baiduid", @"bdid",
-                          @"idfa", @"idfv", @"imei", @"serial"];
-    for (NSString *p in patterns) {
-        if ([lk containsString:p]) return YES;
+    // Exact match only — never use containsString
+    NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
+                           @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                           @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                           @"bdudid", @"baiduid", @"bdid"];
+    for (NSString *k in exactKeys) {
+        if ([key isEqualToString:k]) return YES;
     }
+    // Keys starting with "cuid" (but not "Bdhk")
+    if ([key.lowercaseString hasPrefix:@"cuid"]) return YES;
     return NO;
 }
 
@@ -287,7 +295,7 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. Purge device IDs from NSUserDefaults ----
+        // ---- 1. Purge device IDs ----
         @try { purgeDeviceIDs(); } @catch (id e) {}
 
         // ---- 2. Keychain clear (first launch) ----
@@ -361,7 +369,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. NSUserDefaults hooks (with recursion guard) ----
+        // ---- 6. NSUserDefaults hooks (exact match, recursion guard) ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
@@ -369,10 +377,10 @@ static void initPrivacyHook(void) {
                 if (ofkM) {
                     IMP orig = method_getImplementation(ofkM);
                     IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
-                        if (!g_inHook && isDeviceKey(key)) {
-                            g_inHook = YES;
-                            @try { NSString *f = getFakeID(@"cuid"); g_inHook = NO; return f; }
-                            @catch (id e) { g_inHook = NO; }
+                        if (!g_inUDHook && isDeviceKey(key)) {
+                            g_inUDHook = YES;
+                            @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
+                            @catch (id e) { g_inUDHook = NO; }
                         }
                         return ((id (*)(id, SEL, NSString *))orig)(s, @selector(objectForKey:), key);
                     });
@@ -382,10 +390,10 @@ static void initPrivacyHook(void) {
                 if (sfkM) {
                     IMP orig = method_getImplementation(sfkM);
                     IMP imp = imp_implementationWithBlock(^NSString *(id s, NSString *key) {
-                        if (!g_inHook && isDeviceKey(key)) {
-                            g_inHook = YES;
-                            @try { NSString *f = getFakeID(@"cuid"); g_inHook = NO; return f; }
-                            @catch (id e) { g_inHook = NO; }
+                        if (!g_inUDHook && isDeviceKey(key)) {
+                            g_inUDHook = YES;
+                            @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
+                            @catch (id e) { g_inUDHook = NO; }
                         }
                         return ((NSString *(*)(id, SEL, NSString *))orig)(s, @selector(stringForKey:), key);
                     });
@@ -394,9 +402,9 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. CRITICAL: Hook NSURLSessionConfiguration.protocolClasses ----
-        // This ensures ALL NSURLSessions (including Baidu's custom ones)
-        // use our NSURLProtocol. registerClass: only works for default session.
+        // ---- 7. Hook NSURLSessionConfiguration.protocolClasses ----
+        // Thread-local guard prevents recursion: when BdhkProtocol creates
+        // its own session, g_inProtocol=YES skips this hook
         @try {
             Class sc = objc_getClass("NSURLSessionConfiguration");
             if (sc) {
@@ -404,6 +412,10 @@ static void initPrivacyHook(void) {
                 if (pcM) {
                     IMP origPC = method_getImplementation(pcM);
                     IMP newPC = imp_implementationWithBlock(^NSArray *(id s) {
+                        // Skip when inside our own BdhkProtocol
+                        if (g_inProtocol) {
+                            return ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
+                        }
                         NSArray *orig = ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
                         NSMutableArray *arr = [NSMutableArray arrayWithArray:orig ?: @[]];
                         if (![arr containsObject:[BdhkProtocol class]]) {
@@ -416,7 +428,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 8. Also register globally (backup for default session) ----
+        // ---- 8. Register globally (backup) ----
         @try { [NSURLProtocol registerClass:[BdhkProtocol class]]; } @catch (id e) {}
     }
 }
