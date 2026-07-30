@@ -1,11 +1,12 @@
 //
-//  PrivacyHook.m
-//  最小化测试版本 — 什么都不做，只验证 dylib 注入是否正常
+// PrivacyHookMin.m — EMPTY dylib for crash isolation
+// Does literally nothing. If this crashes, it's a binary format issue.
+// If this doesn't crash, the problem is in the hook code.
 //
 
 #import <Foundation/Foundation.h>
 
 __attribute__((constructor))
-static void initPrivacyHook(void) {
-    // 什么都不做
+static void initMinimal(void) {
+    // Do nothing. Just test if the dylib loads.
 }
