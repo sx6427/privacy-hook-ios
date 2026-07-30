@@ -1,5 +1,5 @@
 #
-# Makefile — v8: device spoof + payment compatible
+# Makefile — v9: Step33 + Cookie hooks
 #
 
 DYLIB = PrivacyHook.dylib
