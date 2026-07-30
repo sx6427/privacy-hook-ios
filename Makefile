@@ -1,6 +1,5 @@
 #
-# Makefile for building PrivacyHook.dylib
-# Post-processes binary for iOS 16 compatibility (Xcode 26 runner workaround)
+# Makefile — minimal, no post-processing, pure ld_classic
 #
 
 DYLIB = PrivacyHook.dylib
@@ -11,7 +10,6 @@ MIN_SRC   = PrivacyHookMin.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
-# Compiler flags — explicit target triple for iOS 14 compat
 CFLAGS  = -arch arm64 \
           -target arm64-apple-ios14.0 \
           -isysroot $(SDKROOT) \
@@ -21,7 +19,6 @@ CFLAGS  = -arch arm64 \
           -Wall \
           -Wno-deprecated-declarations
 
-# Linker flags — -ld_classic uses old linker (ld_prime generates incompatible Mach-O)
 LDFLAGS = -arch arm64 \
           -target arm64-apple-ios14.0 \
           -isysroot $(SDKROOT) \
@@ -34,7 +31,6 @@ LDFLAGS = -arch arm64 \
           -framework IOKit \
           -install_name @executable_path/PrivacyHook.dylib \
           -Wl,-ld_classic \
-          -Wl,-no_fixup_chains \
           -Wl,-weak_framework,AppTrackingTransparency
 
 MIN_LDFLAGS = -arch arm64 \
@@ -44,8 +40,7 @@ MIN_LDFLAGS = -arch arm64 \
           -dynamiclib \
           -framework Foundation \
           -install_name @executable_path/PrivacyHookMin.dylib \
-          -Wl,-ld_classic \
-          -Wl,-no_fixup_chains
+          -Wl,-ld_classic
 
 .PHONY: all clean
 
@@ -56,28 +51,19 @@ $(DYLIB): $(SRC)
 	@xcodebuild -version 2>/dev/null || true
 	@echo "SDK: $(SDKROOT)"
 	@echo "=================="
-	@echo "Building PrivacyHook.dylib..."
+	@echo "Building PrivacyHook.dylib (no post-processing)..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
-
-	@echo "=== Post-build: vtool (set SDK 16.0) ==="
-	-vtool -set-build-version ios 14.0 16.0 -output $@.tmp $@ && mv $@.tmp $@
-	@echo "vtool done"
-
-	@echo "=== Post-build: strip LC_OBJC_LINK_LAYOUT ==="
-	-python3 strip_load_cmds.py $@ || echo "strip script not found or failed (non-fatal)"
-
 	@echo "=== Diagnostics ==="
 	@echo "--- otool -L ---"
 	@otool -L $@
-	@echo "--- LC_BUILD_VERSION / LC_DYLD / LC_OBJC ---"
-	@otool -l $@ | grep -A5 "LC_BUILD_VERSION\|LC_DYLD_INFO\|LC_DYLD_CHAINED\|LC_OBJC_LINK_LAYOUT\|LC_OBJC_DYLD_INFO" || echo "(none found)"
 	@echo "--- file ---"
 	@file $@
+	@echo "--- otool -l (load commands) ---"
+	@otool -l $@ | grep -E "cmd |cmdsize|LC_" | head -40
 
 $(MIN_DYLIB): $(MIN_SRC)
 	@echo "Building PrivacyHookMin.dylib..."
 	clang $(CFLAGS) $(MIN_LDFLAGS) -o $@ $<
-	-vtool -set-build-version ios 14.0 16.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "Done: $(MIN_DYLIB)"
 
 clean:
