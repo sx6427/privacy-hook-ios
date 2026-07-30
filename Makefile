@@ -1,5 +1,5 @@
 #
-# Makefile — Foundation only: Bundle ID hook + NSURLProtocol device ID replacement
+# Makefile — Device fingerprint spoofing + Bundle ID + NSURLProtocol
 #
 
 DYLIB = PrivacyHook.dylib
@@ -18,6 +18,9 @@ LDFLAGS = -arch arm64 \
           -miphoneos-version-min=14.0 \
           -dynamiclib \
           -framework Foundation \
+          -framework UIKit \
+          -framework AdSupport \
+          -framework Security \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
@@ -26,10 +29,11 @@ LDFLAGS = -arch arm64 \
 all: $(DYLIB)
 
 $(DYLIB): $(SRC)
-	@echo "Building PrivacyHook.dylib (Bundle ID + NSURLProtocol)..."
+	@echo "Building PrivacyHook.dylib (device spoof + NSURLProtocol)..."
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "Done: $(DYLIB)"
 	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "FAIL!" || echo "OK: no chained fixups"
+	@otool -L $@
 	@file $@
 
 clean:
