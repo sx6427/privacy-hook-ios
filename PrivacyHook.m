@@ -1,11 +1,7 @@
 //
-// PrivacyHook.m — Device fingerprint spoofing v5
-// Based on memory file lessons:
-//   - DO NOT delete files (breaks payment)
-//   - DO NOT hook sysctl (useless on iOS)
-//   - DO NOT purge UserDefaults aggressively (breaks payment)
-// Key fix: swizzle NSURLSession dataTaskWithRequest: directly
-//   (NSURLProtocol may not intercept Baidu's custom network stack)
+// PrivacyHook.m — v6: Hook NSHTTPCookieStorage (the real source of CUID)
+// MITM proxy worked by replacing Cookie values. The cookies come from
+// NSHTTPCookieStorage, not from app code. Hook the cookie storage directly.
 //
 
 #import <Foundation/Foundation.h>
@@ -17,7 +13,7 @@
 #define NSLog(...)
 
 static BOOL g_inUDHook = NO;
-static __thread BOOL g_inHook = NO;  // thread-local: prevent network hook recursion
+static __thread BOOL g_inCookieHook = NO;
 
 // ============================================================
 // Persistent fake IDs — uses CFPreferences to avoid recursion
@@ -83,7 +79,49 @@ static NSString *getFakeID(NSString *name) {
 }
 
 // ============================================================
-// Keychain clear (first launch only, per memory file)
+// Check if a cookie name is a device ID cookie
+// ============================================================
+static BOOL isDeviceCookie(NSString *cookieName) {
+    if (!cookieName) return NO;
+    NSString *lk = [cookieName lowercaseString];
+    NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
+                       @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid"];
+    for (NSString *n in names) {
+        if ([lk isEqualToString:n]) return YES;
+    }
+    return NO;
+}
+
+// ============================================================
+// Replace device cookies in a cookie array
+// ============================================================
+static NSArray *modifiedCookies(NSArray *cookies) {
+    if (!cookies || cookies.count == 0) return cookies;
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSHTTPCookie *cookie in cookies) {
+        if (isDeviceCookie(cookie.name)) {
+            // Create a modified cookie with fake value
+            NSString *fakeValue = getFakeID(cookie.name);
+            NSMutableDictionary *props = [NSMutableDictionary dictionary];
+            props[NSHTTPCookieName] = cookie.name;
+            props[NSHTTPCookieValue] = fakeValue;
+            if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
+            if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
+            if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
+            props[NSHTTPCookieVersion] = @(cookie.version);
+            if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
+            NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
+            if (newCookie) [result addObject:newCookie];
+            else [result addObject:cookie];
+        } else {
+            [result addObject:cookie];
+        }
+    }
+    return result;
+}
+
+// ============================================================
+// Keychain clear
 // ============================================================
 static void clearKeychain(void) {
     NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
@@ -92,163 +130,15 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// Network request modification
+// Clear HTTP cookie storage (forces fresh cookies with our fake IDs)
 // ============================================================
-static NSString *replaceDeviceCookiesInString(NSString *cookie) {
-    NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID", @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
-    NSString *modified = cookie;
-    for (NSString *name in names) {
-        NSString *fake = getFakeID(name);
-        NSRegularExpression *regex = [NSRegularExpression
-            regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
-            options:NSRegularExpressionCaseInsensitive error:nil];
-        modified = [regex stringByReplacingMatchesInString:modified options:0
-            range:NSMakeRange(0, modified.length)
-            withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
+static void clearCookieStorage(void) {
+    NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    NSArray *cookies = [storage cookies];
+    for (NSHTTPCookie *cookie in cookies) {
+        [storage deleteCookie:cookie];
     }
-    // standalone cuid= (not BAIDUCUID= etc)
-    NSRegularExpression *cuidRegex = [NSRegularExpression
-        regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
-    modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
-        range:NSMakeRange(0, modified.length)
-        withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
-    return modified;
 }
-
-static NSURL *replaceDeviceParamsInURL(NSURL *url) {
-    if (!url) return url;
-    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-    if (!comp) return url;
-    NSArray *items = comp.queryItems;
-    if (!items || items.count == 0) return url;
-
-    BOOL modified = NO;
-    NSMutableArray *newItems = [NSMutableArray array];
-    for (NSURLQueryItem *item in items) {
-        NSString *n = item.name.lowercaseString;
-        if ([n isEqualToString:@"cuid"] || [n hasPrefix:@"cuid_"] ||
-            [n isEqualToString:@"cfrom"] || [n isEqualToString:@"c3_aid"]) {
-            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:getFakeID(@"cuid")]];
-            modified = YES;
-        } else { [newItems addObject:item]; }
-    }
-    if (modified) { comp.queryItems = newItems; return comp.URL ?: url; }
-    return url;
-}
-
-static NSData *replaceDeviceParamsInBody(NSData *body, NSString *contentType) {
-    if (!body || body.length == 0) return body;
-
-    if ([contentType containsString:@"json"]) {
-        NSError *err = nil;
-        NSMutableDictionary *json = [NSJSONSerialization JSONObjectWithData:body
-            options:NSJSONReadingMutableContainers error:&err];
-        if (err || !json || ![json isKindOfClass:[NSDictionary class]]) return body;
-
-        BOOL modified = NO;
-        for (NSString *key in [json allKeys]) {
-            NSString *lk = key.lowercaseString;
-            if ([lk isEqualToString:@"cuid"] || [lk hasPrefix:@"cuid"] ||
-                [lk isEqualToString:@"cfrom"] || [lk isEqualToString:@"c3_aid"]) {
-                json[key] = getFakeID(@"cuid"); modified = YES;
-            }
-        }
-        if (modified) return [NSJSONSerialization dataWithJSONObject:json options:0 error:nil] ?: body;
-    } else {
-        NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-        if (!bodyStr) return body;
-        NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
-        NSMutableArray *newPairs = [NSMutableArray array];
-        BOOL modified = NO;
-        for (NSString *pair in pairs) {
-            NSRange eq = [pair rangeOfString:@"="];
-            if (eq.location == NSNotFound) { [newPairs addObject:pair]; continue; }
-            NSString *name = [pair substringToIndex:eq.location];
-            NSString *lk = name.lowercaseString;
-            if ([lk isEqualToString:@"cuid"] || [lk hasPrefix:@"cuid"] ||
-                [lk isEqualToString:@"cfrom"] || [lk isEqualToString:@"c3_aid"]) {
-                [newPairs addObject:[NSString stringWithFormat:@"%@=%@", name, getFakeID(@"cuid")]];
-                modified = YES;
-            } else { [newPairs addObject:pair]; }
-        }
-        if (modified) return [[newPairs componentsJoinedByString:@"&"] dataUsingEncoding:NSUTF8StringEncoding];
-    }
-    return body;
-}
-
-static BOOL isBaiduHost(NSString *host) {
-    if (!host) return NO;
-    return [host containsString:@"baidu"] || [host containsString:@"bdstatic"] ||
-           [host containsString:@"bdimg"] || [host containsString:@"hao123"] ||
-           [host containsString:@"baidustatic"];
-}
-
-static NSMutableURLRequest *modifiedRequest(NSURLRequest *req) {
-    NSMutableURLRequest *m = [req mutableCopy];
-
-    // 1. Cookie header
-    NSString *cookie = [m valueForHTTPHeaderField:@"Cookie"];
-    if (cookie.length > 0)
-        [m setValue:replaceDeviceCookiesInString(cookie) forHTTPHeaderField:@"Cookie"];
-
-    // 2. URL query params
-    NSURL *newURL = replaceDeviceParamsInURL(m.URL);
-    if (newURL && ![newURL isEqual:m.URL]) [m setURL:newURL];
-
-    // 3. POST body
-    NSData *body = m.HTTPBody;
-    if (body) {
-        NSString *ct = [m valueForHTTPHeaderField:@"Content-Type"];
-        NSData *newBody = replaceDeviceParamsInBody(body, ct);
-        if (newBody && ![newBody isEqual:body]) [m setHTTPBody:newBody];
-    }
-    return m;
-}
-
-// ============================================================
-// NSURLProtocol (backup layer)
-// ============================================================
-static NSString *const kMarker = @"X-Bdhk-Int";
-
-@interface BdhkProtocol : NSURLProtocol @end
-
-@implementation BdhkProtocol { NSURLSessionDataTask *_task; }
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if (g_inHook) return NO;
-    if (!isBaiduHost(request.URL.host)) return NO;
-    return ![[request valueForHTTPHeaderField:kMarker] isEqualToString:@"1"];
-}
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
-
-- (void)startLoading {
-    NSMutableURLRequest *req = modifiedRequest(self.request);
-    [req setValue:@"1" forHTTPHeaderField:kMarker];
-
-    g_inHook = YES;
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.protocolClasses = @[];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-    g_inHook = NO;
-
-    __weak typeof(self) ws = self;
-    _task = [session dataTaskWithRequest:req
-        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            __strong typeof(ws) ss = ws;
-            if (!ss) return;
-            if (error) [ss.client URLProtocol:ss didFailWithError:error];
-            else {
-                [ss.client URLProtocol:ss didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-                [ss.client URLProtocol:ss didLoadData:data];
-                [ss.client URLProtocolDidFinishLoading:ss];
-            }
-        }];
-    [_task resume];
-}
-
-- (void)stopLoading { [_task cancel]; _task = nil; }
-@end
 
 // ============================================================
 // NSUserDefaults — exact key matching
@@ -274,7 +164,29 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. Bundle ID hook (payment critical) ----
+        // ---- 1. Clear cookie storage (first launch) ----
+        // This is THE key fix. Old CUID cookies must be deleted so the
+        // server doesn't recognize the device.
+        @try {
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.cc"), kCFPreferencesCurrentApplication);
+            if (!cleared) {
+                clearCookieStorage();
+                CFPreferencesSetAppValue(CFSTR("Bdhk.cc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            } else { CFRelease(cleared); }
+        } @catch (id e) {}
+
+        // ---- 2. Clear keychain (first launch) ----
+        @try {
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.kc"), kCFPreferencesCurrentApplication);
+            if (!cleared) {
+                clearKeychain();
+                CFPreferencesSetAppValue(CFSTR("Bdhk.kc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            } else { CFRelease(cleared); }
+        } @catch (id e) {}
+
+        // ---- 3. Bundle ID hook (payment critical) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -290,7 +202,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 2. UIDevice hooks ----
+        // ---- 4. UIDevice hooks ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -321,7 +233,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 3. ASIdentifierManager IDFA hook ----
+        // ---- 5. ASIdentifierManager IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -335,7 +247,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. NSUserDefaults hooks (exact match only) ----
+        // ---- 6. NSUserDefaults hooks ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
@@ -368,85 +280,133 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. Keychain clear (first launch only) ----
+        // ---- 7. CRITICAL: Hook NSHTTPCookieStorage ----
+        // This is where CUID actually lives. The system automatically
+        // attaches cookies from here to all requests. By replacing
+        // device cookies at the source, ALL requests get fake CUID
+        // regardless of networking stack used.
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.kc"), kCFPreferencesCurrentApplication);
-            if (!cleared) {
-                clearKeychain();
-                CFPreferencesSetAppValue(CFSTR("Bdhk.kc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
-                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-            } else { CFRelease(cleared); }
-        } @catch (id e) {}
+            Class cs = objc_getClass("NSHTTPCookieStorage");
 
-        // ---- 6. CRITICAL: Swizzle NSURLSession dataTaskWithRequest: ----
-        // This is the REAL fix. NSURLProtocol may not intercept Baidu's
-        // custom network stack. Swizzling the method directly catches ALL
-        // requests regardless of which session configuration is used.
-        @try {
-            Class sc = objc_getClass("NSURLSession");
-            if (sc) {
-                // dataTaskWithRequest:
-                Method dtM = class_getInstanceMethod(sc, @selector(dataTaskWithRequest:));
-                if (dtM) {
-                    IMP origDT = method_getImplementation(dtM);
-                    IMP newDT = imp_implementationWithBlock(^NSURLSessionDataTask *(id s, NSURLRequest *request) {
-                        if (!g_inHook && isBaiduHost(request.URL.host)) {
-                            g_inHook = YES;
-                            @try {
-                                NSMutableURLRequest *m = modifiedRequest(request);
-                                g_inHook = NO;
-                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))origDT)(s, @selector(dataTaskWithRequest:), m);
-                            } @catch (id e) { g_inHook = NO; }
-                        }
-                        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))origDT)(s, @selector(dataTaskWithRequest:), request);
-                    });
-                    class_replaceMethod(sc, @selector(dataTaskWithRequest:), newDT, method_getTypeEncoding(dtM));
-                }
+            // Hook cookiesForURL: — called when system attaches cookies to a request
+            Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
+            if (cfuM) {
+                IMP origCFU = method_getImplementation(cfuM);
+                IMP newCFU = imp_implementationWithBlock(^NSArray *(id s, NSURL *url) {
+                    NSArray *cookies = ((NSArray *(*)(id, SEL, NSURL *))origCFU)(s, @selector(cookiesForURL:), url);
+                    if (g_inCookieHook) return cookies;
+                    g_inCookieHook = YES;
+                    @try {
+                        NSArray *modified = modifiedCookies(cookies);
+                        g_inCookieHook = NO;
+                        return modified;
+                    } @catch (id e) {
+                        g_inCookieHook = NO;
+                        return cookies;
+                    }
+                });
+                class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
+            }
 
-                // dataTaskWithRequest:completionHandler:
-                Method dtcM = class_getInstanceMethod(sc, @selector(dataTaskWithRequest:completionHandler:));
-                if (dtcM) {
-                    IMP origDTC = method_getImplementation(dtcM);
-                    IMP newDTC = imp_implementationWithBlock(^NSURLSessionDataTask *(id s, NSURLRequest *request, void (^ch)(NSData *, NSURLResponse *, NSError *)) {
-                        if (!g_inHook && isBaiduHost(request.URL.host)) {
-                            g_inHook = YES;
-                            @try {
-                                NSMutableURLRequest *m = modifiedRequest(request);
-                                g_inHook = NO;
-                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))origDTC)(s, @selector(dataTaskWithRequest:completionHandler:), m, ch);
-                            } @catch (id e) { g_inHook = NO; }
-                        }
-                        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))origDTC)(s, @selector(dataTaskWithRequest:completionHandler:), request, ch);
-                    });
-                    class_replaceMethod(sc, @selector(dataTaskWithRequest:completionHandler:), newDTC, method_getTypeEncoding(dtcM));
-                }
+            // Hook setCookie: — called when server sets a cookie, intercept and modify
+            Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
+            if (scM) {
+                IMP origSC = method_getImplementation(scM);
+                IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
+                    if (cookie && isDeviceCookie(cookie.name)) {
+                        @try {
+                            NSString *fakeVal = getFakeID(cookie.name);
+                            NSMutableDictionary *props = [NSMutableDictionary dictionary];
+                            props[NSHTTPCookieName] = cookie.name;
+                            props[NSHTTPCookieValue] = fakeVal;
+                            if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
+                            if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
+                            if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
+                            props[NSHTTPCookieVersion] = @(cookie.version);
+                            if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
+                            NSHTTPCookie *fakeCookie = [[NSHTTPCookie alloc] initWithProperties:props];
+                            if (fakeCookie) {
+                                ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), fakeCookie);
+                                return;
+                            }
+                        } @catch (id e) {}
+                    }
+                    ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), cookie);
+                });
+                class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
+            }
+
+            // Hook setCookies:forURL:mainDocumentURL: — bulk cookie set
+            Method scsM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
+            if (scsM) {
+                IMP origSCS = method_getImplementation(scsM);
+                IMP newSCS = imp_implementationWithBlock(^void(id s, NSArray *cookies, NSURL *url, NSURL *docURL) {
+                    NSArray *modified = modifiedCookies(cookies);
+                    ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCS)(s, @selector(setCookies:forURL:mainDocumentURL:), modified, url, docURL);
+                });
+                class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCS, method_getTypeEncoding(scsM));
+            }
+
+            // Hook cookies (property) — returns all cookies
+            Method allM = class_getInstanceMethod(cs, @selector(cookies));
+            if (allM) {
+                IMP origAll = method_getImplementation(allM);
+                IMP newAll = imp_implementationWithBlock(^NSArray *(id s) {
+                    NSArray *cookies = ((NSArray *(*)(id, SEL))origAll)(s, @selector(cookies));
+                    if (g_inCookieHook) return cookies;
+                    g_inCookieHook = YES;
+                    @try {
+                        NSArray *modified = modifiedCookies(cookies);
+                        g_inCookieHook = NO;
+                        return modified;
+                    } @catch (id e) {
+                        g_inCookieHook = NO;
+                        return cookies;
+                    }
+                });
+                class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
             }
         } @catch (id e) {}
 
-        // ---- 7. Hook NSURLSessionConfiguration (backup for NSURLProtocol) ----
+        // ---- 8. Hook NSMutableURLRequest setValue:forHTTPHeaderField: ----
+        // Catch cases where app manually sets Cookie header
         @try {
-            Class cfgClass = objc_getClass("NSURLSessionConfiguration");
-            if (cfgClass) {
-                Method pcM = class_getInstanceMethod(cfgClass, @selector(protocolClasses));
-                if (pcM) {
-                    IMP origPC = method_getImplementation(pcM);
-                    IMP newPC = imp_implementationWithBlock(^NSArray *(id s) {
-                        if (g_inHook) {
-                            return ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
+            Class reqClass = objc_getClass("NSMutableURLRequest");
+            if (reqClass) {
+                Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+                if (svM) {
+                    IMP origSV = method_getImplementation(svM);
+                    IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (value && field && [field isEqualToString:@"Cookie"]) {
+                            // Replace device cookies in the Cookie header value
+                            NSString *lk = [field lowercaseString];
+                            if ([lk isEqualToString:@"cookie"]) {
+                                NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                                                   @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
+                                NSString *modified = value;
+                                for (NSString *name in names) {
+                                    NSString *fake = getFakeID(name);
+                                    NSRegularExpression *regex = [NSRegularExpression
+                                        regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
+                                        options:NSRegularExpressionCaseInsensitive error:nil];
+                                    modified = [regex stringByReplacingMatchesInString:modified options:0
+                                        range:NSMakeRange(0, modified.length)
+                                        withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
+                                }
+                                NSRegularExpression *cuidRegex = [NSRegularExpression
+                                    regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
+                                modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
+                                    range:NSMakeRange(0, modified.length)
+                                    withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
+                                ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), modified, field);
+                                return;
+                            }
                         }
-                        NSArray *orig = ((NSArray *(*)(id, SEL))origPC)(s, @selector(protocolClasses));
-                        NSMutableArray *arr = [NSMutableArray arrayWithArray:orig ?: @[]];
-                        if (![arr containsObject:[BdhkProtocol class]]) {
-                            [arr insertObject:[BdhkProtocol class] atIndex:0];
-                        }
-                        return arr;
+                        ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
                     });
-                    class_replaceMethod(cfgClass, @selector(protocolClasses), newPC, method_getTypeEncoding(pcM));
+                    class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
                 }
             }
         } @catch (id e) {}
-
-        // ---- 8. Register NSURLProtocol globally ----
-        @try { [NSURLProtocol registerClass:[BdhkProtocol class]]; } @catch (id e) {}
     }
 }
