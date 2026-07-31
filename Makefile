@@ -1,9 +1,9 @@
 #
-# Makefile — v13: ObjC-only hooks (no fishhook)
+# Makefile — v14: ObjC + fishhook (stat/lstat/access only)
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
