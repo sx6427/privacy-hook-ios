@@ -1,13 +1,9 @@
 //
-// PrivacyHook.m — v20: Payment-safe device spoof + per-clone independent
+// PrivacyHook.m — v20b: Payment-safe base (Step33 + vtool + per-clone IDs)
 //
-// Step33 (payment-proven) + vtool SDK patch + real bundle ID preferences
-// + Cookie READ-ONLY hook (spoof CUID without breaking payment SDK writes).
-//
-// KEY INSIGHT: Only hook cookiesForURL: / cookies (READ), NOT setCookie
-//   (WRITE). Payment SDKs set their own cookies → must not be tampered.
-//   Only device-identifying cookies (BAIDUCUID, DVIF, etc.) are replaced
-//   on read; everything else passes through unchanged.
+// NO cookie hooks — causes "下单人数过多" (CUID inconsistency between
+//   cookie / URL param / HTTP header). IDFA/IDFV/device-name spoofing
+//   is the maximum we can do without breaking payment or triggering 风控.
 //
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
@@ -19,7 +15,6 @@
 
 #define NSLog(...)
 
-static __thread BOOL g_inCookieHook = NO;
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
 
 // REAL bundle ID read BEFORE hooks — used as CFPreferences domain
@@ -50,77 +45,6 @@ static NSString *genDeviceName(void) {
     NSArray *sn = @[@"张",@"王",@"李",@"赵",@"刘",@"陈",@"杨",@"黄",@"周",@"吴",@"徐",@"孙",@"马",@"朱",@"胡",@"林",@"郭",@"何",@"高",@"罗"];
     NSArray *md = @[@"iPhone",@"iPhone 13",@"iPhone 14",@"iPhone 15",@"iPhone 12",@"iPhone 11",@"iPhone SE"];
     return [NSString stringWithFormat:@"%@的%@", sn[arc4random_uniform((uint32_t)sn.count)], md[arc4random_uniform((uint32_t)md.count)]];
-}
-
-static NSString *genRandStr(NSUInteger len, NSString *cs) {
-    NSMutableString *s = [NSMutableString stringWithCapacity:len];
-    for (NSUInteger i = 0; i < len; i++)
-        [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    return s;
-}
-
-static NSString *genCUID(void) {
-    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 63; i++) {
-        if (i > 0 && i % 10 == 3) [s appendString:@"-"];
-        else [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    }
-    return s;
-}
-
-// ============================================================
-// Cookie helpers — READ ONLY (no setCookie hook)
-// ============================================================
-static BOOL isDeviceCookie(NSString *cookieName) {
-    if (!cookieName) return NO;
-    NSString *lk = [cookieName lowercaseString];
-    NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
-                       @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid"];
-    for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
-    return NO;
-}
-
-static NSString *genFakeCookieValue(NSString *name) {
-    NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
-    NSString *hexCS = @"0123456789abcdef";
-    if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
-        return genCUID();
-    if ([name isEqualToString:@"DVIF"]) {
-        NSString *num = [NSString stringWithFormat:@"%llu", (unsigned long long)(arc4random_uniform(900000000U) + 100000000U)];
-        NSMutableData *d = [NSMutableData dataWithLength:300];
-        arc4random_buf([d mutableBytes], 300);
-        return [NSString stringWithFormat:@"%@_%@_%@", num, [d base64EncodedStringWithOptions:0], genRandStr(6, hexCS)];
-    }
-    if ([name isEqualToString:@"tcuid"])
-        return [genRandStr(40, hexCS).uppercaseString stringByAppendingString:genRandStr(4, @"ABCDEFGHIJ")];
-    if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
-    if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
-    return genRandStr(32, cuidCS);
-}
-
-static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
-    if (!isDeviceCookie(cookie.name)) return cookie;
-    NSString *fakeValue = getPersistent(
-        [NSString stringWithFormat:@"Bdhk.ck.%@", cookie.name],
-        ^{ return genFakeCookieValue(cookie.name); });
-    NSMutableDictionary *props = [NSMutableDictionary dictionary];
-    props[NSHTTPCookieName] = cookie.name;
-    props[NSHTTPCookieValue] = fakeValue;
-    if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
-    if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
-    if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
-    props[NSHTTPCookieVersion] = @(cookie.version);
-    if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
-    NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
-    return newCookie ?: cookie;
-}
-
-static NSArray *modifiedCookies(NSArray *cookies) {
-    if (!cookies || cookies.count == 0) return cookies;
-    NSMutableArray *result = [NSMutableArray arrayWithCapacity:cookies.count];
-    for (NSHTTPCookie *cookie in cookies) { [result addObject:modifiedCookie(cookie)]; }
-    return result;
 }
 
 // ============================================================
@@ -218,41 +142,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
-            }
-        } @catch (id e) {}
-
-        // ---- 4. Cookie READ-ONLY hooks (device spoof) ----
-        // Only hook READ (cookiesForURL:, cookies) — NOT WRITE (setCookie, etc.)
-        // This ensures payment SDKs can write their cookies unmodified.
-        @try {
-            Class cs = objc_getClass("NSHTTPCookieStorage");
-            if (cs) {
-                Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
-                if (cfuM) {
-                    IMP origCFU = method_getImplementation(cfuM);
-                    IMP newCFU = imp_implementationWithBlock(^NSArray *(id s, NSURL *url) {
-                        NSArray *cookies = ((NSArray *(*)(id, SEL, NSURL *))origCFU)(s, @selector(cookiesForURL:), url);
-                        if (g_inCookieHook) return cookies;
-                        g_inCookieHook = YES;
-                        @try { NSArray *m = modifiedCookies(cookies); g_inCookieHook = NO; return m; }
-                        @catch (id e) { g_inCookieHook = NO; return cookies; }
-                    });
-                    class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
-                }
-                Method allM = class_getInstanceMethod(cs, @selector(cookies));
-                if (allM) {
-                    IMP origAll = method_getImplementation(allM);
-                    IMP newAll = imp_implementationWithBlock(^NSArray *(id s) {
-                        NSArray *cookies = ((NSArray *(*)(id, SEL))origAll)(s, @selector(cookies));
-                        if (g_inCookieHook) return cookies;
-                        g_inCookieHook = YES;
-                        @try { NSArray *m = modifiedCookies(cookies); g_inCookieHook = NO; return m; }
-                        @catch (id e) { g_inCookieHook = NO; return cookies; }
-                    });
-                    class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
-                }
-                // NOT hooking setCookie: or setCookies:forURL:mainDocumentURL:
-                // → payment SDK writes are untouched → payment works
             }
         } @catch (id e) {}
     }
