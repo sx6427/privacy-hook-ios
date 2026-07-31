@@ -127,15 +127,6 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 }
 
 // ============================================================
-// Keychain clear — EVERY launch
-// ============================================================
-static void clearKeychain(void) {
-    NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
-                         (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
-    for (id cls in classes) { SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls}); }
-}
-
-// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
@@ -150,10 +141,11 @@ static void initPrivacyHook(void) {
             g_realBundleID = [d[@"CFBundleIdentifier"] copy];
         } @catch (id e) {}
 
-        // ---- 1. Clear keychain EVERY launch ----
-        @try { clearKeychain(); } @catch (id e) {}
+        // ---- 1. Bundle ID hook (3 methods) ----
+        // (Keychain NOT cleared — login tokens persist for convenience.
+        //  A1/A2 are already isolated via different keychain-access-groups
+        //  set in Info.plist by modify_ipa.py.)
 
-        // ---- 2. Bundle ID hook (3 methods) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
