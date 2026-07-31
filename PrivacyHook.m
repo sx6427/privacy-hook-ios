@@ -1,9 +1,9 @@
 //
-// PrivacyHook.m — v13: Step33 + Cookie spoof + jailbreak bypass (NO fishhook)
+// PrivacyHook.m — v14: v13 + safe fishhook (stat/lstat/access only)
 //
-// NO fishhook — all hooks are ObjC method swizzle (safe, no crashes)
-// Jailbreak bypass via NSFileManager only (covers ObjC path checks)
-// Bundle ID + device spoof + cookie spoof
+// v13 base (all ObjC hooks) + fishhook for ONLY stat/lstat/access
+// Key: use rebind_symbols (global) but with NULL guard in each hook
+//      and NO getenv/fopen/dladdr/dyld hooks (those crash)
 //
 
 #import <Foundation/Foundation.h>
@@ -11,6 +11,12 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <sys/stat.h>
+#import <unistd.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+
+#include "fishhook.h"
 
 #define NSLog(...)
 
@@ -124,11 +130,40 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// Jailbreak path check
+// Jailbreak path check (C string version for fishhook)
 // ============================================================
+static BOOL isJailbreakPathC(const char *path) {
+    if (!path) return NO;
+    static const char *jbPaths[] = {
+        "/bin/bash", "/bin/sh", "/usr/sbin/sshd", "/etc/apt", "/etc/ssh/sshd_config",
+        "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app",
+        "/Library/MobileSubstrate/MobileSubstrate.dylib",
+        "/usr/libexec/sftp-server", "/usr/libexec/ssh-keysign",
+        "/usr/libexec/cydia/", "/usr/sbin/frida-server", "/usr/bin/cycript",
+        "/private/var/lib/cydia", "/private/var/lib/apt", "/private/var/tmp/cydia.log",
+        "/private/etc/apt", "/private/etc/ssh/sshd_config",
+        "/Applications/WinterBoard.app", "/Applications/SBSetttings.app",
+        "/Applications/IntelliScreen.app", "/Applications/FakeCarrier.app",
+        "/private/var/stash", "/var/lib/cydia", "/var/lib/apt", "/var/cache/apt",
+        "/private/bdpan_jailbreak_test",
+        "/var/jb", "/var/jb/",
+        "/Applications/TrollStore.app",
+        "/usr/lib/TweakInject", "/usr/lib/libhooker", "/usr/lib/substitute",
+        NULL
+    };
+    for (int i = 0; jbPaths[i] != NULL; i++) {
+        if (strcmp(path, jbPaths[i]) == 0) return YES;
+    }
+    if (strstr(path, "MobileSubstrate") != NULL) return YES;
+    if (strstr(path, "TweakInject") != NULL) return YES;
+    if (strstr(path, "/var/jb/") != NULL) return YES;
+    if (strstr(path, "frida") != NULL) return YES;
+    return NO;
+}
+
+// ObjC version
 static BOOL isJailbreakPath(NSString *path) {
     if (!path) return NO;
-    // Check against known jailbreak paths
     static NSArray *jbPaths = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -160,11 +195,44 @@ static BOOL isJailbreakPath(NSString *path) {
 }
 
 // ============================================================
+// C function hooks via fishhook — with NULL guard
+// ============================================================
+static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int hook_stat(const char *path, struct stat *buf) {
+    if (isJailbreakPathC(path)) { errno = ENOENT; return -1; }
+    if (!orig_stat) { errno = ENOENT; return -1; }
+    return orig_stat(path, buf);
+}
+
+static int (*orig_lstat)(const char *, struct stat *) = NULL;
+static int hook_lstat(const char *path, struct stat *buf) {
+    if (isJailbreakPathC(path)) { errno = ENOENT; return -1; }
+    if (!orig_lstat) { errno = ENOENT; return -1; }
+    return orig_lstat(path, buf);
+}
+
+static int (*orig_access)(const char *, int) = NULL;
+static int hook_access(const char *path, int mode) {
+    if (isJailbreakPathC(path)) { errno = ENOENT; return -1; }
+    if (!orig_access) { errno = ENOENT; return -1; }
+    return orig_access(path, mode);
+}
+
+// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
+
+        // ---- 0. Fishhook: stat/lstat/access ONLY (global, but safe with NULL guard) ----
+        @try {
+            rebind_symbols((struct rebinding[]){
+                {"stat", (void *)hook_stat, (void **)&orig_stat},
+                {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
+                {"access", (void *)hook_access, (void **)&orig_access},
+            }, 3);
+        } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch ----
         @try { clearKeychain(); } @catch (id e) {}
@@ -303,7 +371,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. NSFileManager hook for fileExistsAtPath (jailbreak paths) ----
+        // ---- 6. NSFileManager hook for fileExistsAtPath ----
         @try {
             Class fm = objc_getClass("NSFileManager");
             if (fm) {
@@ -325,8 +393,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(fm, @selector(fileExistsAtPath:isDirectory:), newFEA, method_getTypeEncoding(feaM));
                 }
-
-                // Also hook attributesOfItemAtPath:error: (some checks use this)
                 Method aM = class_getInstanceMethod(fm, @selector(attributesOfItemAtPath:error:));
                 if (aM) {
                     IMP origA = method_getImplementation(aM);
@@ -342,7 +408,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. NSProcessInfo hook for environment (DYLD_INSERT_LIBRARIES) ----
+        // ---- 7. NSProcessInfo hook for environment ----
         @try {
             Class pi = objc_getClass("NSProcessInfo");
             if (pi) {
