@@ -92,8 +92,18 @@ static void wipeCUIDFromKeychain(void) {
                 [searchStr appendString:@"\n"];
                 if (label)   [searchStr appendString:label];
 
-                if ([searchStr.lowercaseString containsString:@"cuid"]) {
-                    // Delete ONLY this CUID-related item
+                // Match CUID and other device-ID related items
+                // (same patterns as NSUserDefaults cleanup above)
+                NSString *lower = searchStr.lowercaseString;
+                BOOL isDeviceID = ([lower containsString:@"cuid"] ||
+                                   [lower containsString:@"deviceid"] ||
+                                   [lower containsString:@"device_id"] ||
+                                   [lower containsString:@"machineid"] ||
+                                   [lower containsString:@"bdid"] ||
+                                   [lower containsString:@"clientid"]);
+                if (isDeviceID) {
+                    // Delete ONLY this device-ID-related item
+                    // Login tokens (BDUSS, STOKEN, passport, session) are PRESERVED
                     NSMutableDictionary *delQuery = [NSMutableDictionary dictionary];
                     delQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
                     if (service) delQuery[(__bridge id)kSecAttrService] = service;
