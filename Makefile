@@ -1,9 +1,9 @@
 #
-# Makefile — v10: code signature bypass + dylib hiding
+# Makefile — v13: ObjC-only hooks (no fishhook)
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m fishhook.c
+SRC   = PrivacyHook.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
