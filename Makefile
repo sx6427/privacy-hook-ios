@@ -1,5 +1,5 @@
 #
-# Makefile — v19: Per-clone independent fingerprints + vtool SDK patch
+# Makefile — v26: Selective Keychain CUID wipe + vtool SDK patch
 #
 # Xcode 26.5 compiles dylib with SDK=26.5 in LC_BUILD_VERSION
 # 百度 detects this abnormal SDK version → "下单人数过多"
@@ -15,7 +15,7 @@ CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-ar
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
           -dynamiclib -framework Foundation -framework UIKit \
-          -framework AdSupport \
+          -framework AdSupport -framework Security \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
