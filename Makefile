@@ -1,13 +1,9 @@
 #
-# Makefile — v28: CUID full interception + vtool SDK patch
-#
-# Xcode 26.5 compiles dylib with SDK=26.5 in LC_BUILD_VERSION
-# 百度 detects this abnormal SDK version → "下单人数过多"
-# Fix: use vtool to set SDK to 17.0 (normal iOS SDK)
+# Makefile — v29: sysctlbyname hook (pre-loaded) + CUID interception + vtool SDK patch
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
@@ -23,8 +19,8 @@ LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
 
 all: $(DYLIB)
 
-$(DYLIB): $(SRC)
-	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
+$(DYLIB): $(SRC) fishhook.h
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
 	@echo "=== Patching LC_BUILD_VERSION SDK 26.5 → 17.0 ==="
 	vtool -set-build-version ios 14.0 17.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "=== Verifying ==="
