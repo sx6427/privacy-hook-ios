@@ -13,10 +13,6 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <sys/sysctl.h>
-
 #include "fishhook.h"
 
 #define NSLog(...)
@@ -153,45 +149,10 @@ static OSStatus hook_SecCodeCheckValidity(void *code, uint32_t flags, CFDictiona
 }
 
 // ============================================================
-// DYLD IMAGE HIDING (NEW in v10)
+// DYLD IMAGE HIDING — DISABLED (causes crash)
+// dladdr and _dyld_get_image_name are called too frequently
+// by system libraries. Hooking them causes crashes.
 // ============================================================
-
-static BOOL shouldHideImage(const char *name) {
-    if (!name) return NO;
-    // Hide our injected dylib from enumeration
-    if (strstr(name, "BaiduBoxSys") != NULL) return YES;
-    if (strstr(name, "PrivacyHook") != NULL) return YES;
-    return NO;
-}
-
-// _dyld_get_image_name → return fake name for our dylib
-static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
-static const char *hook_dyld_get_image_name(uint32_t image_index) {
-    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
-    if (shouldHideImage(name)) {
-        // Return a system framework path instead
-        return "/usr/lib/libSystem.B.dylib";
-    }
-    return name;
-}
-
-// _dyld_image_count → return count minus our hidden images
-// We can't easily reduce the count because indices would shift.
-// Instead, we just rename our dylib in the name lookup (above).
-// This is safer than changing the count.
-
-// dladdr → hide our dylib
-static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
-static int hook_dladdr(const void *addr, Dl_info *info) {
-    int ret = orig_dladdr ? orig_dladdr(addr, info) : 0;
-    if (ret && info && info->dli_fname && shouldHideImage(info->dli_fname)) {
-        // Replace the path with a system library
-        info->dli_fname = "/usr/lib/libSystem.B.dylib";
-        info->dli_sname = NULL;
-        info->dli_saddr = NULL;
-    }
-    return ret;
-}
 
 // ============================================================
 // Constructor
@@ -205,9 +166,7 @@ static void initPrivacyHook(void) {
             rebind_symbols((struct rebinding[]){
                 {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
                 {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
-                {"_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
-                {"dladdr", (void *)hook_dladdr, (void **)&orig_dladdr},
-            }, 4);
+            }, 2);
         } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch (Step33 proven) ----
