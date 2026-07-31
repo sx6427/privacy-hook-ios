@@ -1,9 +1,9 @@
 //
-// PrivacyHook.m — v12: Step33 + Cookie spoof + jailbreak bypass (image-scoped)
+// PrivacyHook.m — v13: Step33 + Cookie spoof + jailbreak bypass (NO fishhook)
 //
-// KEY FIX: Only rebind C functions in the MAIN BINARY (not system libs)
-//           This prevents crashes from system code calling stat/getenv/etc.
-//           Uses rebind_symbols_image() instead of rebind_symbols()
+// NO fishhook — all hooks are ObjC method swizzle (safe, no crashes)
+// Jailbreak bypass via NSFileManager only (covers ObjC path checks)
+// Bundle ID + device spoof + cookie spoof
 //
 
 #import <Foundation/Foundation.h>
@@ -11,11 +11,6 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h>
-#import <sys/stat.h>
-#import <unistd.h>
-
-#include "fishhook.h"
 
 #define NSLog(...)
 
@@ -129,67 +124,39 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// JAILBREAK PATH DETECTION
+// Jailbreak path check
 // ============================================================
-static BOOL isJailbreakPath(const char *path) {
+static BOOL isJailbreakPath(NSString *path) {
     if (!path) return NO;
-    static const char *jbPaths[] = {
-        "/bin/bash", "/bin/sh", "/usr/sbin/sshd", "/etc/apt", "/etc/ssh/sshd_config",
-        "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app",
-        "/Library/MobileSubstrate/MobileSubstrate.dylib",
-        "/usr/libexec/sftp-server", "/usr/libexec/ssh-keysign",
-        "/usr/libexec/cydia/", "/usr/sbin/frida-server", "/usr/bin/cycript",
-        "/private/var/lib/cydia", "/private/var/lib/apt", "/private/var/tmp/cydia.log",
-        "/private/etc/apt", "/private/etc/ssh/sshd_config",
-        "/Applications/WinterBoard.app", "/Applications/SBSetttings.app",
-        "/Applications/IntelliScreen.app", "/Applications/FakeCarrier.app",
-        "/private/var/stash", "/var/lib/cydia", "/var/lib/apt", "/var/cache/apt",
-        "/private/bdpan_jailbreak_test",
-        "/var/jb/", "/var/jb",
-        "/Applications/TrollStore.app",
-        "/usr/lib/TweakInject", "/usr/lib/libhooker", "/usr/lib/substitute",
-        NULL
-    };
-    for (int i = 0; jbPaths[i] != NULL; i++) {
-        if (strcmp(path, jbPaths[i]) == 0) return YES;
+    // Check against known jailbreak paths
+    static NSArray *jbPaths = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        jbPaths = @[
+            @"/bin/bash", @"/bin/sh", @"/usr/sbin/sshd", @"/etc/apt", @"/etc/ssh/sshd_config",
+            @"/Applications/Cydia.app", @"/Applications/Sileo.app", @"/Applications/Zebra.app",
+            @"/Library/MobileSubstrate/MobileSubstrate.dylib",
+            @"/usr/libexec/sftp-server", @"/usr/libexec/ssh-keysign",
+            @"/usr/libexec/cydia/", @"/usr/sbin/frida-server", @"/usr/bin/cycript",
+            @"/private/var/lib/cydia", @"/private/var/lib/apt", @"/private/var/tmp/cydia.log",
+            @"/private/etc/apt", @"/private/etc/ssh/sshd_config",
+            @"/Applications/WinterBoard.app", @"/Applications/SBSetttings.app",
+            @"/Applications/IntelliScreen.app", @"/Applications/FakeCarrier.app",
+            @"/private/var/stash", @"/var/lib/cydia", @"/var/lib/apt", @"/var/cache/apt",
+            @"/private/bdpan_jailbreak_test",
+            @"/var/jb", @"/var/jb/",
+            @"/Applications/TrollStore.app",
+            @"/usr/lib/TweakInject", @"/usr/lib/libhooker", @"/usr/lib/substitute"
+        ];
+    });
+    for (NSString *jb in jbPaths) {
+        if ([path isEqualToString:jb]) return YES;
     }
-    if (strstr(path, "/Library/MobileSubstrate") != NULL) return YES;
-    if (strstr(path, "MobileSubstrate") != NULL) return YES;
-    if (strstr(path, "TweakInject") != NULL) return YES;
-    if (strstr(path, "/var/jb/") != NULL) return YES;
-    if (strstr(path, "frida") != NULL) return YES;
+    if ([path containsString:@"MobileSubstrate"]) return YES;
+    if ([path containsString:@"TweakInject"]) return YES;
+    if ([path containsString:@"/var/jb/"]) return YES;
+    if ([path containsString:@"frida"]) return YES;
     return NO;
-}
-
-// ============================================================
-// C function hooks (will be scoped to main binary only)
-// ============================================================
-static int (*orig_stat)(const char *, struct stat *) = NULL;
-static int hook_stat(const char *path, struct stat *buf) {
-    if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
-    return orig_stat(path, buf);
-}
-
-static int (*orig_lstat)(const char *, struct stat *) = NULL;
-static int hook_lstat(const char *path, struct stat *buf) {
-    if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
-    return orig_lstat(path, buf);
-}
-
-static int (*orig_access)(const char *, int) = NULL;
-static int hook_access(const char *path, int mode) {
-    if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
-    return orig_access(path, mode);
-}
-
-static OSStatus (*orig_SecStaticCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
-static OSStatus hook_SecStaticCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
-    return 0;
-}
-
-static OSStatus (*orig_SecCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
-static OSStatus hook_SecCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
-    return 0;
 }
 
 // ============================================================
@@ -198,25 +165,6 @@ static OSStatus hook_SecCodeCheckValidity(void *code, uint32_t flags, CFDictiona
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-
-        // ---- 0. Fishhook: C function hooks SCOPED TO MAIN BINARY ONLY ----
-        // This prevents crashes from system libraries calling stat/access
-        @try {
-            // Get main executable image header and slide
-            const struct mach_header *mainHeader = _dyld_get_image_header(0);
-            intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
-            
-            if (mainHeader) {
-                rebind_symbols_image((void *)mainHeader, mainSlide,
-                    (struct rebinding[]){
-                        {"stat", (void *)hook_stat, (void **)&orig_stat},
-                        {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
-                        {"access", (void *)hook_access, (void **)&orig_access},
-                        {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
-                        {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
-                    }, 5);
-            }
-        } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch ----
         @try { clearKeychain(); } @catch (id e) {}
@@ -363,10 +311,7 @@ static void initPrivacyHook(void) {
                 if (feM) {
                     IMP origFE = method_getImplementation(feM);
                     IMP newFE = imp_implementationWithBlock(^BOOL(id s, NSString *path) {
-                        if (path) {
-                            const char *cpath = [path UTF8String];
-                            if (isJailbreakPath(cpath)) return NO;
-                        }
+                        if (isJailbreakPath(path)) return NO;
                         return ((BOOL (*)(id, SEL, NSString *))origFE)(s, @selector(fileExistsAtPath:), path);
                     });
                     class_replaceMethod(fm, @selector(fileExistsAtPath:), newFE, method_getTypeEncoding(feM));
@@ -375,13 +320,45 @@ static void initPrivacyHook(void) {
                 if (feaM) {
                     IMP origFEA = method_getImplementation(feaM);
                     IMP newFEA = imp_implementationWithBlock(^BOOL(id s, NSString *path, BOOL *isDir) {
-                        if (path) {
-                            const char *cpath = [path UTF8String];
-                            if (isJailbreakPath(cpath)) return NO;
-                        }
+                        if (isJailbreakPath(path)) return NO;
                         return ((BOOL (*)(id, SEL, NSString *, BOOL *))origFEA)(s, @selector(fileExistsAtPath:isDirectory:), path, isDir);
                     });
                     class_replaceMethod(fm, @selector(fileExistsAtPath:isDirectory:), newFEA, method_getTypeEncoding(feaM));
+                }
+
+                // Also hook attributesOfItemAtPath:error: (some checks use this)
+                Method aM = class_getInstanceMethod(fm, @selector(attributesOfItemAtPath:error:));
+                if (aM) {
+                    IMP origA = method_getImplementation(aM);
+                    IMP newA = imp_implementationWithBlock(^NSDictionary *(id s, NSString *path, NSError **error) {
+                        if (isJailbreakPath(path)) {
+                            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
+                            return nil;
+                        }
+                        return ((NSDictionary *(*)(id, SEL, NSString *, NSError **))origA)(s, @selector(attributesOfItemAtPath:error:), path, error);
+                    });
+                    class_replaceMethod(fm, @selector(attributesOfItemAtPath:error:), newA, method_getTypeEncoding(aM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 7. NSProcessInfo hook for environment (DYLD_INSERT_LIBRARIES) ----
+        @try {
+            Class pi = objc_getClass("NSProcessInfo");
+            if (pi) {
+                Method envM = class_getInstanceMethod(pi, @selector(environment));
+                if (envM) {
+                    IMP origEnv = method_getImplementation(envM);
+                    IMP newEnv = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        NSDictionary *env = ((NSDictionary *(*)(id, SEL))origEnv)(s, @selector(environment));
+                        NSMutableDictionary *md = [NSMutableDictionary dictionaryWithDictionary:env];
+                        [md removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
+                        [md removeObjectForKey:@"DYLD_LIBRARY_PATH"];
+                        [md removeObjectForKey:@"DYLD_FRAMEWORK_PATH"];
+                        [md removeObjectForKey:@"_MSSafeMode"];
+                        return md;
+                    });
+                    class_replaceMethod(pi, @selector(environment), newEnv, method_getTypeEncoding(envM));
                 }
             }
         } @catch (id e) {}
