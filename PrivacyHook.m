@@ -1,20 +1,20 @@
 //
-// PrivacyHook.m — v19: Per-clone independent device fingerprint
+// PrivacyHook.m — v20: Payment-safe device spoof + per-clone independent
 //
-// Fix: read REAL bundle ID before hooking → use as CFPreferences domain
-//   A1 (com.baidu.BaiduMobileA1) and A2 (com.baidu.BaiduMobileA2)
-//   now have completely separate fake IDFA/IDFV/CUID/device-name storage.
-//   Previously kCFPreferencesCurrentApplication resolved to the hooked
-//   bundle ID (com.baidu.BaiduMobile), causing A1/A2 to SHARE fingerprints.
+// Step33 (payment-proven) + vtool SDK patch + real bundle ID preferences
+// + Cookie READ-ONLY hook (spoof CUID without breaking payment SDK writes).
+//
+// KEY INSIGHT: Only hook cookiesForURL: / cookies (READ), NOT setCookie
+//   (WRITE). Payment SDKs set their own cookies → must not be tampered.
+//   Only device-identifying cookies (BAIDUCUID, DVIF, etc.) are replaced
+//   on read; everything else passes through unchanged.
 //
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
-#import <Security/Security.h>
 #import <objc/runtime.h>
 
 #define NSLog(...)
@@ -27,11 +27,9 @@ static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
 static NSString *g_realBundleID = nil;
 
 // ============================================================
-// Persistent fake IDs
+// Persistent fake IDs — keyed to REAL bundle ID
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
-    // Use g_realBundleID (read before hooks) as preferences domain.
-    // This ensures each clone (A1/A2) has its own independent fake IDs.
     CFStringRef cfDomain = (__bridge CFStringRef)(g_realBundleID ?: kOrigBundleID);
     CFStringRef cfKey = (__bridge CFStringRef)key;
     CFPropertyListRef val = CFPreferencesCopyAppValue(cfKey, cfDomain);
@@ -71,29 +69,8 @@ static NSString *genCUID(void) {
     return s;
 }
 
-static NSString *genFakeCookie(NSString *name) {
-    NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
-    NSString *hexCS = @"0123456789abcdef";
-    if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
-        return genCUID();
-    if ([name isEqualToString:@"DVIF"]) {
-        NSString *num = [NSString stringWithFormat:@"%llu", (unsigned long long)(arc4random_uniform(900000000U) + 100000000U)];
-        NSMutableData *d = [NSMutableData dataWithLength:300];
-        arc4random_buf([d mutableBytes], 300);
-        return [NSString stringWithFormat:@"%@_%@_%@", num, [d base64EncodedStringWithOptions:0], genRandStr(6, hexCS)];
-    }
-    if ([name isEqualToString:@"tcuid"]) return [genRandStr(40, hexCS).uppercaseString stringByAppendingString:genRandStr(4, @"ABCDEFGHIJ")];
-    if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
-    if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
-    return genRandStr(32, cuidCS);
-}
-
-static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bdhk.ck.%@", name], ^{ return genFakeCookie(name); });
-}
-
 // ============================================================
-// Cookie helpers
+// Cookie helpers — READ ONLY (no setCookie hook)
 // ============================================================
 static BOOL isDeviceCookie(NSString *cookieName) {
     if (!cookieName) return NO;
@@ -104,9 +81,29 @@ static BOOL isDeviceCookie(NSString *cookieName) {
     return NO;
 }
 
+static NSString *genFakeCookieValue(NSString *name) {
+    NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    NSString *hexCS = @"0123456789abcdef";
+    if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
+        return genCUID();
+    if ([name isEqualToString:@"DVIF"]) {
+        NSString *num = [NSString stringWithFormat:@"%llu", (unsigned long long)(arc4random_uniform(900000000U) + 100000000U)];
+        NSMutableData *d = [NSMutableData dataWithLength:300];
+        arc4random_buf([d mutableBytes], 300);
+        return [NSString stringWithFormat:@"%@_%@_%@", num, [d base64EncodedStringWithOptions:0], genRandStr(6, hexCS)];
+    }
+    if ([name isEqualToString:@"tcuid"])
+        return [genRandStr(40, hexCS).uppercaseString stringByAppendingString:genRandStr(4, @"ABCDEFGHIJ")];
+    if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
+    if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
+    return genRandStr(32, cuidCS);
+}
+
 static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
     if (!isDeviceCookie(cookie.name)) return cookie;
-    NSString *fakeValue = getFakeID(cookie.name);
+    NSString *fakeValue = getPersistent(
+        [NSString stringWithFormat:@"Bdhk.ck.%@", cookie.name],
+        ^{ return genFakeCookieValue(cookie.name); });
     NSMutableDictionary *props = [NSMutableDictionary dictionary];
     props[NSHTTPCookieName] = cookie.name;
     props[NSHTTPCookieValue] = fakeValue;
@@ -134,18 +131,12 @@ static void initPrivacyHook(void) {
     @autoreleasepool {
 
         // ---- 0. Read REAL bundle ID BEFORE any hooks ----
-        // This is the actual installed bundle ID (e.g. com.baidu.BaiduMobileA1).
-        // Used as CFPreferences domain so each clone has independent fake IDs.
         @try {
             NSDictionary *d = [[NSBundle mainBundle] infoDictionary];
             g_realBundleID = [d[@"CFBundleIdentifier"] copy];
         } @catch (id e) {}
 
         // ---- 1. Bundle ID hook (3 methods) ----
-        // (Keychain NOT cleared — login tokens persist for convenience.
-        //  A1/A2 are already isolated via different keychain-access-groups
-        //  set in Info.plist by modify_ipa.py.)
-
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -185,7 +176,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 3. UIDevice hooks ----
+        // ---- 2. UIDevice hooks ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -216,7 +207,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. ASIdentifierManager IDFA hook ----
+        // ---- 3. ASIdentifierManager IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -230,7 +221,9 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. NSHTTPCookieStorage hooks (device spoof) ----
+        // ---- 4. Cookie READ-ONLY hooks (device spoof) ----
+        // Only hook READ (cookiesForURL:, cookies) — NOT WRITE (setCookie, etc.)
+        // This ensures payment SDKs can write their cookies unmodified.
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
             if (cs) {
@@ -258,24 +251,8 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
                 }
-                Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
-                if (scM) {
-                    IMP origSC = method_getImplementation(scM);
-                    IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
-                        NSHTTPCookie *mc = g_inCookieHook ? cookie : modifiedCookie(cookie);
-                        ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), mc);
-                    });
-                    class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
-                }
-                Method scfM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
-                    if (scfM) {
-                    IMP origSCF = method_getImplementation(scfM);
-                    IMP newSCF = imp_implementationWithBlock(^void(id s, NSArray *cookies, NSURL *url, NSURL *mainDocURL) {
-                        NSArray *mc = g_inCookieHook ? cookies : modifiedCookies(cookies);
-                        ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCF)(s, @selector(setCookies:forURL:mainDocumentURL:), mc, url, mainDocURL);
-                    });
-                    class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCF, method_getTypeEncoding(scfM));
-                }
+                // NOT hooking setCookie: or setCookies:forURL:mainDocumentURL:
+                // → payment SDK writes are untouched → payment works
             }
         } @catch (id e) {}
     }
