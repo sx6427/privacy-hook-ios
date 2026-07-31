@@ -1,5 +1,9 @@
 #
-# Makefile — v16: pure Step33
+# Makefile — v17: Step33 + vtool SDK patch
+#
+# Xcode 26.5 compiles dylib with SDK=26.5 in LC_BUILD_VERSION
+# 百度 detects this abnormal SDK version → "下单人数过多"
+# Fix: use vtool to set SDK to 17.0 (normal iOS SDK)
 #
 
 DYLIB = PrivacyHook.dylib
@@ -21,6 +25,10 @@ all: $(DYLIB)
 
 $(DYLIB): $(SRC)
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
+	@echo "=== Patching LC_BUILD_VERSION SDK 26.5 → 17.0 ==="
+	vtool -set-build-version ios 14.0 17.0 -output $@.tmp $@ && mv $@.tmp $@
+	@echo "=== Verifying ==="
+	@otool -l $@ | grep -A4 "LC_BUILD_VERSION"
 	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "FAIL!" || echo "OK"
 	@file $@
 
