@@ -1,11 +1,9 @@
 //
-// PrivacyHook.m — v10: Step33 + Cookie spoof + code signature bypass + dylib hiding
+// PrivacyHook.m — v11: Step33 + Cookie spoof + jailbreak detection bypass
 //
-// Based on v9 (Step33 + Cookie) + NEW:
-//   - SecStaticCodeCheckValidity / SecCodeCheckValidity → return success
-//   - _dyld_get_image_name → hide injected dylib
-//   - dladdr → hide injected dylib
-//   - csops → fake CS_VALID status
+// Hook file existence checks for jailbreak paths
+// Hook stat/access for jailbreak paths
+// Hook _dyld_get_image_name to hide our dylib (with thread-local guard)
 //
 
 #import <Foundation/Foundation.h>
@@ -13,16 +11,21 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <sys/stat.h>
+#import <unistd.h>
+
 #include "fishhook.h"
 
 #define NSLog(...)
 
 static __thread BOOL g_inCookieHook = NO;
+static __thread int g_dyldDepth = 0;
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
-static NSString *const kDylibName = @"BaiduBoxSys"; // partial match for hiding
 
 // ============================================================
-// Persistent fake IDs — uses CFPreferences to avoid recursion
+// Persistent fake IDs
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -114,45 +117,120 @@ static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
 static NSArray *modifiedCookies(NSArray *cookies) {
     if (!cookies || cookies.count == 0) return cookies;
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:cookies.count];
-    for (NSHTTPCookie *cookie in cookies) {
-        [result addObject:modifiedCookie(cookie)];
-    }
+    for (NSHTTPCookie *cookie in cookies) { [result addObject:modifiedCookie(cookie)]; }
     return result;
 }
 
 // ============================================================
-// Keychain clear — EVERY launch (like Step33)
+// Keychain clear
 // ============================================================
 static void clearKeychain(void) {
     NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
                          (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
-    for (id cls in classes) {
-        SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
-    }
+    for (id cls in classes) { SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls}); }
 }
 
 // ============================================================
-// CODE SIGNATURE BYPASS (NEW in v10)
-// Use void* for opaque types to avoid SDK header issues
+// JAILBREAK DETECTION BYPASS
 // ============================================================
 
-// SecStaticCodeCheckValidity → always return success
+// Paths that indicate jailbreak/TrollStore/injection
+static BOOL isJailbreakPath(const char *path) {
+    if (!path) return NO;
+    // Exact path checks for known jailbreak files
+    static const char *jbPaths[] = {
+        "/bin/bash", "/bin/sh", "/usr/sbin/sshd", "/etc/apt", "/etc/ssh/sshd_config",
+        "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app",
+        "/Library/MobileSubstrate/MobileSubstrate.dylib",
+        "/usr/libexec/sftp-server", "/usr/libexec/ssh-keysign",
+        "/usr/libexec/cydia/", "/usr/sbin/frida-server", "/usr/bin/cycript",
+        "/private/var/lib/cydia", "/private/var/lib/apt", "/private/var/tmp/cydia.log",
+        "/private/etc/apt", "/private/etc/ssh/sshd_config",
+        "/Applications/WinterBoard.app", "/Applications/SBSetttings.app",
+        "/Applications/IntelliScreen.app", "/Applications/FakeCarrier.app",
+        "/private/var/stash", "/var/lib/cydia", "/var/lib/apt", "/var/cache/apt",
+        "/private/bdpan_jailbreak_test",
+        "/var/jb/", "/var/jb",
+        "/Applications/TrollStore.app",
+        "/usr/lib/TweakInject", "/usr/lib/libhooker", "/usr/lib/substitute",
+        NULL
+    };
+    for (int i = 0; jbPaths[i] != NULL; i++) {
+        if (strcmp(path, jbPaths[i]) == 0) return YES;
+    }
+    // Prefix checks
+    if (strstr(path, "/Library/MobileSubstrate") != NULL) return YES;
+    if (strstr(path, "MobileSubstrate") != NULL) return YES;
+    if (strstr(path, "TweakInject") != NULL) return YES;
+    if (strstr(path, "/var/jb/") != NULL) return YES;
+    if (strstr(path, "frida") != NULL) return YES;
+    return NO;
+}
+
+// Hook stat / lstat / access / fopen for jailbreak paths
+static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int hook_stat(const char *path, struct stat *buf) {
+    if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
+    return orig_stat(path, buf);
+}
+
+static int (*orig_lstat)(const char *, struct stat *) = NULL;
+static int hook_lstat(const char *path, struct stat *buf) {
+    if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
+    return orig_lstat(path, buf);
+}
+
+static int (*orig_access)(const char *, int) = NULL;
+static int hook_access(const char *path, int mode) {
+    if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
+    return orig_access(path, mode);
+}
+
+static FILE *(*orig_fopen)(const char *, const char *) = NULL;
+static FILE *hook_fopen(const char *path, const char *mode) {
+    if (isJailbreakPath(path)) { errno = ENOENT; return NULL; }
+    return orig_fopen(path, mode);
+}
+
+// Hook getenv for DYLD_INSERT_LIBRARIES
+static char *(*orig_getenv)(const char *) = NULL;
+static char *hook_getenv(const char *name) {
+    if (name) {
+        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) return NULL;
+        if (strcmp(name, "DYLD_LIBRARY_PATH") == 0) return NULL;
+        if (strcmp(name, "DYLD_FRAMEWORK_PATH") == 0) return NULL;
+        if (strcmp(name, "_MSSafeMode") == 0) return NULL;
+    }
+    return orig_getenv(name);
+}
+
+// Hook _dyld_get_image_name to hide our dylib
+// Use depth counter to prevent recursion (system code calls this too)
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const char *hook_dyld_get_image_name(uint32_t image_index) {
+    g_dyldDepth++;
+    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
+    g_dyldDepth--;
+    if (name && g_dyldDepth == 0) {
+        // Only hide when called from app code (depth == 0 means top-level call)
+        if (strstr(name, "BaiduBoxSys") != NULL || strstr(name, "PrivacyHook") != NULL) {
+            // Return a benign system library name
+            return "/usr/lib/libSystem.B.dylib";
+        }
+    }
+    return name;
+}
+
+// Code signature bypass
 static OSStatus (*orig_SecStaticCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
 static OSStatus hook_SecStaticCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
-    return 0; // errSecSuccess
+    return 0;
 }
 
-// SecCodeCheckValidity → always return success
 static OSStatus (*orig_SecCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
 static OSStatus hook_SecCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
     return 0;
 }
-
-// ============================================================
-// DYLD IMAGE HIDING — DISABLED (causes crash)
-// dladdr and _dyld_get_image_name are called too frequently
-// by system libraries. Hooking them causes crashes.
-// ============================================================
 
 // ============================================================
 // Constructor
@@ -161,18 +239,24 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 0. Fishhook: C function hooks for code signature bypass ----
+        // ---- 0. Fishhook: C function hooks ----
         @try {
             rebind_symbols((struct rebinding[]){
+                {"stat", (void *)hook_stat, (void **)&orig_stat},
+                {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
+                {"access", (void *)hook_access, (void **)&orig_access},
+                {"fopen", (void *)hook_fopen, (void **)&orig_fopen},
+                {"getenv", (void *)hook_getenv, (void **)&orig_getenv},
+                {"_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
                 {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
                 {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
-            }, 2);
+            }, 8);
         } @catch (id e) {}
 
-        // ---- 1. Clear keychain EVERY launch (Step33 proven) ----
+        // ---- 1. Clear keychain EVERY launch ----
         @try { clearKeychain(); } @catch (id e) {}
 
-        // ---- 2. Bundle ID hook (3 methods, Step33 style) ----
+        // ---- 2. Bundle ID hook (3 methods) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -257,7 +341,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. NSHTTPCookieStorage hooks (device spoof) ----
+        // ---- 5. NSHTTPCookieStorage hooks ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
             if (cs) {
@@ -302,6 +386,37 @@ static void initPrivacyHook(void) {
                         ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCF)(s, @selector(setCookies:forURL:mainDocumentURL:), mc, url, mainDocURL);
                     });
                     class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCF, method_getTypeEncoding(scfM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 6. NSFileManager hook for fileExistsAtPath (jailbreak paths) ----
+        @try {
+            Class fm = objc_getClass("NSFileManager");
+            if (fm) {
+                Method feM = class_getInstanceMethod(fm, @selector(fileExistsAtPath:));
+                if (feM) {
+                    IMP origFE = method_getImplementation(feM);
+                    IMP newFE = imp_implementationWithBlock(^BOOL(id s, NSString *path) {
+                        if (path) {
+                            const char *cpath = [path UTF8String];
+                            if (isJailbreakPath(cpath)) return NO;
+                        }
+                        return ((BOOL (*)(id, SEL, NSString *))origFE)(s, @selector(fileExistsAtPath:), path);
+                    });
+                    class_replaceMethod(fm, @selector(fileExistsAtPath:), newFE, method_getTypeEncoding(feM));
+                }
+                Method feaM = class_getInstanceMethod(fm, @selector(fileExistsAtPath:isDirectory:));
+                if (feaM) {
+                    IMP origFEA = method_getImplementation(feaM);
+                    IMP newFEA = imp_implementationWithBlock(^BOOL(id s, NSString *path, BOOL *isDir) {
+                        if (path) {
+                            const char *cpath = [path UTF8String];
+                            if (isJailbreakPath(cpath)) return NO;
+                        }
+                        return ((BOOL (*)(id, SEL, NSString *, BOOL *))origFEA)(s, @selector(fileExistsAtPath:isDirectory:), path, isDir);
+                    });
+                    class_replaceMethod(fm, @selector(fileExistsAtPath:isDirectory:), newFEA, method_getTypeEncoding(feaM));
                 }
             }
         } @catch (id e) {}
