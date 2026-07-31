@@ -1,17 +1,23 @@
 //
-// PrivacyHook.m — v23: v17 (payment-proven) + Extension fix + per-clone IDs
+// PrivacyHook.m — v24: Per-clone CUID via systemVersion spoof (no keychain wipe)
 //
-// v17 had keychain clearing → CUID regenerated each launch → new device.
-// v20b removed it → old CUID persisted → "下单人数过多".
-// This version restores keychain clearing (essential for new device spoof).
+// Problem with v23: clearing ALL keychain → deletes login tokens → re-login
+//   every restart. And CUID regenerated from same hardware → same value.
 //
+// Solution: DON'T clear keychain. Instead:
+//   1. Hook UIDevice.systemVersion → fake per-clone version
+//   2. Delete only CUID-related NSUserDefaults keys → force regeneration
+//   3. App regenerates CUID using fake systemVersion → different CUID
+//   4. A1 (16.1) vs A2 (16.3) → different CUIDs
+//   5. Login tokens in keychain preserved → no re-login
+//
+// No fishhook, no cookie hooks, no NSURLSession hooks → payment safe.
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
-#import <Security/Security.h>
 #import <objc/runtime.h>
 
 #define NSLog(...)
@@ -48,13 +54,10 @@ static NSString *genDeviceName(void) {
     return [NSString stringWithFormat:@"%@的%@", sn[arc4random_uniform((uint32_t)sn.count)], md[arc4random_uniform((uint32_t)md.count)]];
 }
 
-// ============================================================
-// Keychain clear — EVERY launch (CUID lives here)
-// ============================================================
-static void clearKeychain(void) {
-    NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
-                         (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
-    for (id cls in classes) { SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls}); }
+// Generate a fake iOS version string per clone
+static NSString *genFakeSystemVersion(void) {
+    NSArray *versions = @[@"15.7", @"16.0", @"16.1", @"16.2", @"16.3", @"16.4", @"16.5", @"16.6"];
+    return versions[arc4random_uniform((uint32_t)versions.count)];
 }
 
 // ============================================================
@@ -70,10 +73,22 @@ static void initPrivacyHook(void) {
             g_realBundleID = [d[@"CFBundleIdentifier"] copy];
         } @catch (id e) {}
 
-        // ---- 1. Clear keychain EVERY launch ----
-        // CUID is stored in keychain. Without clearing, old CUID persists
-        // → Baidu recognizes old device → "下单人数过多".
-        @try { clearKeychain(); } @catch (id e) {}
+        // ---- 1. Delete CUID-related NSUserDefaults keys ----
+        // Force app to regenerate CUID. Combined with systemVersion hook,
+        // the regenerated CUID will be different per clone.
+        // Login tokens in keychain are NOT touched → no re-login.
+        @try {
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            NSDictionary *allDict = [ud dictionaryRepresentation];
+            for (NSString *key in allDict.allKeys) {
+                NSString *lk = key.lowercaseString;
+                if ([lk containsString:@"cuid"] || [lk containsString:@"deviceid"] ||
+                    [lk containsString:@"device_id"] || [lk containsString:@"machineid"]) {
+                    [ud removeObjectForKey:key];
+                }
+            }
+            [ud synchronize];
+        } @catch (id e) {}
 
         // ---- 2. Bundle ID hook (3 methods) ----
         @try {
@@ -119,6 +134,14 @@ static void initPrivacyHook(void) {
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
+                // systemVersion → fake per-clone (changes CUID generation input)
+                Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
+                if (svM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
+                    });
+                    class_replaceMethod(dc, @selector(systemVersion), imp, method_getTypeEncoding(svM));
+                }
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
@@ -160,9 +183,8 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. Pre-write fake CUID into NSUserDefaults (best-effort) ----
-        // If CUID is also stored in NSUserDefaults, pre-writing a fake value
-        // before App reads it means App uses our value. Harmless if key wrong.
+        // ---- 5. Pre-write fake CUID into NSUserDefaults ----
+        // After clearing CUID keys above, write our fake CUID so app uses it.
         @try {
             NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{
                 NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
