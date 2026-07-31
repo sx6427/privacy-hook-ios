@@ -1,15 +1,17 @@
 //
-// PrivacyHook.m — v24: Per-clone CUID via systemVersion spoof (no keychain wipe)
+// PrivacyHook.m — v26: Selective Keychain CUID wipe (no re-login)
 //
-// Problem with v23: clearing ALL keychain → deletes login tokens → re-login
-//   every restart. And CUID regenerated from same hardware → same value.
+// Problem with v24: didn't touch Keychain → A1/A2 share CUID in Keychain
+//   → "下单人数过多"
+// Problem with v23: cleared ALL Keychain → deleted login tokens → re-login
 //
-// Solution: DON'T clear keychain. Instead:
-//   1. Hook UIDevice.systemVersion → fake per-clone version
-//   2. Delete only CUID-related NSUserDefaults keys → force regeneration
-//   3. App regenerates CUID using fake systemVersion → different CUID
-//   4. A1 (16.1) vs A2 (16.3) → different CUIDs
-//   5. Login tokens in keychain preserved → no re-login
+// Solution: Selectively delete ONLY CUID-related Keychain items.
+//   1. Query all Keychain generic-password items
+//   2. Delete only items whose service/account/label contains "cuid"
+//   3. Login tokens (BDUSS, STOKEN, passport, etc.) are preserved → no re-login
+//   4. CUID gone from Keychain → app falls back to NSUserDefaults fake CUID
+//      or regenerates using hooked IDFV/systemVersion → different per clone
+//   5. Pre-write fake CUID to NSUserDefaults as fallback
 //
 // No fishhook, no cookie hooks, no NSURLSession hooks → payment safe.
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
@@ -18,6 +20,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
+#import <Security/Security.h>
 #import <objc/runtime.h>
 
 #define NSLog(...)
@@ -61,6 +64,50 @@ static NSString *genFakeSystemVersion(void) {
 }
 
 // ============================================================
+// Selective Keychain CUID deletion
+// Deletes ONLY items whose service/account/label contains "cuid"
+// Login tokens (BDUSS, STOKEN, passport, session, etc.) are PRESERVED
+// ============================================================
+static void wipeCUIDFromKeychain(void) {
+    @try {
+        // Query all generic-password items (attributes only, no data)
+        NSDictionary *query = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+        };
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+        if (status == errSecSuccess && result) {
+            NSArray *items = (__bridge_transfer NSArray *)result;
+            for (NSDictionary *item in items) {
+                NSString *service = item[(__bridge id)kSecAttrService];
+                NSString *account = item[(__bridge id)kSecAttrAccount];
+                NSString *label   = item[(__bridge id)kSecAttrLabel];
+
+                NSMutableString *searchStr = [NSMutableString string];
+                if (service) [searchStr appendString:service];
+                [searchStr appendString:@"\n"];
+                if (account) [searchStr appendString:account];
+                [searchStr appendString:@"\n"];
+                if (label)   [searchStr appendString:label];
+
+                if ([searchStr.lowercaseString containsString:@"cuid"]) {
+                    // Delete ONLY this CUID-related item
+                    NSMutableDictionary *delQuery = [NSMutableDictionary dictionary];
+                    delQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+                    if (service) delQuery[(__bridge id)kSecAttrService] = service;
+                    if (account) delQuery[(__bridge id)kSecAttrAccount] = account;
+                    SecItemDelete((__bridge CFDictionaryRef)delQuery);
+                }
+            }
+        } else if (result) {
+            CFRelease(result);
+        }
+    } @catch (id e) {}
+}
+
+// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
@@ -74,9 +121,6 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 1. Delete CUID-related NSUserDefaults keys ----
-        // Force app to regenerate CUID. Combined with systemVersion hook,
-        // the regenerated CUID will be different per clone.
-        // Login tokens in keychain are NOT touched → no re-login.
         @try {
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             NSDictionary *allDict = [ud dictionaryRepresentation];
@@ -89,6 +133,12 @@ static void initPrivacyHook(void) {
             }
             [ud synchronize];
         } @catch (id e) {}
+
+        // ---- 1b. Selectively delete CUID from Keychain ----
+        // ONLY deletes items whose service/account/label contains "cuid"
+        // Login tokens (BDUSS, STOKEN, passport, session, auth, etc.) are
+        // PRESERVED → no re-login after restart.
+        wipeCUIDFromKeychain();
 
         // ---- 2. Bundle ID hook (3 methods) ----
         @try {
@@ -184,7 +234,8 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 5. Pre-write fake CUID into NSUserDefaults ----
-        // After clearing CUID keys above, write our fake CUID so app uses it.
+        // After clearing CUID from both NSUserDefaults and Keychain,
+        // write our fake CUID so app uses it.
         @try {
             NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{
                 NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
