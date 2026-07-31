@@ -1,10 +1,12 @@
 //
-// PrivacyHook.m — v20b: Payment-safe base (Step33 + vtool + per-clone IDs)
+// PrivacyHook.m — v21: CUID source-level spoof via NSUserDefaults
 //
-// NO cookie hooks — causes "下单人数过多" (CUID inconsistency between
-//   cookie / URL param / HTTP header). IDFA/IDFV/device-name spoofing
-//   is the maximum we can do without breaking payment or triggering 风控.
+// Key insight: CUID appears in 3 places (Cookie, URL param, HTTP header).
+//   Replacing only one → inconsistency → "下单人数过多".
+//   Solution: hook NSUserDefaults objectForKey: for keys containing "cuid".
+//   App reads fake CUID → uses it everywhere → all 3 places consistent.
 //
+// No Cookie hooks, no NSURLSession hooks → payment safe.
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
@@ -45,6 +47,29 @@ static NSString *genDeviceName(void) {
     NSArray *sn = @[@"张",@"王",@"李",@"赵",@"刘",@"陈",@"杨",@"黄",@"周",@"吴",@"徐",@"孙",@"马",@"朱",@"胡",@"林",@"郭",@"何",@"高",@"罗"];
     NSArray *md = @[@"iPhone",@"iPhone 13",@"iPhone 14",@"iPhone 15",@"iPhone 12",@"iPhone 11",@"iPhone SE"];
     return [NSString stringWithFormat:@"%@的%@", sn[arc4random_uniform((uint32_t)sn.count)], md[arc4random_uniform((uint32_t)md.count)]];
+}
+
+static NSString *genRandStr(NSUInteger len, NSString *cs) {
+    NSMutableString *s = [NSMutableString stringWithCapacity:len];
+    for (NSUInteger i = 0; i < len; i++)
+        [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    return s;
+}
+
+// Generate a fake CUID value (baidutestapp-style format)
+static NSString *genFakeCUID(void) {
+    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    NSMutableString *s = [NSMutableString stringWithString:@"baidutestapp-BI-"];
+    for (int i = 0; i < 8; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    [s appendString:@"-"];
+    for (int i = 0; i < 4; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    [s appendString:@"-"];
+    for (int i = 0; i < 4; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    [s appendString:@"-"];
+    for (int i = 0; i < 4; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    [s appendString:@"-"];
+    for (int i = 0; i < 12; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+    return s;
 }
 
 // ============================================================
@@ -142,6 +167,32 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
+            }
+        } @catch (id e) {}
+
+        // ---- 4. NSUserDefaults CUID spoof (source-level) ----
+        // Hook objectForKey: for keys containing "cuid" (case-insensitive).
+        // App reads fake CUID → uses it in Cookie, URL params, HTTP headers
+        // → all 3 places consistent → no "下单人数过多".
+        // A1/A2 get different fake CUIDs via getPersistent (real bundle ID domain).
+        // Payment SDK doesn't read "cuid" keys → unaffected.
+        @try {
+            Method om = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
+            if (om) {
+                IMP origOM = method_getImplementation(om);
+                IMP newOM = imp_implementationWithBlock(^id(id s, NSString *key) {
+                    id val = ((id(*)(id, SEL, NSString *))origOM)(s, @selector(objectForKey:), key);
+                    if (key && [key.lowercaseString containsString:@"cuid"]) {
+                        if (val == nil || [val isKindOfClass:[NSString class]]) {
+                            NSString *fake = getPersistent(
+                                [NSString stringWithFormat:@"Bdhk.cuid.%@", key],
+                                ^{ return genFakeCUID(); });
+                            return fake;
+                        }
+                    }
+                    return val;
+                });
+                class_replaceMethod([NSUserDefaults class], @selector(objectForKey:), newOM, method_getTypeEncoding(om));
             }
         } @catch (id e) {}
     }
