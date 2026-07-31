@@ -1,16 +1,17 @@
 #
-# Makefile — TEST: empty dylib (diagnostic)
+# Makefile — v10: code signature bypass + dylib hiding
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHookTest.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-arc -Wall
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
-          -dynamiclib -framework Foundation \
+          -dynamiclib -framework Foundation -framework UIKit \
+          -framework AdSupport -framework Security \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
