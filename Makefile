@@ -1,5 +1,5 @@
 #
-# Makefile — v14: ObjC + fishhook (stat/lstat/access only)
+# Makefile — v15: image-scoped fishhook
 #
 
 DYLIB = PrivacyHook.dylib
