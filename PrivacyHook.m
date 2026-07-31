@@ -1,9 +1,9 @@
 //
-// PrivacyHook.m — v14: v13 + safe fishhook (stat/lstat/access only)
+// PrivacyHook.m — v15: v13 + image-scoped fishhook (find main binary by name)
 //
-// v13 base (all ObjC hooks) + fishhook for ONLY stat/lstat/access
-// Key: use rebind_symbols (global) but with NULL guard in each hook
-//      and NO getenv/fopen/dladdr/dyld hooks (those crash)
+// Fishhook only rebinds stat/lstat/access in the MAIN BINARY (BaiduBoxApp)
+// Found by iterating _dyld_image_count and matching name, NOT image[0]
+// All other hooks are ObjC (safe)
 //
 
 #import <Foundation/Foundation.h>
@@ -130,7 +130,7 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// Jailbreak path check (C string version for fishhook)
+// Jailbreak path check (C string version)
 // ============================================================
 static BOOL isJailbreakPathC(const char *path) {
     if (!path) return NO;
@@ -199,6 +199,7 @@ static BOOL isJailbreakPath(NSString *path) {
 // ============================================================
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int hook_stat(const char *path, struct stat *buf) {
+    if (!path) { return orig_stat ? orig_stat("", buf) : -1; }
     if (isJailbreakPathC(path)) { errno = ENOENT; return -1; }
     if (!orig_stat) { errno = ENOENT; return -1; }
     return orig_stat(path, buf);
@@ -206,6 +207,7 @@ static int hook_stat(const char *path, struct stat *buf) {
 
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
 static int hook_lstat(const char *path, struct stat *buf) {
+    if (!path) { return orig_lstat ? orig_lstat("", buf) : -1; }
     if (isJailbreakPathC(path)) { errno = ENOENT; return -1; }
     if (!orig_lstat) { errno = ENOENT; return -1; }
     return orig_lstat(path, buf);
@@ -213,9 +215,36 @@ static int hook_lstat(const char *path, struct stat *buf) {
 
 static int (*orig_access)(const char *, int) = NULL;
 static int hook_access(const char *path, int mode) {
+    if (!path) { return orig_access ? orig_access("", mode) : -1; }
     if (isJailbreakPathC(path)) { errno = ENOENT; return -1; }
     if (!orig_access) { errno = ENOENT; return -1; }
     return orig_access(path, mode);
+}
+
+// ============================================================
+// Find main binary image by name
+// ============================================================
+static void rebindMainBinaryOnly(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        // Match the main executable: .../BaiduBoxApp.app/BaiduBoxApp
+        // NOT a framework, NOT a dylib
+        if (strstr(name, "/BaiduBoxApp.app/BaiduBoxApp") != NULL) {
+            const struct mach_header *header = _dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            if (header) {
+                rebind_symbols_image((void *)header, slide,
+                    (struct rebinding[]){
+                        {"stat", (void *)hook_stat, (void **)&orig_stat},
+                        {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
+                        {"access", (void *)hook_access, (void **)&orig_access},
+                    }, 3);
+            }
+            return;
+        }
+    }
 }
 
 // ============================================================
@@ -225,14 +254,8 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 0. Fishhook: stat/lstat/access ONLY (global, but safe with NULL guard) ----
-        @try {
-            rebind_symbols((struct rebinding[]){
-                {"stat", (void *)hook_stat, (void **)&orig_stat},
-                {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
-                {"access", (void *)hook_access, (void **)&orig_access},
-            }, 3);
-        } @catch (id e) {}
+        // ---- 0. Fishhook: stat/lstat/access ONLY in main binary ----
+        @try { rebindMainBinaryOnly(); } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch ----
         @try { clearKeychain(); } @catch (id e) {}
