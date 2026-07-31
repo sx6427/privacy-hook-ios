@@ -137,33 +137,19 @@ static void clearKeychain(void) {
 
 // ============================================================
 // CODE SIGNATURE BYPASS (NEW in v10)
+// Use void* for opaque types to avoid SDK header issues
 // ============================================================
 
 // SecStaticCodeCheckValidity → always return success
-static OSStatus (*orig_SecStaticCodeCheckValidity)(SecStaticCodeRef, SecCSFlags, CFDictionaryRef) = NULL;
-static OSStatus hook_SecStaticCodeCheckValidity(SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef requirements) {
-    return errSecSuccess; // 0
+static OSStatus (*orig_SecStaticCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
+static OSStatus hook_SecStaticCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
+    return 0; // errSecSuccess
 }
 
 // SecCodeCheckValidity → always return success
-static OSStatus (*orig_SecCodeCheckValidity)(SecCodeRef, SecCSFlags, CFDictionaryRef) = NULL;
-static OSStatus hook_SecCodeCheckValidity(SecCodeRef code, SecCSFlags flags, CFDictionaryRef requirements) {
-    return errSecSuccess;
-}
-
-// SecCodeCopySigningInformation → return a dict with valid-looking info
-static OSStatus (*orig_SecCodeCopySigningInformation)(SecCodeRef, SecCSFlags, CFDictionaryRef *) = NULL;
-static OSStatus hook_SecCodeCopySigningInformation(SecCodeRef code, SecCSFlags flags, CFDictionaryRef *result) {
-    OSStatus ret = orig_SecCodeCopySigningInformation ? orig_SecCodeCopySigningInformation(code, flags, result) : errSecSuccess;
-    // If it failed, return a minimal valid dict
-    if (ret != errSecSuccess && result) {
-        *result = (__bridge_retained CFDictionaryRef)@{
-            (__bridge id)kSecCodeInfoIdentifier: kOrigBundleID,
-            (__bridge id)kSecCodeInfoTeamIdentifier: @"TEAMID",
-        };
-        return errSecSuccess;
-    }
-    return ret;
+static OSStatus (*orig_SecCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
+static OSStatus hook_SecCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
+    return 0;
 }
 
 // ============================================================
@@ -219,10 +205,9 @@ static void initPrivacyHook(void) {
             rebind_symbols((struct rebinding[]){
                 {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
                 {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
-                {"SecCodeCopySigningInformation", (void *)hook_SecCodeCopySigningInformation, (void **)&orig_SecCodeCopySigningInformation},
                 {"_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
                 {"dladdr", (void *)hook_dladdr, (void **)&orig_dladdr},
-            }, 5);
+            }, 4);
         } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch (Step33 proven) ----
