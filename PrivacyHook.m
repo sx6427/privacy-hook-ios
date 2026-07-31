@@ -1,9 +1,9 @@
 //
-// PrivacyHook.m — v11: Step33 + Cookie spoof + jailbreak detection bypass
+// PrivacyHook.m — v12: Step33 + Cookie spoof + jailbreak bypass (image-scoped)
 //
-// Hook file existence checks for jailbreak paths
-// Hook stat/access for jailbreak paths
-// Hook _dyld_get_image_name to hide our dylib (with thread-local guard)
+// KEY FIX: Only rebind C functions in the MAIN BINARY (not system libs)
+//           This prevents crashes from system code calling stat/getenv/etc.
+//           Uses rebind_symbols_image() instead of rebind_symbols()
 //
 
 #import <Foundation/Foundation.h>
@@ -11,7 +11,6 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -21,7 +20,6 @@
 #define NSLog(...)
 
 static __thread BOOL g_inCookieHook = NO;
-static __thread int g_dyldDepth = 0;
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
 
 // ============================================================
@@ -131,13 +129,10 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
-// JAILBREAK DETECTION BYPASS
+// JAILBREAK PATH DETECTION
 // ============================================================
-
-// Paths that indicate jailbreak/TrollStore/injection
 static BOOL isJailbreakPath(const char *path) {
     if (!path) return NO;
-    // Exact path checks for known jailbreak files
     static const char *jbPaths[] = {
         "/bin/bash", "/bin/sh", "/usr/sbin/sshd", "/etc/apt", "/etc/ssh/sshd_config",
         "/Applications/Cydia.app", "/Applications/Sileo.app", "/Applications/Zebra.app",
@@ -158,7 +153,6 @@ static BOOL isJailbreakPath(const char *path) {
     for (int i = 0; jbPaths[i] != NULL; i++) {
         if (strcmp(path, jbPaths[i]) == 0) return YES;
     }
-    // Prefix checks
     if (strstr(path, "/Library/MobileSubstrate") != NULL) return YES;
     if (strstr(path, "MobileSubstrate") != NULL) return YES;
     if (strstr(path, "TweakInject") != NULL) return YES;
@@ -167,7 +161,9 @@ static BOOL isJailbreakPath(const char *path) {
     return NO;
 }
 
-// Hook stat / lstat / access / fopen for jailbreak paths
+// ============================================================
+// C function hooks (will be scoped to main binary only)
+// ============================================================
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int hook_stat(const char *path, struct stat *buf) {
     if (isJailbreakPath(path)) { errno = ENOENT; return -1; }
@@ -186,42 +182,6 @@ static int hook_access(const char *path, int mode) {
     return orig_access(path, mode);
 }
 
-static FILE *(*orig_fopen)(const char *, const char *) = NULL;
-static FILE *hook_fopen(const char *path, const char *mode) {
-    if (isJailbreakPath(path)) { errno = ENOENT; return NULL; }
-    return orig_fopen(path, mode);
-}
-
-// Hook getenv for DYLD_INSERT_LIBRARIES
-static char *(*orig_getenv)(const char *) = NULL;
-static char *hook_getenv(const char *name) {
-    if (name) {
-        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) return NULL;
-        if (strcmp(name, "DYLD_LIBRARY_PATH") == 0) return NULL;
-        if (strcmp(name, "DYLD_FRAMEWORK_PATH") == 0) return NULL;
-        if (strcmp(name, "_MSSafeMode") == 0) return NULL;
-    }
-    return orig_getenv(name);
-}
-
-// Hook _dyld_get_image_name to hide our dylib
-// Use depth counter to prevent recursion (system code calls this too)
-static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
-static const char *hook_dyld_get_image_name(uint32_t image_index) {
-    g_dyldDepth++;
-    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
-    g_dyldDepth--;
-    if (name && g_dyldDepth == 0) {
-        // Only hide when called from app code (depth == 0 means top-level call)
-        if (strstr(name, "BaiduBoxSys") != NULL || strstr(name, "PrivacyHook") != NULL) {
-            // Return a benign system library name
-            return "/usr/lib/libSystem.B.dylib";
-        }
-    }
-    return name;
-}
-
-// Code signature bypass
 static OSStatus (*orig_SecStaticCodeCheckValidity)(void *, uint32_t, CFDictionaryRef) = NULL;
 static OSStatus hook_SecStaticCodeCheckValidity(void *code, uint32_t flags, CFDictionaryRef requirements) {
     return 0;
@@ -239,18 +199,23 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 0. Fishhook: C function hooks ----
+        // ---- 0. Fishhook: C function hooks SCOPED TO MAIN BINARY ONLY ----
+        // This prevents crashes from system libraries calling stat/access
         @try {
-            rebind_symbols((struct rebinding[]){
-                {"stat", (void *)hook_stat, (void **)&orig_stat},
-                {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
-                {"access", (void *)hook_access, (void **)&orig_access},
-                {"fopen", (void *)hook_fopen, (void **)&orig_fopen},
-                {"getenv", (void *)hook_getenv, (void **)&orig_getenv},
-                {"_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
-                {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
-                {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
-            }, 8);
+            // Get main executable image header and slide
+            const struct mach_header *mainHeader = _dyld_get_image_header(0);
+            intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
+            
+            if (mainHeader) {
+                rebind_symbols_image((void *)mainHeader, mainSlide,
+                    (struct rebinding[]){
+                        {"stat", (void *)hook_stat, (void **)&orig_stat},
+                        {"lstat", (void *)hook_lstat, (void **)&orig_lstat},
+                        {"access", (void *)hook_access, (void **)&orig_access},
+                        {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
+                        {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
+                    }, 5);
+            }
         } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch ----
