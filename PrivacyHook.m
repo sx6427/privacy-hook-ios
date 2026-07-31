@@ -1,12 +1,10 @@
 //
-// PrivacyHook.m — v21: CUID source-level spoof via NSUserDefaults
+// PrivacyHook.m — v20b: Payment-safe base (Step33 + vtool + per-clone IDs)
 //
-// Key insight: CUID appears in 3 places (Cookie, URL param, HTTP header).
-//   Replacing only one → inconsistency → "下单人数过多".
-//   Solution: hook NSUserDefaults objectForKey: for keys containing "cuid".
-//   App reads fake CUID → uses it everywhere → all 3 places consistent.
+// Step33 (payment-proven) + vtool SDK patch + real bundle ID preferences.
+// No cookie hooks, no NSUserDefaults hooks, no CUID hooks.
+// IDFA/IDFV/device-name spoofing only — the maximum that doesn't break payment.
 //
-// No Cookie hooks, no NSURLSession hooks → payment safe.
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
@@ -47,29 +45,6 @@ static NSString *genDeviceName(void) {
     NSArray *sn = @[@"张",@"王",@"李",@"赵",@"刘",@"陈",@"杨",@"黄",@"周",@"吴",@"徐",@"孙",@"马",@"朱",@"胡",@"林",@"郭",@"何",@"高",@"罗"];
     NSArray *md = @[@"iPhone",@"iPhone 13",@"iPhone 14",@"iPhone 15",@"iPhone 12",@"iPhone 11",@"iPhone SE"];
     return [NSString stringWithFormat:@"%@的%@", sn[arc4random_uniform((uint32_t)sn.count)], md[arc4random_uniform((uint32_t)md.count)]];
-}
-
-static NSString *genRandStr(NSUInteger len, NSString *cs) {
-    NSMutableString *s = [NSMutableString stringWithCapacity:len];
-    for (NSUInteger i = 0; i < len; i++)
-        [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    return s;
-}
-
-// Generate a fake CUID value (baidutestapp-style format)
-static NSString *genFakeCUID(void) {
-    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    NSMutableString *s = [NSMutableString stringWithString:@"baidutestapp-BI-"];
-    for (int i = 0; i < 8; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    [s appendString:@"-"];
-    for (int i = 0; i < 4; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    [s appendString:@"-"];
-    for (int i = 0; i < 4; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    [s appendString:@"-"];
-    for (int i = 0; i < 4; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    [s appendString:@"-"];
-    for (int i = 0; i < 12; i++) [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    return s;
 }
 
 // ============================================================
@@ -170,30 +145,28 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. NSUserDefaults CUID spoof (source-level) ----
-        // Hook objectForKey: for keys containing "cuid" (case-insensitive).
-        // App reads fake CUID → uses it in Cookie, URL params, HTTP headers
-        // → all 3 places consistent → no "下单人数过多".
-        // A1/A2 get different fake CUIDs via getPersistent (real bundle ID domain).
-        // Payment SDK doesn't read "cuid" keys → unaffected.
+        // ---- 4. Pre-write fake CUID into NSUserDefaults ----
+        // Don't hook any method. Just write fake CUID values into standard
+        // NSUserDefaults before App reads them. If App finds existing value,
+        // it uses it instead of generating from hardware info.
+        // This is safe: no method swizzling → can't break payment.
         @try {
-            Method om = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
-            if (om) {
-                IMP origOM = method_getImplementation(om);
-                IMP newOM = imp_implementationWithBlock(^id(id s, NSString *key) {
-                    id val = ((id(*)(id, SEL, NSString *))origOM)(s, @selector(objectForKey:), key);
-                    if (key && [key.lowercaseString containsString:@"cuid"]) {
-                        if (val == nil || [val isKindOfClass:[NSString class]]) {
-                            NSString *fake = getPersistent(
-                                [NSString stringWithFormat:@"Bdhk.cuid.%@", key],
-                                ^{ return genFakeCUID(); });
-                            return fake;
-                        }
-                    }
-                    return val;
-                });
-                class_replaceMethod([NSUserDefaults class], @selector(objectForKey:), newOM, method_getTypeEncoding(om));
+            NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{
+                NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                NSMutableString *s = [NSMutableString string];
+                for (int i = 0; i < 40; i++)
+                    [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+                return s;
+            });
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            // Try common CUID key names used by Baidu
+            for (NSString *k in @[@"CUID", @"cuid", @"BD_CUID", @"baidu_cuid",
+                                  @"BAIDU_CUID", @"kCUID", @"com.baidu.cuid"]) {
+                if (![ud objectForKey:k]) {
+                    [ud setObject:fakeCUID forKey:k];
+                }
             }
+            [ud synchronize];
         } @catch (id e) {}
     }
 }
