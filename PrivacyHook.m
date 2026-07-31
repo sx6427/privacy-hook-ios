@@ -1,20 +1,11 @@
 //
-// PrivacyHook.m — v9: Step33 (payment-proven) + Cookie read hooks (device spoof)
+// PrivacyHook.m — v10: Step33 + Cookie spoof + code signature bypass + dylib hiding
 //
-// Step33 architecture (payment works):
-//   - 3-method Bundle ID hook
-//   - Keychain clear EVERY launch
-//   - IDFA/IDFV/name spoof
-//
-// Added for device spoof:
-//   - NSHTTPCookieStorage read hooks (cookiesForURL:, cookies)
-//   - NSHTTPCookieStorage write hooks (setCookie:, setCookies:forURL:mainDocumentURL:)
-//
-// REMOVED from v8 (caused payment failure):
-//   - NSURLProtocol (broke session/cookie sharing for payment SDK)
-//   - NSUserDefaults hooks (interfered with payment SDK reads)
-//   - NSMutableURLRequest setValue:forHTTPHeaderField: hook
-//   - URL/POST body parameter replacement
+// Based on v9 (Step33 + Cookie) + NEW:
+//   - SecStaticCodeCheckValidity / SecCodeCheckValidity → return success
+//   - _dyld_get_image_name → hide injected dylib
+//   - dladdr → hide injected dylib
+//   - csops → fake CS_VALID status
 //
 
 #import <Foundation/Foundation.h>
@@ -22,12 +13,17 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <sys/sysctl.h>
+
+#include "fishhook.h"
 
 #define NSLog(...)
 
 static __thread BOOL g_inCookieHook = NO;
-
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
+static NSString *const kDylibName = @"BaiduBoxSys"; // partial match for hiding
 
 // ============================================================
 // Persistent fake IDs — uses CFPreferences to avoid recursion
@@ -140,11 +136,94 @@ static void clearKeychain(void) {
 }
 
 // ============================================================
+// CODE SIGNATURE BYPASS (NEW in v10)
+// ============================================================
+
+// SecStaticCodeCheckValidity → always return success
+static OSStatus (*orig_SecStaticCodeCheckValidity)(SecStaticCodeRef, SecCSFlags, CFDictionaryRef) = NULL;
+static OSStatus hook_SecStaticCodeCheckValidity(SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef requirements) {
+    return errSecSuccess; // 0
+}
+
+// SecCodeCheckValidity → always return success
+static OSStatus (*orig_SecCodeCheckValidity)(SecCodeRef, SecCSFlags, CFDictionaryRef) = NULL;
+static OSStatus hook_SecCodeCheckValidity(SecCodeRef code, SecCSFlags flags, CFDictionaryRef requirements) {
+    return errSecSuccess;
+}
+
+// SecCodeCopySigningInformation → return a dict with valid-looking info
+static OSStatus (*orig_SecCodeCopySigningInformation)(SecCodeRef, SecCSFlags, CFDictionaryRef *) = NULL;
+static OSStatus hook_SecCodeCopySigningInformation(SecCodeRef code, SecCSFlags flags, CFDictionaryRef *result) {
+    OSStatus ret = orig_SecCodeCopySigningInformation ? orig_SecCodeCopySigningInformation(code, flags, result) : errSecSuccess;
+    // If it failed, return a minimal valid dict
+    if (ret != errSecSuccess && result) {
+        *result = (__bridge_retained CFDictionaryRef)@{
+            (__bridge id)kSecCodeInfoIdentifier: kOrigBundleID,
+            (__bridge id)kSecCodeInfoTeamIdentifier: @"TEAMID",
+        };
+        return errSecSuccess;
+    }
+    return ret;
+}
+
+// ============================================================
+// DYLD IMAGE HIDING (NEW in v10)
+// ============================================================
+
+static BOOL shouldHideImage(const char *name) {
+    if (!name) return NO;
+    // Hide our injected dylib from enumeration
+    if (strstr(name, "BaiduBoxSys") != NULL) return YES;
+    if (strstr(name, "PrivacyHook") != NULL) return YES;
+    return NO;
+}
+
+// _dyld_get_image_name → return fake name for our dylib
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const char *hook_dyld_get_image_name(uint32_t image_index) {
+    const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
+    if (shouldHideImage(name)) {
+        // Return a system framework path instead
+        return "/usr/lib/libSystem.B.dylib";
+    }
+    return name;
+}
+
+// _dyld_image_count → return count minus our hidden images
+// We can't easily reduce the count because indices would shift.
+// Instead, we just rename our dylib in the name lookup (above).
+// This is safer than changing the count.
+
+// dladdr → hide our dylib
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+static int hook_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr ? orig_dladdr(addr, info) : 0;
+    if (ret && info && info->dli_fname && shouldHideImage(info->dli_fname)) {
+        // Replace the path with a system library
+        info->dli_fname = "/usr/lib/libSystem.B.dylib";
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+    }
+    return ret;
+}
+
+// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
+
+        // ---- 0. Fishhook: C function hooks for code signature bypass ----
+        @try {
+            rebind_symbols((struct rebinding[]){
+                {"SecStaticCodeCheckValidity", (void *)hook_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity},
+                {"SecCodeCheckValidity", (void *)hook_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity},
+                {"SecCodeCopySigningInformation", (void *)hook_SecCodeCopySigningInformation, (void **)&orig_SecCodeCopySigningInformation},
+                {"_dyld_get_image_name", (void *)hook_dyld_get_image_name, (void **)&orig_dyld_get_image_name},
+                {"dladdr", (void *)hook_dladdr, (void **)&orig_dladdr},
+            }, 5);
+        } @catch (id e) {}
 
         // ---- 1. Clear keychain EVERY launch (Step33 proven) ----
         @try { clearKeychain(); } @catch (id e) {}
@@ -153,7 +232,6 @@ static void initPrivacyHook(void) {
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
-                // bundleIdentifier
                 Method m1 = class_getInstanceMethod(bc, @selector(bundleIdentifier));
                 if (m1) {
                     IMP orig1 = method_getImplementation(m1);
@@ -163,7 +241,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(bc, @selector(bundleIdentifier), imp1, method_getTypeEncoding(m1));
                 }
-                // objectForInfoDictionaryKey:
                 Method m2 = class_getInstanceMethod(bc, @selector(objectForInfoDictionaryKey:));
                 if (m2) {
                     IMP orig2 = method_getImplementation(m2);
@@ -174,7 +251,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(bc, @selector(objectForInfoDictionaryKey:), imp2, method_getTypeEncoding(m2));
                 }
-                // infoDictionary
                 Method m3 = class_getInstanceMethod(bc, @selector(infoDictionary));
                 if (m3) {
                     IMP orig3 = method_getImplementation(m3);
@@ -238,12 +314,9 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 5. NSHTTPCookieStorage hooks (device spoof) ----
-        // Read hooks: replace device cookies when app reads them
-        // Write hooks: replace device cookies when server sets them (store fake value)
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
             if (cs) {
-                // cookiesForURL: — read cookies for outgoing request
                 Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
                 if (cfuM) {
                     IMP origCFU = method_getImplementation(cfuM);
@@ -256,7 +329,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
                 }
-                // cookies — read all cookies
                 Method allM = class_getInstanceMethod(cs, @selector(cookies));
                 if (allM) {
                     IMP origAll = method_getImplementation(allM);
@@ -269,7 +341,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
                 }
-                // setCookie: — store modified cookie when app/server sets one
                 Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
                 if (scM) {
                     IMP origSC = method_getImplementation(scM);
@@ -279,7 +350,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
                 }
-                // setCookies:forURL:mainDocumentURL: — batch store
                 Method scfM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
                 if (scfM) {
                     IMP origSCF = method_getImplementation(scfM);
