@@ -1,9 +1,9 @@
 #
-# Makefile — v15: image-scoped fishhook
+# Makefile — v16: pure Step33
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m fishhook.c
+SRC   = PrivacyHook.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
