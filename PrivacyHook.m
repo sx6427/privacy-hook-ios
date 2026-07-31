@@ -1,9 +1,9 @@
 //
-// PrivacyHook.m — v20b: Payment-safe base (Step33 + vtool + per-clone IDs)
+// PrivacyHook.m — v23: v17 (payment-proven) + Extension fix + per-clone IDs
 //
-// Step33 (payment-proven) + vtool SDK patch + real bundle ID preferences.
-// No cookie hooks, no NSUserDefaults hooks, no CUID hooks.
-// IDFA/IDFV/device-name spoofing only — the maximum that doesn't break payment.
+// v17 had keychain clearing → CUID regenerated each launch → new device.
+// v20b removed it → old CUID persisted → "下单人数过多".
+// This version restores keychain clearing (essential for new device spoof).
 //
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
+#import <Security/Security.h>
 #import <objc/runtime.h>
 
 #define NSLog(...)
@@ -48,6 +49,15 @@ static NSString *genDeviceName(void) {
 }
 
 // ============================================================
+// Keychain clear — EVERY launch (CUID lives here)
+// ============================================================
+static void clearKeychain(void) {
+    NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
+                         (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
+    for (id cls in classes) { SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls}); }
+}
+
+// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
@@ -60,7 +70,12 @@ static void initPrivacyHook(void) {
             g_realBundleID = [d[@"CFBundleIdentifier"] copy];
         } @catch (id e) {}
 
-        // ---- 1. Bundle ID hook (3 methods) ----
+        // ---- 1. Clear keychain EVERY launch ----
+        // CUID is stored in keychain. Without clearing, old CUID persists
+        // → Baidu recognizes old device → "下单人数过多".
+        @try { clearKeychain(); } @catch (id e) {}
+
+        // ---- 2. Bundle ID hook (3 methods) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -100,7 +115,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 2. UIDevice hooks ----
+        // ---- 3. UIDevice hooks ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -131,7 +146,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 3. ASIdentifierManager IDFA hook ----
+        // ---- 4. ASIdentifierManager IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -145,11 +160,9 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. Pre-write fake CUID into NSUserDefaults ----
-        // Don't hook any method. Just write fake CUID values into standard
-        // NSUserDefaults before App reads them. If App finds existing value,
-        // it uses it instead of generating from hardware info.
-        // This is safe: no method swizzling → can't break payment.
+        // ---- 5. Pre-write fake CUID into NSUserDefaults (best-effort) ----
+        // If CUID is also stored in NSUserDefaults, pre-writing a fake value
+        // before App reads it means App uses our value. Harmless if key wrong.
         @try {
             NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{
                 NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -159,12 +172,9 @@ static void initPrivacyHook(void) {
                 return s;
             });
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-            // Try common CUID key names used by Baidu
             for (NSString *k in @[@"CUID", @"cuid", @"BD_CUID", @"baidu_cuid",
                                   @"BAIDU_CUID", @"kCUID", @"com.baidu.cuid"]) {
-                if (![ud objectForKey:k]) {
-                    [ud setObject:fakeCUID forKey:k];
-                }
+                [ud setObject:fakeCUID forKey:k];
             }
             [ud synchronize];
         } @catch (id e) {}
