@@ -1,19 +1,20 @@
 //
-// PrivacyHook.m — v27: sysctlbyname + uname hook for device model spoofing
+// PrivacyHook.m — v28: CUID full interception (no fishhook, no crash)
 //
-// v26 problem: UIDevice hooks alone insufficient. Baidu reads hw.machine
-//   via sysctlbyname("hw.machine") -> real "iPhone7,2" shown to server.
-//   Also reads kern.osrelease -> wrong kernel version.
+// v27 crash: fishhook hooking sysctlbyname globally → crash
+// v26b: CUID not faked in HTTP → "下单人数过多"
 //
-// v27 solution: use fishhook to intercept sysctlbyname + uname C functions.
-//   - hw.machine / hw.product -> fake model (iPhone14,5 etc.)
-//   - kern.osversion -> fake build number matching fake systemVersion
-//   - kern.osrelease -> fake kernel version matching fake systemVersion
-//   - uname() machine/release -> same fake values
+// v28 solution: ObjC-only hooks, intercept CUID at all 3 exits:
+//   1. Cookie  (NSHTTPCookieStorage) — BAIDUCUID=xxx
+//   2. URL params (NSMutableURLRequest setURL:) — ?cuid=xxx
+//   3. HTTP Header (NSMutableURLRequest setValue:forHTTPHeaderField:) — cuid: xxx
 //
-// All fake values are persistent per-clone and consistent with each other.
-// Payment safe: sysctl/uname hooks don't affect Alipay/WeChat SDK.
-// vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
+// Safety:
+//   - Only modify items whose name/key contains "cuid" (case-insensitive)
+//   - All other cookies/headers/params untouched → payment safe
+//   - No fishhook → no crash
+//   - Selective Keychain CUID wipe → login tokens preserved
+//   - vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
 #import <Foundation/Foundation.h>
@@ -21,18 +22,16 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <sys/sysctl.h>
-#import <sys/utsname.h>
-#import <string.h>
-#import "fishhook.h"
 
 #define NSLog(...)
 
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
 
 // REAL bundle ID read BEFORE hooks — used as CFPreferences domain
-// so each clone (A1/A2/...) has independent persistent fake IDs.
 static NSString *g_realBundleID = nil;
+
+// Thread-local flag to prevent recursion in hooks
+static __thread BOOL g_inHook = NO;
 
 // ============================================================
 // Persistent fake IDs — keyed to REAL bundle ID
@@ -60,119 +59,30 @@ static NSString *genDeviceName(void) {
     return [NSString stringWithFormat:@"%@的%@", sn[arc4random_uniform((uint32_t)sn.count)], md[arc4random_uniform((uint32_t)md.count)]];
 }
 
-// Generate a fake iOS version string per clone
 static NSString *genFakeSystemVersion(void) {
     NSArray *versions = @[@"15.7", @"16.0", @"16.1", @"16.2", @"16.3", @"16.4", @"16.5", @"16.6"];
     return versions[arc4random_uniform((uint32_t)versions.count)];
 }
 
-// Fake device hardware model (hw.machine)
-static NSString *genFakeMachine(void) {
-    NSArray *models = @[
-        @"iPhone14,5",   // iPhone 13
-        @"iPhone14,7",   // iPhone 14
-        @"iPhone14,8",   // iPhone 14 Plus
-        @"iPhone15,2",   // iPhone 14 Pro
-        @"iPhone15,3",   // iPhone 14 Pro Max
-        @"iPhone15,4",   // iPhone 15
-        @"iPhone15,5",   // iPhone 15 Plus
-        @"iPhone14,6",   // iPhone 13 mini
-        @"iPhone14,4",   // iPhone 13 Pro
-    ];
-    return models[arc4random_uniform((uint32_t)models.count)];
+// Get the per-clone fake CUID
+static NSString *getFakeCUID(void) {
+    return getPersistent(@"Bdhk.cuid", ^{
+        NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        NSMutableString *s = [NSMutableString string];
+        for (int i = 0; i < 40; i++)
+            [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+        return s;
+    });
 }
 
-// iOS version -> build number + kernel release mapping
-// Ensures sysctlbyname("kern.osversion") and kern.osrelease are
-// consistent with UIDevice.systemVersion
-static NSDictionary *versionInfoMap(NSString *version) {
-    NSDictionary *map = @{
-        @"15.7": @{@"build": @"19H221",  @"release": @"21.6.0"},
-        @"16.0": @{@"build": @"20A362",  @"release": @"22.0.0"},
-        @"16.1": @{@"build": @"20B82",   @"release": @"22.1.0"},
-        @"16.2": @{@"build": @"20C65",   @"release": @"22.2.0"},
-        @"16.3": @{@"build": @"20D47",   @"release": @"22.3.0"},
-        @"16.4": @{@"build": @"20E246",  @"release": @"22.4.0"},
-        @"16.5": @{@"build": @"20F66",   @"release": @"22.5.0"},
-        @"16.6": @{@"build": @"20G75",   @"release": @"22.6.0"},
-    };
-    return map[version] ?: @{@"build": @"20G75", @"release": @"22.6.0"};
-}
-
-// ============================================================
-// fishhook: sysctlbyname hook
-// Intercepts hw.machine, hw.product, kern.osversion, kern.osrelease
-// ============================================================
-static int (*orig_sysctlbyname)(const char *, void *, size_t *,
-                                 const void *, size_t) = NULL;
-
-static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
-                              const void *newp, size_t newlen) {
-    if (name) {
-        NSString *fakeStr = nil;
-
-        // hw.machine / hw.product -> fake device model
-        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.product") == 0) {
-            fakeStr = getPersistent(@"Bdhk.hm", ^{ return genFakeMachine(); });
-        }
-        // kern.osversion -> fake build number (e.g. "20G75")
-        else if (strcmp(name, "kern.osversion") == 0) {
-            NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
-            fakeStr = versionInfoMap(fakeSV)[@"build"];
-        }
-        // kern.osrelease -> fake kernel version (e.g. "22.6.0")
-        else if (strcmp(name, "kern.osrelease") == 0) {
-            NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
-            fakeStr = versionInfoMap(fakeSV)[@"release"];
-        }
-
-        if (fakeStr) {
-            const char *cstr = [fakeStr UTF8String];
-            size_t fakeLen = strlen(cstr) + 1;
-            if (oldp && oldlenp) {
-                if (*oldlenp >= fakeLen) {
-                    memcpy(oldp, cstr, fakeLen);
-                }
-                *oldlenp = fakeLen;
-                return 0;
-            } else if (oldlenp) {
-                *oldlenp = fakeLen;
-                return 0;
-            }
-        }
-    }
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-}
-
-// ============================================================
-// fishhook: uname hook
-// Intercepts utsname.machine and utsname.release
-// ============================================================
-static int (*orig_uname)(struct utsname *) = NULL;
-
-static int hook_uname(struct utsname *name) {
-    int ret = orig_uname(name);
-    if (ret == 0 && name) {
-        // machine -> fake device model
-        NSString *fakeMachine = getPersistent(@"Bdhk.hm", ^{ return genFakeMachine(); });
-        const char *m = [fakeMachine UTF8String];
-        memset(name->machine, 0, sizeof(name->machine));
-        strncpy(name->machine, m, sizeof(name->machine) - 1);
-
-        // release -> fake kernel version
-        NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
-        NSString *release = versionInfoMap(fakeSV)[@"release"];
-        const char *r = [release UTF8String];
-        memset(name->release, 0, sizeof(name->release));
-        strncpy(name->release, r, sizeof(name->release) - 1);
-    }
-    return ret;
+// Check if a string contains "cuid" (case-insensitive)
+static BOOL containsCUID(NSString *s) {
+    if (!s) return NO;
+    return [s.lowercaseString containsString:@"cuid"];
 }
 
 // ============================================================
 // Selective Keychain CUID deletion
-// Deletes ONLY items whose service/account/label contains "cuid"
-// Login tokens (BDUSS, STOKEN, passport, session, etc.) are PRESERVED
 // ============================================================
 static void wipeCUIDFromKeychain(void) {
     @try {
@@ -216,6 +126,58 @@ static void wipeCUIDFromKeychain(void) {
             CFRelease(result);
         }
     } @catch (id e) {}
+}
+
+// ============================================================
+// Replace cuid in URL query string
+// e.g. "https://xxx.baidu.com/xxx?cuid=ABCDEF&foo=bar"
+//    → "https://xxx.baidu.com/xxx?cuid=FAKE_CUID&foo=bar"
+// ============================================================
+static NSURL *replaceCUIDInURL(NSURL *url) {
+    if (!url) return url;
+    NSString *query = [url query];
+    if (!query || !containsCUID(query)) return url;
+
+    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (!comp || !comp.queryItems) return url;
+
+    NSMutableArray *newItems = [NSMutableArray array];
+    for (NSURLQueryItem *item in comp.queryItems) {
+        if (containsCUID(item.name)) {
+            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:getFakeCUID()]];
+        } else {
+            [newItems addObject:item];
+        }
+    }
+    comp.queryItems = newItems;
+    NSURL *newURL = [comp URL];
+    return newURL ?: url;
+}
+
+// ============================================================
+// Replace cuid in a single cookie
+// ============================================================
+static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
+    if (!cookie || !containsCUID(cookie.name)) return cookie;
+    NSMutableDictionary *props = [NSMutableDictionary dictionary];
+    props[NSHTTPCookieName] = cookie.name;
+    props[NSHTTPCookieValue] = getFakeCUID();
+    if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
+    if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
+    if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
+    props[NSHTTPCookieVersion] = @(cookie.version);
+    if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
+    NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
+    return newCookie ?: cookie;
+}
+
+static NSArray *modifiedCookies(NSArray *cookies) {
+    if (!cookies || cookies.count == 0) return cookies;
+    NSMutableArray *result = [NSMutableArray arrayWithCapacity:cookies.count];
+    for (NSHTTPCookie *cookie in cookies) {
+        [result addObject:modifiedCookie(cookie)];
+    }
+    return result;
 }
 
 // ============================================================
@@ -340,26 +302,126 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. fishhook: sysctlbyname + uname ----
-        // Hook C functions that bypass UIDevice and read kernel directly.
-        // Baidu uses sysctlbyname("hw.machine") to get real device model.
+        // ---- 5. NSMutableURLRequest hooks (HTTP Header + URL params) ----
+        // Only replaces fields whose name contains "cuid" (case-insensitive)
+        // Payment SDK headers don't contain "cuid" → payment safe
         @try {
-            struct rebinding rebindings[] = {
-                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
-            };
-            rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+            Class reqClass = objc_getClass("NSMutableURLRequest");
+            if (reqClass) {
+                // setValue:forHTTPHeaderField: — replace cuid header value
+                Method svm = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+                if (svm) {
+                    IMP origSV = method_getImplementation(svm);
+                    IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (!g_inHook && field && containsCUID(field)) {
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), getFakeCUID(), field);
+                            g_inHook = NO;
+                            return;
+                        }
+                        ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
+                    });
+                    class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svm));
+                }
+
+                // addValue:forHTTPHeaderField: — replace cuid header value
+                Method avm = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
+                if (avm) {
+                    IMP origAV = method_getImplementation(avm);
+                    IMP newAV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (!g_inHook && field && containsCUID(field)) {
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), getFakeCUID(), field);
+                            g_inHook = NO;
+                            return;
+                        }
+                        ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), value, field);
+                    });
+                    class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAV, method_getTypeEncoding(avm));
+                }
+
+                // setURL: — replace cuid in URL query params
+                Method sum = class_getInstanceMethod(reqClass, @selector(setURL:));
+                if (sum) {
+                    IMP origSU = method_getImplementation(sum);
+                    IMP newSU = imp_implementationWithBlock(^void(id s, NSURL *url) {
+                        if (!g_inHook && url) {
+                            NSURL *newURL = replaceCUIDInURL(url);
+                            if (newURL != url) {
+                                g_inHook = YES;
+                                ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), newURL);
+                                g_inHook = NO;
+                                return;
+                            }
+                        }
+                        ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), url);
+                    });
+                    class_replaceMethod(reqClass, @selector(setURL:), newSU, method_getTypeEncoding(sum));
+                }
+            }
         } @catch (id e) {}
 
-        // ---- 6. Pre-write fake CUID into NSUserDefaults ----
+        // ---- 6. NSHTTPCookieStorage hooks (Cookie CUID replacement) ----
+        // Only replaces cookies whose name contains "cuid" (case-insensitive)
+        // Payment cookies (BDUSS, STOKEN, etc.) are untouched → payment safe
         @try {
-            NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{
-                NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-                NSMutableString *s = [NSMutableString string];
-                for (int i = 0; i < 40; i++)
-                    [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-                return s;
-            });
+            Class cs = objc_getClass("NSHTTPCookieStorage");
+            if (cs) {
+                // cookiesForURL: — replace cuid cookies in return value
+                Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
+                if (cfuM) {
+                    IMP origCFU = method_getImplementation(cfuM);
+                    IMP newCFU = imp_implementationWithBlock(^NSArray *(id s, NSURL *url) {
+                        NSArray *cookies = ((NSArray *(*)(id, SEL, NSURL *))origCFU)(s, @selector(cookiesForURL:), url);
+                        if (g_inHook) return cookies;
+                        g_inHook = YES;
+                        @try { NSArray *m = modifiedCookies(cookies); g_inHook = NO; return m; }
+                        @catch (id e) { g_inHook = NO; return cookies; }
+                    });
+                    class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
+                }
+
+                // cookies — replace cuid cookies in return value
+                Method allM = class_getInstanceMethod(cs, @selector(cookies));
+                if (allM) {
+                    IMP origAll = method_getImplementation(allM);
+                    IMP newAll = imp_implementationWithBlock(^NSArray *(id s) {
+                        NSArray *cookies = ((NSArray *(*)(id, SEL))origAll)(s, @selector(cookies));
+                        if (g_inHook) return cookies;
+                        g_inHook = YES;
+                        @try { NSArray *m = modifiedCookies(cookies); g_inHook = NO; return m; }
+                        @catch (id e) { g_inHook = NO; return cookies; }
+                    });
+                    class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
+                }
+
+                // setCookie: — replace cuid cookie value before storing
+                Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
+                if (scM) {
+                    IMP origSC = method_getImplementation(scM);
+                    IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
+                        NSHTTPCookie *mc = g_inHook ? cookie : modifiedCookie(cookie);
+                        ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), mc);
+                    });
+                    class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
+                }
+
+                // setCookies:forURL:mainDocumentURL: — replace cuid cookies
+                Method scfM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
+                if (scfM) {
+                    IMP origSCF = method_getImplementation(scfM);
+                    IMP newSCF = imp_implementationWithBlock(^void(id s, NSArray *cookies, NSURL *url, NSURL *mainDocURL) {
+                        NSArray *mc = g_inHook ? cookies : modifiedCookies(cookies);
+                        ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCF)(s, @selector(setCookies:forURL:mainDocumentURL:), mc, url, mainDocURL);
+                    });
+                    class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCF, method_getTypeEncoding(scfM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 7. Pre-write fake CUID into NSUserDefaults ----
+        @try {
+            NSString *fakeCUID = getFakeCUID();
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             for (NSString *k in @[@"CUID", @"cuid", @"BD_CUID", @"baidu_cuid",
                                   @"BAIDU_CUID", @"kCUID", @"com.baidu.cuid"]) {
