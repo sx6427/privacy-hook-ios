@@ -1,19 +1,18 @@
 //
-// PrivacyHook.m — v26: Selective Keychain CUID wipe (no re-login)
+// PrivacyHook.m — v27: sysctlbyname + uname hook for device model spoofing
 //
-// Problem with v24: didn't touch Keychain → A1/A2 share CUID in Keychain
-//   → "下单人数过多"
-// Problem with v23: cleared ALL Keychain → deleted login tokens → re-login
+// v26 problem: UIDevice hooks alone insufficient. Baidu reads hw.machine
+//   via sysctlbyname("hw.machine") -> real "iPhone7,2" shown to server.
+//   Also reads kern.osrelease -> wrong kernel version.
 //
-// Solution: Selectively delete ONLY CUID-related Keychain items.
-//   1. Query all Keychain generic-password items
-//   2. Delete only items whose service/account/label contains "cuid"
-//   3. Login tokens (BDUSS, STOKEN, passport, etc.) are preserved → no re-login
-//   4. CUID gone from Keychain → app falls back to NSUserDefaults fake CUID
-//      or regenerates using hooked IDFV/systemVersion → different per clone
-//   5. Pre-write fake CUID to NSUserDefaults as fallback
+// v27 solution: use fishhook to intercept sysctlbyname + uname C functions.
+//   - hw.machine / hw.product -> fake model (iPhone14,5 etc.)
+//   - kern.osversion -> fake build number matching fake systemVersion
+//   - kern.osrelease -> fake kernel version matching fake systemVersion
+//   - uname() machine/release -> same fake values
 //
-// No fishhook, no cookie hooks, no NSURLSession hooks → payment safe.
+// All fake values are persistent per-clone and consistent with each other.
+// Payment safe: sysctl/uname hooks don't affect Alipay/WeChat SDK.
 // vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
@@ -22,6 +21,10 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <sys/sysctl.h>
+#import <sys/utsname.h>
+#import <string.h>
+#import "fishhook.h"
 
 #define NSLog(...)
 
@@ -63,6 +66,109 @@ static NSString *genFakeSystemVersion(void) {
     return versions[arc4random_uniform((uint32_t)versions.count)];
 }
 
+// Fake device hardware model (hw.machine)
+static NSString *genFakeMachine(void) {
+    NSArray *models = @[
+        @"iPhone14,5",   // iPhone 13
+        @"iPhone14,7",   // iPhone 14
+        @"iPhone14,8",   // iPhone 14 Plus
+        @"iPhone15,2",   // iPhone 14 Pro
+        @"iPhone15,3",   // iPhone 14 Pro Max
+        @"iPhone15,4",   // iPhone 15
+        @"iPhone15,5",   // iPhone 15 Plus
+        @"iPhone14,6",   // iPhone 13 mini
+        @"iPhone14,4",   // iPhone 13 Pro
+    ];
+    return models[arc4random_uniform((uint32_t)models.count)];
+}
+
+// iOS version -> build number + kernel release mapping
+// Ensures sysctlbyname("kern.osversion") and kern.osrelease are
+// consistent with UIDevice.systemVersion
+static NSDictionary *versionInfoMap(NSString *version) {
+    NSDictionary *map = @{
+        @"15.7": @{@"build": @"19H221",  @"release": @"21.6.0"},
+        @"16.0": @{@"build": @"20A362",  @"release": @"22.0.0"},
+        @"16.1": @{@"build": @"20B82",   @"release": @"22.1.0"},
+        @"16.2": @{@"build": @"20C65",   @"release": @"22.2.0"},
+        @"16.3": @{@"build": @"20D47",   @"release": @"22.3.0"},
+        @"16.4": @{@"build": @"20E246",  @"release": @"22.4.0"},
+        @"16.5": @{@"build": @"20F66",   @"release": @"22.5.0"},
+        @"16.6": @{@"build": @"20G75",   @"release": @"22.6.0"},
+    };
+    return map[version] ?: @{@"build": @"20G75", @"release": @"22.6.0"};
+}
+
+// ============================================================
+// fishhook: sysctlbyname hook
+// Intercepts hw.machine, hw.product, kern.osversion, kern.osrelease
+// ============================================================
+static int (*orig_sysctlbyname)(const char *, void *, size_t *,
+                                 const void *, size_t) = NULL;
+
+static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                              const void *newp, size_t newlen) {
+    if (name) {
+        NSString *fakeStr = nil;
+
+        // hw.machine / hw.product -> fake device model
+        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.product") == 0) {
+            fakeStr = getPersistent(@"Bdhk.hm", ^{ return genFakeMachine(); });
+        }
+        // kern.osversion -> fake build number (e.g. "20G75")
+        else if (strcmp(name, "kern.osversion") == 0) {
+            NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
+            fakeStr = versionInfoMap(fakeSV)[@"build"];
+        }
+        // kern.osrelease -> fake kernel version (e.g. "22.6.0")
+        else if (strcmp(name, "kern.osrelease") == 0) {
+            NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
+            fakeStr = versionInfoMap(fakeSV)[@"release"];
+        }
+
+        if (fakeStr) {
+            const char *cstr = [fakeStr UTF8String];
+            size_t fakeLen = strlen(cstr) + 1;
+            if (oldp && oldlenp) {
+                if (*oldlenp >= fakeLen) {
+                    memcpy(oldp, cstr, fakeLen);
+                }
+                *oldlenp = fakeLen;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = fakeLen;
+                return 0;
+            }
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// ============================================================
+// fishhook: uname hook
+// Intercepts utsname.machine and utsname.release
+// ============================================================
+static int (*orig_uname)(struct utsname *) = NULL;
+
+static int hook_uname(struct utsname *name) {
+    int ret = orig_uname(name);
+    if (ret == 0 && name) {
+        // machine -> fake device model
+        NSString *fakeMachine = getPersistent(@"Bdhk.hm", ^{ return genFakeMachine(); });
+        const char *m = [fakeMachine UTF8String];
+        memset(name->machine, 0, sizeof(name->machine));
+        strncpy(name->machine, m, sizeof(name->machine) - 1);
+
+        // release -> fake kernel version
+        NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
+        NSString *release = versionInfoMap(fakeSV)[@"release"];
+        const char *r = [release UTF8String];
+        memset(name->release, 0, sizeof(name->release));
+        strncpy(name->release, r, sizeof(name->release) - 1);
+    }
+    return ret;
+}
+
 // ============================================================
 // Selective Keychain CUID deletion
 // Deletes ONLY items whose service/account/label contains "cuid"
@@ -70,7 +176,6 @@ static NSString *genFakeSystemVersion(void) {
 // ============================================================
 static void wipeCUIDFromKeychain(void) {
     @try {
-        // Query all generic-password items (attributes only, no data)
         NSDictionary *query = @{
             (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
             (__bridge id)kSecReturnAttributes: @YES,
@@ -92,8 +197,6 @@ static void wipeCUIDFromKeychain(void) {
                 [searchStr appendString:@"\n"];
                 if (label)   [searchStr appendString:label];
 
-                // Match CUID and other device-ID related items
-                // (same patterns as NSUserDefaults cleanup above)
                 NSString *lower = searchStr.lowercaseString;
                 BOOL isDeviceID = ([lower containsString:@"cuid"] ||
                                    [lower containsString:@"deviceid"] ||
@@ -102,8 +205,6 @@ static void wipeCUIDFromKeychain(void) {
                                    [lower containsString:@"bdid"] ||
                                    [lower containsString:@"clientid"]);
                 if (isDeviceID) {
-                    // Delete ONLY this device-ID-related item
-                    // Login tokens (BDUSS, STOKEN, passport, session) are PRESERVED
                     NSMutableDictionary *delQuery = [NSMutableDictionary dictionary];
                     delQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
                     if (service) delQuery[(__bridge id)kSecAttrService] = service;
@@ -145,9 +246,6 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 1b. Selectively delete CUID from Keychain ----
-        // ONLY deletes items whose service/account/label contains "cuid"
-        // Login tokens (BDUSS, STOKEN, passport, session, auth, etc.) are
-        // PRESERVED → no re-login after restart.
         wipeCUIDFromKeychain();
 
         // ---- 2. Bundle ID hook (3 methods) ----
@@ -194,7 +292,6 @@ static void initPrivacyHook(void) {
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
-                // systemVersion → fake per-clone (changes CUID generation input)
                 Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
                 if (svM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
@@ -243,9 +340,18 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. Pre-write fake CUID into NSUserDefaults ----
-        // After clearing CUID from both NSUserDefaults and Keychain,
-        // write our fake CUID so app uses it.
+        // ---- 5. fishhook: sysctlbyname + uname ----
+        // Hook C functions that bypass UIDevice and read kernel directly.
+        // Baidu uses sysctlbyname("hw.machine") to get real device model.
+        @try {
+            struct rebinding rebindings[] = {
+                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
+                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
+            };
+            rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+        } @catch (id e) {}
+
+        // ---- 6. Pre-write fake CUID into NSUserDefaults ----
         @try {
             NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{
                 NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
