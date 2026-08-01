@@ -1209,100 +1209,17 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 16. Security tokens: atbc/natbc/wcp ----
-        // These tokens prove app integrity. Hook them to return dummy values.
-        @try {
-            unsigned int classCount3 = 0;
-            Class *classes3 = objc_copyClassList(&classCount3);
+        // REMOVED v41.1: Hooking fetchWcpInfoForNetwork broke ALL networking.
+        // These methods are called for every network request, not just orders.
+        // Returning fake tokens causes server to reject all requests → "no network".
+        // The tokens are generated from app binary signature which TrollStore changes,
+        // so fake tokens won't work anyway. Need a different approach.
 
-            // Methods that return security tokens - hook to return persistent dummy string
-            NSArray *tokenSelectors = @[
-                @"fetchAtbcForNetworking",
-                @"fetchNatbcForNetworking",
-                @"fetchWcpInfoForNetwork",
-                @"fetchWcpInfoForDXMBankPay",
-                @"wcpEncoded",
-                @"fetchAtbc",
-                @"fetchNatbc",
-                @"fetchWcp",
-            ];
-
-            NSString *fakeToken = getPersistent(@"Bdhk.token", ^{
-                NSString *cs = @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-                NSMutableString *s = [NSMutableString string];
-                for (int i = 0; i < 44; i++)
-                    [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-                return s;
-            });
-
-            for (unsigned int ci = 0; ci < classCount3; ci++) {
-                Class cls = classes3[ci];
-                for (NSString *selName in tokenSelectors) {
-                    SEL sel = NSSelectorFromString(selName);
-                    // Instance method
-                    Method m = class_getInstanceMethod(cls, sel);
-                    if (m) {
-                        const char *typeEnc = method_getTypeEncoding(m);
-                        IMP imp = imp_implementationWithBlock(^NSString *(id s) { return fakeToken; });
-                        class_replaceMethod(cls, sel, imp, typeEnc);
-                    }
-                    // Class method
-                    m = class_getClassMethod(cls, sel);
-                    if (m) {
-                        const char *typeEnc = method_getTypeEncoding(m);
-                        IMP imp = imp_implementationWithBlock(^NSString *(id s) { return fakeToken; });
-                        class_replaceMethod(object_getClass(cls), sel, imp, typeEnc);
-                    }
-                }
-            }
-            free(classes3);
-        } @catch (id e) {}
-
-        // ---- 17. App Store receipt hook ----
-        // TrollStore apps don't have a receipt. Return a fake URL.
-        @try {
-            Class bc2 = objc_getClass("NSBundle");
-            if (bc2) {
-                Method rm = class_getInstanceMethod(bc2, @selector(appStoreReceiptURL));
-                if (rm) {
-                    IMP origR = method_getImplementation(rm);
-                    IMP newR = imp_implementationWithBlock(^NSURL *(id s) {
-                        if ([s isEqual:[NSBundle mainBundle]]) {
-                            // Return a fake receipt URL that looks like App Store
-                            NSString *fakePath = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:getPersistent(@"Bdhk.uuid", ^{ return genUUIDStr(); })];
-                            fakePath = [fakePath stringByAppendingPathComponent:@"BaiduBoxApp.app/_MASReceipt/receipt"];
-                            return [NSURL fileURLWithPath:fakePath];
-                        }
-                        return ((NSURL *(*)(id, SEL))origR)(s, @selector(appStoreReceiptURL));
-                    });
-                    class_replaceMethod(bc2, @selector(appStoreReceiptURL), newR, method_getTypeEncoding(rm));
-                }
-                // Also hook bundlePath to return App Store-like path
-                Method bpm = class_getInstanceMethod(bc2, @selector(bundlePath));
-                if (bpm) {
-                    IMP origBP = method_getImplementation(bpm);
-                    IMP newBP = imp_implementationWithBlock(^NSString *(id s) {
-                        if ([s isEqual:[NSBundle mainBundle]]) {
-                            NSString *fakePath = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:getPersistent(@"Bdhk.uuid", ^{ return genUUIDStr(); })];
-                            return [fakePath stringByAppendingPathComponent:@"BaiduBoxApp.app"];
-                        }
-                        return ((NSString *(*)(id, SEL))origBP)(s, @selector(bundlePath));
-                    });
-                    class_replaceMethod(bc2, @selector(bundlePath), newBP, method_getTypeEncoding(bpm));
-                }
-                // Hook executablePath
-                Method epm = class_getInstanceMethod(bc2, @selector(executablePath));
-                if (epm) {
-                    IMP origEP = method_getImplementation(epm);
-                    IMP newEP = imp_implementationWithBlock(^NSString *(id s) {
-                        if ([s isEqual:[NSBundle mainBundle]]) {
-                            NSString *fakePath = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:getPersistent(@"Bdhk.uuid", ^{ return genUUIDStr(); })];
-                            return [fakePath stringByAppendingPathComponent:@"BaiduBoxApp.app/BaiduBoxApp"];
-                        }
-                        return ((NSString *(*)(id, SEL))origEP)(s, @selector(executablePath));
-                    });
-                    class_replaceMethod(bc2, @selector(executablePath), newEP, method_getTypeEncoding(epm));
-                }
-            }
-        } @catch (id e) {}
+//        // ---- 17. App Store receipt hook ----
+//        // REMOVED v41.1: bundlePath/executablePath/appStoreReceiptURL hooks
+//        // broke networking + login (app can't find its own resources/certs/keychain).
+//        @try {
+//            Class bc2 = objc_getClass("NSBundle");
+//        } @catch (id e) {}
     }
 }
