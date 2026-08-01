@@ -1,23 +1,22 @@
 //
-// PrivacyHook.m — v42: task_info(TASK_DYLD_INFO) + objc_copyImageNames anti-injection
+// PrivacyHook.m — v43: Multi-instance without CUID replacement
 //
-// ROOT CAUSE (CONFIRMED): Original TrollStore app (no dylib) works fine!
-//   → TrollStore signature is NOT the problem.
-//   → Our INJECTED DYLIB is detected by atbc/natbc/wcp token generation.
-//   → v40 hooks (_dyld_get_image_name, dladdr, getenv) are NOT enough.
-//   → App uses task_info(TASK_DYLD_INFO) to read kernel-level image list,
-//     bypassing our dyld hooks.
+// ROOT CAUSE (CONFIRMED): Replacing CUID with random values while keeping
+//   the same BDUSS (login token) caused Baidu to flag the account.
+//   CUID and BDUSS are linked server-side. Changing CUID = account theft
+//   signal → risk control → "下单人数过多".
 //
-// v42 FIX:
-//   1. Hook task_info(TASK_DYLD_INFO) — modify dyld_all_image_infos to hide our dylib
-//   2. Hook objc_copyImageNames — replace our image name with fake
-//   3. Keep all v41.1 hooks
+// v43 FIX: DON'T touch CUID/BAIDUID at all!
+//   1. Change device fingerprint (model, OS version, IDFV, IDFA) → app generates different CUID naturally
+//   2. Keychain is isolated by bundle ID change → each instance has own CUID/BAIDUID
+//   3. Each instance uses a DIFFERENT Baidu account
+//   4. Keep anti-jailbreak + anti-injection detection hiding
+//   5. NO Keychain wiping, NO Cookie wiping, NO CUID replacement
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
-#import <Security/Security.h>
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
 #import <CoreTelephony/CTCarrier.h>
 #import <objc/runtime.h>
@@ -38,7 +37,7 @@ static NSString *g_realBundleID = nil;
 static __thread BOOL g_inHook = NO;
 
 // ============================================================
-// Persistent fake IDs
+// Persistent fake IDs — keyed to REAL bundle ID (per instance)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfDomain = (__bridge CFStringRef)(g_realBundleID ?: kOrigBundleID);
@@ -68,289 +67,20 @@ static NSString *genFakeSystemVersion(void) {
     return versions[arc4random_uniform((uint32_t)versions.count)];
 }
 
-static NSString *getFakeCUID(void) {
-    return getPersistent(@"Bdhk.cuid", ^{
-        NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        NSMutableString *s = [NSMutableString string];
-        for (int i = 0; i < 40; i++)
-            [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-        return s;
-    });
-}
-
-// BAIDUID: server-assigned cookie, typically like "A1B2C3D4E5F6G7H8:FG=1"
-static NSString *getFakeBAIDUID(void) {
-    return getPersistent(@"Bdhk.baiduid", ^{
-        NSString *cs = @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        NSMutableString *s = [NSMutableString string];
-        for (int i = 0; i < 32; i++)
-            [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-        [s appendString:@":FG=1"];
-        return s;
-    });
-}
-
-static NSString *getFakeMAC(void) {
-    return getPersistent(@"Bdhk.mac", ^{
-        NSMutableString *s = [NSMutableString string];
-        for (int i = 0; i < 6; i++) {
-            if (i > 0) [s appendString:@":"];
-            [s appendFormat:@"%02X%02X", arc4random_uniform(256), arc4random_uniform(256)];
-        }
-        return s;
-    });
-}
-
-static NSString *getFakeMachineID(void) {
-    return getPersistent(@"Bdhk.machineid", ^{ return genUUIDStr(); });
-}
-
-static NSString *getFakeUDID(void) {
-    return getPersistent(@"Bdhk.udid", ^{
-        NSMutableString *s = [NSMutableString string];
-        NSString *cs = @"0123456789abcdef";
-        for (int i = 0; i < 40; i++)
-            [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-        return s;
+static NSString *getFakeMachine(void) {
+    return getPersistent(@"Bdhk.hwmodel", ^{
+        NSArray *models = @[@"iPhone14,5", @"iPhone14,7", @"iPhone15,2", @"iPhone15,3", @"iPhone13,2", @"iPhone12,1"];
+        return models[arc4random_uniform((uint32_t)models.count)];
     });
 }
 
 // ============================================================
-// Check functions
-// ============================================================
-static BOOL containsCUID(NSString *s) {
-    if (!s) return NO;
-    return [s.lowercaseString containsString:@"cuid"];
-}
-
-static BOOL containsBAIDUID(NSString *s) {
-    if (!s) return NO;
-    return [s.lowercaseString containsString:@"baiduid"];
-}
-
-static BOOL containsDeviceID(NSString *s) {
-    if (!s) return NO;
-    return containsCUID(s) || containsBAIDUID(s);
-}
-
-static BOOL isCUIDRelatedKey(NSString *key) {
-    if (!key) return NO;
-    NSString *lk = key.lowercaseString;
-    return [lk containsString:@"cuid"] ||
-           [lk containsString:@"sapi"] ||
-           [lk containsString:@"device_id"] ||
-           [lk containsString:@"deviceid"] ||
-           [lk containsString:@"bdudid"] ||
-           [lk containsString:@"bd_uuid"] ||
-           [lk containsString:@"baiduid"] ||
-           [lk containsString:@"baiduid"] ||
-           [lk containsString:@"bdid"] ||
-           [lk containsString:@"clientid"] ||
-           [lk containsString:@"machineid"] ||
-           [lk containsString:@"clone"];
-}
-
-static BOOL shouldPreserveKey(NSString *key) {
-    if (!key) return NO;
-    NSString *lk = key.lowercaseString;
-    return [lk containsString:@"bduss"] ||
-           [lk containsString:@"stoken"] ||
-           [lk containsString:@"login"] ||
-           [lk containsString:@"token"] ||
-           [lk containsString:@"account"] ||
-           [lk containsString:@"passport"] ||
-           [lk containsString:@"session"];
-}
-
-// ============================================================
-// Replace device IDs in strings and URLs
-// ============================================================
-static NSString *replaceDeviceIDsInString(NSString *str) {
-    if (!str) return str;
-    BOOL hasCUID = containsCUID(str);
-    BOOL hasBAIDUID = containsBAIDUID(str);
-    if (!hasCUID && !hasBAIDUID) return str;
-
-    NSMutableString *result = [str mutableCopy];
-    NSError *err = nil;
-
-    if (hasCUID) {
-        NSString *fakeCUID = getFakeCUID();
-
-        // cuid=xxx in URL query
-        NSRegularExpression *regex1 = [NSRegularExpression
-            regularExpressionWithPattern:@"(cuid=)([^&;\"' \r\n]+)"
-            options:NSRegularExpressionCaseInsensitive error:&err];
-        if (regex1) [regex1 replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:[NSString stringWithFormat:@"$1%@", fakeCUID]];
-
-        // "cuid":"xxx" in JSON
-        NSRegularExpression *regex2 = [NSRegularExpression
-            regularExpressionWithPattern:@"(\"cuid\"\\s*:\\s*\")([^\"]+)(\")"
-            options:NSRegularExpressionCaseInsensitive error:&err];
-        if (regex2) [regex2 replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:[NSString stringWithFormat:@"$1%@$3", fakeCUID]];
-
-        // "cuid":12345 (numeric) in JSON
-        NSRegularExpression *regex3 = [NSRegularExpression
-            regularExpressionWithPattern:@"(\"cuid\"\\s*:\\s*)([0-9]+)"
-            options:NSRegularExpressionCaseInsensitive error:&err];
-        if (regex3) [regex3 replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:[NSString stringWithFormat:@"$1\"%@\"", fakeCUID]];
-
-        // cuid%3Dxxx (URL encoded)
-        NSRegularExpression *regex4 = [NSRegularExpression
-            regularExpressionWithPattern:@"(cuid%3[dD])([^&;%\"' ]+)"
-            options:0 error:&err];
-        if (regex4) [regex4 replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:[NSString stringWithFormat:@"$1%@", fakeCUID]];
-    }
-
-    if (hasBAIDUID) {
-        NSString *fakeBAIDUID = getFakeBAIDUID();
-
-        // BAIDUID=xxx in URL query
-        NSRegularExpression *regex1 = [NSRegularExpression
-            regularExpressionWithPattern:@"(BAIDUID=)([^&;\"' \r\n:]+)(:[^&;\"' \r\n]*)?"
-            options:NSRegularExpressionCaseInsensitive error:&err];
-        if (regex1) [regex1 replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:[NSString stringWithFormat:@"$1%@", fakeBAIDUID]];
-
-        // "baiduid":"xxx" in JSON
-        NSRegularExpression *regex2 = [NSRegularExpression
-            regularExpressionWithPattern:@"(\"baiduid\"\\s*:\\s*\")([^\"]+)(\")"
-            options:NSRegularExpressionCaseInsensitive error:&err];
-        if (regex2) [regex2 replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:[NSString stringWithFormat:@"$1%@$3", fakeBAIDUID]];
-    }
-
-    return result;
-}
-
-static NSURL *replaceDeviceIDsInURL(NSURL *url) {
-    if (!url) return url;
-    NSString *query = [url query];
-    if (!query || !containsDeviceID(query)) return url;
-    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-    if (!comp || !comp.queryItems) return url;
-    NSMutableArray *newItems = [NSMutableArray array];
-    NSString *fakeCUID = getFakeCUID();
-    NSString *fakeBAIDUID = getFakeBAIDUID();
-    for (NSURLQueryItem *item in comp.queryItems) {
-        if (containsCUID(item.name)) {
-            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:fakeCUID]];
-        } else if (containsBAIDUID(item.name)) {
-            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:fakeBAIDUID]];
-        } else if (item.value && containsDeviceID(item.value)) {
-            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:replaceDeviceIDsInString(item.value)]];
-        } else {
-            [newItems addObject:item];
-        }
-    }
-    comp.queryItems = newItems;
-    return [comp URL] ?: url;
-}
-
-// ============================================================
-// Cookie helpers — now handles BAIDUID too!
-// ============================================================
-static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
-    if (!cookie) return cookie;
-
-    BOOL isCUIDCookie = containsCUID(cookie.name);
-    BOOL isBAIDUIDCookie = containsBAIDUID(cookie.name);
-
-    if (!isCUIDCookie && !isBAIDUIDCookie) return cookie;
-
-    NSString *newValue = isCUIDCookie ? getFakeCUID() : getFakeBAIDUID();
-    NSMutableDictionary *props = [NSMutableDictionary dictionary];
-    props[NSHTTPCookieName] = cookie.name;
-    props[NSHTTPCookieValue] = newValue;
-    if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
-    if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
-    if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
-    props[NSHTTPCookieVersion] = @(cookie.version);
-    if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
-    return [[NSHTTPCookie alloc] initWithProperties:props] ?: cookie;
-}
-
-static NSArray *modifiedCookies(NSArray *cookies) {
-    if (!cookies || cookies.count == 0) return cookies;
-    NSMutableArray *result = [NSMutableArray arrayWithCapacity:cookies.count];
-    for (NSHTTPCookie *cookie in cookies) [result addObject:modifiedCookie(cookie)];
-    return result;
-}
-
-// ============================================================
-// Delete ALL cookies except BDUSS/STOKEN
-// ============================================================
-static void wipeAllCookiesExceptLogin(void) {
-    @try {
-        NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-        NSArray *allCookies = [cs cookies];
-        if (!allCookies) return;
-
-        for (NSHTTPCookie *cookie in allCookies) {
-            NSString *ln = cookie.name.lowercaseString;
-            // Preserve login-related cookies
-            if ([ln containsString:@"bduss"] || [ln containsString:@"stoken"] ||
-                [ln containsString:@"login"] || [ln containsString:@"token"] ||
-                [ln containsString:@"account"] || [ln containsString:@"passport"]) {
-                continue;
-            }
-            // Delete everything else — especially BAIDUID!
-            [cs deleteCookie:cookie];
-        }
-    } @catch (id e) {}
-}
-
-// ============================================================
-// AGGRESSIVE Keychain wipe (preserve only login tokens)
-// ============================================================
-static void wipeAllKeychainExceptLogin(void) {
-    @try {
-        NSDictionary *query = @{
-            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-            (__bridge id)kSecReturnAttributes: @YES,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-        };
-        CFTypeRef result = NULL;
-        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
-        if (status == errSecSuccess && result) {
-            NSArray *items = (__bridge_transfer NSArray *)result;
-            for (NSDictionary *item in items) {
-                NSString *service = item[(__bridge id)kSecAttrService];
-                NSString *account = item[(__bridge id)kSecAttrAccount];
-                NSString *label   = item[(__bridge id)kSecAttrLabel];
-
-                NSMutableString *searchStr = [NSMutableString string];
-                if (service) [searchStr appendString:service];
-                [searchStr appendString:@"\n"];
-                if (account) [searchStr appendString:account];
-                [searchStr appendString:@"\n"];
-                if (label)   [searchStr appendString:label];
-
-                if (shouldPreserveKey(searchStr)) continue;
-
-                NSMutableDictionary *delQuery = [NSMutableDictionary dictionary];
-                delQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-                if (service) delQuery[(__bridge id)kSecAttrService] = service;
-                if (account) delQuery[(__bridge id)kSecAttrAccount] = account;
-                SecItemDelete((__bridge CFDictionaryRef)delQuery);
-            }
-        } else if (result) {
-            CFRelease(result);
-        }
-
-        for (id secClass in @[(__bridge id)kSecClassInternetPassword, (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey]) {
-            NSDictionary *delAll = @{ (__bridge id)kSecClass: secClass };
-            SecItemDelete((__bridge CFDictionaryRef)delAll);
-        }
-    } @catch (id e) {}
-}
-
-// ============================================================
-// Anti-jailbreak: Hook access() to hide jailbreak files
+// Anti-jailbreak: Hook access/stat/lstat to hide jailbreak files
 // ============================================================
 static int (*orig_access)(const char *, int) = NULL;
 static int hooked_access(const char *path, int mode) {
     if (!orig_access) return -1;
     if (path) {
-        // Hide jailbreak/TrollStore files
         if (strstr(path, "/Applications/Cydia.app") ||
             strstr(path, "/private/var/lib/apt") ||
             strstr(path, "/private/var/lib/cydia") ||
@@ -374,7 +104,6 @@ static int hooked_access(const char *path, int mode) {
     return orig_access(path, mode);
 }
 
-// Hook stat() to hide jailbreak files
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int hooked_stat(const char *path, struct stat *buf) {
     if (!orig_stat) return -1;
@@ -393,7 +122,6 @@ static int hooked_stat(const char *path, struct stat *buf) {
     return orig_stat(path, buf);
 }
 
-// Hook lstat() to hide jailbreak files
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
 static int hooked_lstat(const char *path, struct stat *buf) {
     if (!orig_lstat) return -1;
@@ -412,44 +140,32 @@ static int hooked_lstat(const char *path, struct stat *buf) {
 }
 
 // ============================================================
-// Anti-injection detection: Hide our dylib from scans
+// Anti-injection: Hide our dylib from all detection methods
 // ============================================================
-
-// The dylib is renamed to BaiduBoxSys.dylib in the IPA
-// We need to hide both "PrivacyHook" and "BaiduBoxSys" from detection
 static BOOL shouldHideImageName(const char *name) {
     if (!name) return NO;
-    // Check for our dylib names
     if (strstr(name, "PrivacyHook") || strstr(name, "BaiduBoxSys")) return YES;
-    // Also check for any dylib in the app's Frameworks dir that shouldn't be there
-    // (but be conservative - only hide our own)
     return NO;
 }
 
 static const char *getFakeImageName(void) {
-    // Return a plausible system framework name
     return "/System/Library/Frameworks/Foundation.framework/Foundation";
 }
 
-// Hook _dyld_get_image_name
 static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
 static const char *hooked_dyld_get_image_name(uint32_t image_index) {
     if (!orig_dyld_get_image_name) return NULL;
     const char *name = orig_dyld_get_image_name(image_index);
-    if (shouldHideImageName(name)) {
-        return getFakeImageName();
-    }
+    if (shouldHideImageName(name)) return getFakeImageName();
     return name;
 }
 
-// Hook dladdr - hide info about our dylib
 static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
 static int hooked_dladdr(const void *addr, Dl_info *info) {
     if (!orig_dladdr) return 0;
     int ret = orig_dladdr(addr, info);
     if (ret != 0 && info && info->dli_fname) {
         if (shouldHideImageName(info->dli_fname)) {
-            // Replace with fake info
             info->dli_fname = getFakeImageName();
             info->dli_sname = NULL;
             info->dli_saddr = NULL;
@@ -458,82 +174,57 @@ static int hooked_dladdr(const void *addr, Dl_info *info) {
     return ret;
 }
 
-// Hook getenv - hide DYLD_INSERT_LIBRARIES
 static char *(*orig_getenv)(const char *) = NULL;
 static char *hooked_getenv(const char *name) {
     if (!orig_getenv) return NULL;
-    if (name && strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) {
+    if (name && (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
+                 strcmp(name, "_MSSafeMode") == 0 ||
+                 strcmp(name, "MSDebugFilter") == 0)) {
         return NULL;
     }
     return orig_getenv(name);
 }
 
-// Hook class_getImageName - hide our classes' image
 static const char *(*orig_class_getImageName)(Class) = NULL;
 static const char *hooked_class_getImageName(Class cls) {
     if (!orig_class_getImageName) return NULL;
     const char *name = orig_class_getImageName(cls);
-    if (shouldHideImageName(name)) {
-        return getFakeImageName();
-    }
+    if (shouldHideImageName(name)) return getFakeImageName();
     return name;
 }
 
-// ============================================================
 // v42: Hook task_info(TASK_DYLD_INFO) — kernel-level image list
-// This is the MOST IMPORTANT hook! App reads dyld_all_image_infos directly
-// from kernel memory, bypassing _dyld_get_image_name.
-// ============================================================
 static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
-
 static kern_return_t hooked_task_info(task_name_t target_task, task_flavor_t flavor,
                                        task_info_t task_info_out, mach_msg_type_number_t *task_info_count) {
     kern_return_t ret = orig_task_info(target_task, flavor, task_info_out, task_info_count);
     if (ret != KERN_SUCCESS) return ret;
-
-    // TASK_DYLD_INFO = 17, TASK_DYLD_INFO_32 = 18, TASK_DYLD_INFO_64 = 19
-    if (flavor < 17 || flavor > 19) return ret;
+    if (flavor < 17 || flavor > 19) return ret;  // TASK_DYLD_INFO variants
     if (!task_info_out) return ret;
 
-    // The result is a struct task_dyld_info with all_image_info_addr
-    // pointing to dyld_all_image_infos in user memory
     mach_vm_address_t infoAddr = 0;
-    if (flavor == 17) {  // TASK_DYLD_INFO
-        struct task_dyld_info *di = (struct task_dyld_info *)task_info_out;
-        infoAddr = di->all_image_info_addr;
-    } else if (flavor == 19) {  // TASK_DYLD_INFO_64
+    if (flavor == 17 || flavor == 19) {
         struct task_dyld_info *di = (struct task_dyld_info *)task_info_out;
         infoAddr = di->all_image_info_addr;
     } else {
-        // TASK_DYLD_INFO_32 — 32-bit variant
         uint32_t *p = (uint32_t *)task_info_out;
         infoAddr = p[0];
     }
-
     if (!infoAddr) return ret;
 
-    // Read dyld_all_image_infos structure
     struct dyld_all_image_infos *allInfos = (struct dyld_all_image_infos *)infoAddr;
     if (!allInfos || !allInfos->infoArray || allInfos->infoArrayCount == 0) return ret;
 
-    // Replace our dylib's path in the infoArray
     for (uint32_t i = 0; i < allInfos->infoArrayCount; i++) {
         const char *path = allInfos->infoArray[i].imageFilePath;
         if (path && shouldHideImageName(path)) {
-            // Replace the path pointer with our fake path
-            // Cast away const to modify the pointer
             *(const char **)&allInfos->infoArray[i].imageFilePath = getFakeImageName();
         }
     }
-
     return ret;
 }
 
-// ============================================================
-// v42: Hook objc_copyImageNames — ObjC runtime image list
-// ============================================================
 static const char **(*orig_objc_copyImageNames)(unsigned int *) = NULL;
-
 static const char **hooked_objc_copyImageNames(unsigned int *outCount) {
     unsigned int count = 0;
     const char **names = orig_objc_copyImageNames(&count);
@@ -541,27 +232,19 @@ static const char **hooked_objc_copyImageNames(unsigned int *outCount) {
         if (outCount) *outCount = count;
         return names;
     }
-
-    // Replace our dylib's name with fake path
     for (unsigned int i = 0; i < count; i++) {
         if (names[i] && shouldHideImageName(names[i])) {
             names[i] = getFakeImageName();
         }
     }
-
     if (outCount) *outCount = count;
     return names;
 }
 
-// ============================================================
-// v42: Hook _dyld_image_count — return count minus our hidden images
-// ============================================================
 static uint32_t (*orig_dyld_image_count)(void) = NULL;
-
 static uint32_t hooked_dyld_image_count(void) {
     if (!orig_dyld_image_count) return 0;
     uint32_t count = orig_dyld_image_count();
-    // Count how many of our images are hidden
     uint32_t hiddenCount = 0;
     for (uint32_t i = 0; i < count; i++) {
         const char *name = orig_dyld_get_image_name(i);
@@ -571,19 +254,15 @@ static uint32_t hooked_dyld_image_count(void) {
 }
 
 // ============================================================
-// Fishhook: sysctlbyname and uname
+// Fishhook: sysctlbyname + uname (device fingerprint)
 // ============================================================
-static char g_fakeModel[32] = {0};
 static char g_fakeMachine[32] = {0};
-static char g_fakeVersion[32] = {0};
 static char g_fakeRelease[32] = {0};
+static char g_fakeVersion[32] = {0};
 
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
-
 static int hooked_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (!orig_sysctlbyname) return -1;
-
-    // hw.machine → fake machine model
     if (name && strcmp(name, "hw.machine") == 0) {
         if (oldp && oldlenp && *oldlenp >= strlen(g_fakeMachine) + 1) {
             strcpy((char *)oldp, g_fakeMachine);
@@ -593,22 +272,10 @@ static int hooked_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
         if (oldlenp) *oldlenp = strlen(g_fakeMachine);
         return 0;
     }
-    // hw.model → fake model
-    if (name && strcmp(name, "hw.model") == 0) {
-        if (oldp && oldlenp && *oldlenp >= strlen(g_fakeModel) + 1) {
-            strcpy((char *)oldp, g_fakeModel);
-            *oldlenp = strlen(g_fakeModel);
-            return 0;
-        }
-        if (oldlenp) *oldlenp = strlen(g_fakeModel);
-        return 0;
-    }
-
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
 static int (*orig_uname)(struct utsname *) = NULL;
-
 static int hooked_uname(struct utsname *buf) {
     if (!orig_uname) return -1;
     int ret = orig_uname(buf);
@@ -621,195 +288,37 @@ static int hooked_uname(struct utsname *buf) {
 }
 
 // ============================================================
-// Hook ALL device ID class methods
-// ============================================================
-static void hookDeviceIDMethods(void) {
-    // +[BIMBaiduUDID value]
-    @try {
-        Class cls = objc_getClass("BIMBaiduUDID");
-        if (cls) {
-            Method m = class_getClassMethod(cls, @selector(value));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeUDID(); });
-                class_replaceMethod(object_getClass(cls), @selector(value), imp, method_getTypeEncoding(m));
-            }
-        }
-    } @catch (id e) {}
-
-    // +[DXMSensorsAnalyticsSDK getUniqueHardwareId]
-    @try {
-        Class cls = objc_getClass("DXMSensorsAnalyticsSDK");
-        if (cls) {
-            Method m = class_getClassMethod(cls, @selector(getUniqueHardwareId));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeUDID(); });
-                class_replaceMethod(object_getClass(cls), @selector(getUniqueHardwareId), imp, method_getTypeEncoding(m));
-            }
-            m = class_getClassMethod(cls, @selector(getIDFA));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    return getPersistent(@"Bdhk.ai", ^{ return genUUIDStr(); });
-                });
-                class_replaceMethod(object_getClass(cls), @selector(getIDFA), imp, method_getTypeEncoding(m));
-            }
-        }
-    } @catch (id e) {}
-
-    // +[YYUtility(Device) macAddresss]
-    @try {
-        Class cls = objc_getClass("YYUtility");
-        if (cls) {
-            // Try class method
-            Method m = class_getClassMethod(cls, @selector(macAddresss));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeMAC(); });
-                class_replaceMethod(object_getClass(cls), @selector(macAddresss), imp, method_getTypeEncoding(m));
-            }
-            // Try instance method
-            m = class_getInstanceMethod(cls, @selector(macAddresss));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeMAC(); });
-                class_replaceMethod(cls, @selector(macAddresss), imp, method_getTypeEncoding(m));
-            }
-        }
-    } @catch (id e) {}
-
-    // +[UtilsHelper getMachineID:] / -[UtilsHelper getDeviceID] / +[UtilsHelper lists_YYUdid]
-    @try {
-        Class cls = objc_getClass("UtilsHelper");
-        if (cls) {
-            // +[UtilsHelper getMachineID:]
-            Method m = class_getClassMethod(cls, @selector(getMachineID:));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s, id arg) { return getFakeMachineID(); });
-                class_replaceMethod(object_getClass(cls), @selector(getMachineID:), imp, method_getTypeEncoding(m));
-            }
-            // -[UtilsHelper getDeviceID]
-            m = class_getInstanceMethod(cls, @selector(getDeviceID));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeMachineID(); });
-                class_replaceMethod(cls, @selector(getDeviceID), imp, method_getTypeEncoding(m));
-            }
-            // +[UtilsHelper lists_YYUdid]
-            m = class_getClassMethod(cls, @selector(lists_YYUdid));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeUDID(); });
-                class_replaceMethod(object_getClass(cls), @selector(lists_YYUdid), imp, method_getTypeEncoding(m));
-            }
-        }
-    } @catch (id e) {}
-
-    // +[DMDeviceInfoWrapper deviceModel / systemVersion / cellularProviderName]
-    @try {
-        Class cls = objc_getClass("DMDeviceInfoWrapper");
-        if (cls) {
-            Method m = class_getClassMethod(cls, @selector(deviceModel));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    return getPersistent(@"Bdhk.hwmodel", ^{
-                        NSArray *models = @[@"iPhone14,5", @"iPhone14,7", @"iPhone15,2", @"iPhone15,3", @"iPhone13,2", @"iPhone12,1"];
-                        return models[arc4random_uniform((uint32_t)models.count)];
-                    });
-                });
-                class_replaceMethod(object_getClass(cls), @selector(deviceModel), imp, method_getTypeEncoding(m));
-            }
-            m = class_getClassMethod(cls, @selector(systemVersion));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    return getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
-                });
-                class_replaceMethod(object_getClass(cls), @selector(systemVersion), imp, method_getTypeEncoding(m));
-            }
-            m = class_getClassMethod(cls, @selector(cellularProviderName));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; });
-                class_replaceMethod(object_getClass(cls), @selector(cellularProviderName), imp, method_getTypeEncoding(m));
-            }
-        }
-    } @catch (id e) {}
-
-    // -[BIMDeviceInfoUtility deviceModelVersion]
-    @try {
-        Class cls = objc_getClass("BIMDeviceInfoUtility");
-        if (cls) {
-            Method m = class_getInstanceMethod(cls, @selector(deviceModelVersion));
-            if (m) {
-                IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                    return getPersistent(@"Bdhk.hwmodel", ^{
-                        NSArray *models = @[@"iPhone14,5", @"iPhone14,7", @"iPhone15,2", @"iPhone15,3", @"iPhone13,2", @"iPhone12,1"];
-                        return models[arc4random_uniform((uint32_t)models.count)];
-                    });
-                });
-                class_replaceMethod(cls, @selector(deviceModelVersion), imp, method_getTypeEncoding(m));
-            }
-        }
-    } @catch (id e) {}
-
-    // Hook getBaiduid / getBaiduID / readBaiduIDFromCookie / getBaiduIDInCookie
-    @try {
-        unsigned int classCount = 0;
-        Class *classes = objc_copyClassList(&classCount);
-        NSArray *baiduidSelectors = @[@"getBaiduid", @"getbaiduid", @"getBaiduID",
-                                      @"getBaiduIDInCookie", @"readBaiduIDFromCookie",
-                                      @"getBaiduidFromCookie"];
-        for (unsigned int ci = 0; ci < classCount; ci++) {
-            Class cls = classes[ci];
-            for (NSString *selName in baiduidSelectors) {
-                SEL sel = NSSelectorFromString(selName);
-                Method m = class_getInstanceMethod(cls, sel);
-                if (m) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeBAIDUID(); });
-                    class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
-                }
-                m = class_getClassMethod(cls, sel);
-                if (m) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeBAIDUID(); });
-                    class_replaceMethod(object_getClass(cls), sel, imp, method_getTypeEncoding(m));
-                }
-            }
-        }
-        free(classes);
-    } @catch (id e) {}
-}
-
-// ============================================================
 // Constructor
 // ============================================================
-__attribute__((constructor))
-static void initPrivacyHook(void) {
+__attribute__((constructor)) static void PrivacyHookConstructor(void) {
     @autoreleasepool {
-
-        // ---- 0. Read REAL bundle ID ----
+        // ---- 0. Read REAL bundle ID (for per-instance persistent storage) ----
         @try {
             NSDictionary *d = [[NSBundle mainBundle] infoDictionary];
-            g_realBundleID = [d[@"CFBundleIdentifier"] copy];
+            g_realBundleID = d[@"CFBundleIdentifier"];
+            if (!g_realBundleID) g_realBundleID = kOrigBundleID;
         } @catch (id e) {}
 
-        // ---- 1. Generate fake hardware identifiers for fishhook ----
+        // ---- 1. Generate persistent fake device fingerprint ----
         @try {
-            NSString *fakeMachine = getPersistent(@"Bdhk.hwmodel", ^{
-                NSArray *models = @[@"iPhone14,5", @"iPhone14,7", @"iPhone15,2", @"iPhone15,3", @"iPhone13,2", @"iPhone12,1"];
-                return models[arc4random_uniform((uint32_t)models.count)];
-            });
+            NSString *fakeMachine = getFakeMachine();
             NSString *fakeVersion = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
 
             strncpy(g_fakeMachine, [fakeMachine UTF8String], sizeof(g_fakeMachine) - 1);
-            strncpy(g_fakeModel, [fakeMachine UTF8String], sizeof(g_fakeModel) - 1);
             strncpy(g_fakeRelease, [[NSString stringWithFormat:@"Darwin Kernel Version %@", fakeVersion] UTF8String], sizeof(g_fakeRelease) - 1);
             strncpy(g_fakeVersion, [fakeVersion UTF8String], sizeof(g_fakeVersion) - 1);
         } @catch (id e) {}
 
-        // ---- 2. Fishhook: sysctlbyname + uname + anti-injection ----
+        // ---- 2. Fishhook: device fingerprint + anti-injection + anti-jailbreak ----
         @try {
             struct rebinding rebindings[] = {
                 {"sysctlbyname",          (void *)hooked_sysctlbyname,          (void **)&orig_sysctlbyname},
                 {"uname",                 (void *)hooked_uname,                 (void **)&orig_uname},
-                // Anti-injection: hide our dylib from dyld scans
+                // Anti-injection: hide our dylib
                 {"_dyld_get_image_name",  (void *)hooked_dyld_get_image_name,  (void **)&orig_dyld_get_image_name},
                 {"dladdr",                (void *)hooked_dladdr,                (void **)&orig_dladdr},
                 {"getenv",                (void *)hooked_getenv,                (void **)&orig_getenv},
                 {"class_getImageName",    (void *)hooked_class_getImageName,    (void **)&orig_class_getImageName},
-                // v42: Kernel-level image list hiding
                 {"task_info",             (void *)hooked_task_info,             (void **)&orig_task_info},
                 {"objc_copyImageNames",   (void *)hooked_objc_copyImageNames,   (void **)&orig_objc_copyImageNames},
                 {"_dyld_image_count",     (void *)hooked_dyld_image_count,      (void **)&orig_dyld_image_count},
@@ -819,16 +328,14 @@ static void initPrivacyHook(void) {
                 {"lstat",                 (void *)hooked_lstat,                 (void **)&orig_lstat},
             };
 
-            // Hook in ALL non-system images (like v36)
+            // Hook in ALL non-system images
             unsigned int imageCount = 0;
             const char **imageNames = objc_copyImageNames(&imageCount);
             for (unsigned int i = 0; i < imageCount; i++) {
                 const char *name = imageNames[i];
                 if (!name) continue;
                 NSString *ns = [NSString stringWithUTF8String:name];
-                // Skip system frameworks
                 if ([ns containsString:@"/System/"] || [ns containsString:@"/Library/"]) continue;
-                // Hook all app/framework images
                 void *header = dlopen(name, RTLD_NOLOAD);
                 if (header) {
                     Dl_info info;
@@ -840,122 +347,23 @@ static void initPrivacyHook(void) {
             free(imageNames);
         } @catch (id e) {}
 
-        // ---- 3. Delete ALL cookies except BDUSS/STOKEN (KEY FIX for BAIDUID!) ----
-        wipeAllCookiesExceptLogin();
-
-        // ---- 4. Wipe keychain (preserve login tokens) ----
-        wipeAllKeychainExceptLogin();
-
-        // ---- 5. Delete CUID/BAIDUID from NSUserDefaults ----
-        @try {
-            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-            NSDictionary *allDict = [ud dictionaryRepresentation];
-            for (NSString *key in allDict.allKeys) {
-                NSString *lk = key.lowercaseString;
-                if ([lk containsString:@"cuid"] || [lk containsString:@"deviceid"] ||
-                    [lk containsString:@"device_id"] || [lk containsString:@"machineid"] ||
-                    [lk containsString:@"bdudid"] || [lk containsString:@"bd_uuid"] ||
-                    [lk containsString:@"clone"] || [lk containsString:@"sapi"] ||
-                    [lk containsString:@"baiduid"]) {
-                    [ud removeObjectForKey:key];
-                }
-            }
-            [ud synchronize];
-        } @catch (id e) {}
-
-        // ---- 6. Pre-write fake CUID to ALL keychain locations ----
-        @try {
-            NSString *fakeCUID = getFakeCUID();
-            NSArray *services = @[
-                @"SAPICUID", @"SAPICUIDKeychain", @"com.baidu.sapi.cuid",
-                @"com.baidu.cuid", @"BDCUID", @"cuid",
-                @"com.baidu.BaiduMobile.cuid", @"BD_CUID",
-                @"com.baidu.device.cuid", @"bd_cuid",
-                @"clone_cuid", @"com.baidu.clone.cuid",
-                @"SAPICUIDKeychainQuery",
-                @"B83JBVZ6M5.com.baidu.baidumobile.cuid",
-            ];
-            NSArray *accounts = @[
-                @"cuid", @"CUID", @"SAPICUID", @"default",
-                @"com.baidu.cuid", @"",
-            ];
-            for (NSString *svc in services) {
-                for (NSString *acc in accounts) {
-                    NSDictionary *query = @{
-                        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                        (__bridge id)kSecAttrService: svc,
-                        (__bridge id)kSecAttrAccount: acc ?: @"",
-                    };
-                    SecItemDelete((__bridge CFDictionaryRef)query);
-                    NSMutableDictionary *addQuery = [NSMutableDictionary dictionaryWithDictionary:query];
-                    addQuery[(__bridge id)kSecValueData] = [fakeCUID dataUsingEncoding:NSUTF8StringEncoding];
-                    addQuery[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
-                    SecItemAdd((__bridge CFDictionaryRef)addQuery, NULL);
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 7. Pre-write fake CUID + BAIDUID to NSUserDefaults ----
-        @try {
-            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-            for (NSString *k in @[@"CUID", @"cuid", @"BD_CUID", @"baidu_cuid",
-                                  @"BAIDU_CUID", @"kCUID", @"com.baidu.cuid",
-                                  @"bd_cuid", @"box_cuid", @"APP_CUID",
-                                  @"clone_cuid", @"SAPICUID", @"sapi_cuid",
-                                  @"BAIDUID", @"baiduid", @"BaiduID", @"baiduID"]) {
-                if ([k.lowercaseString containsString:@"baiduid"]) {
-                    [ud setObject:getFakeBAIDUID() forKey:k];
-                } else {
-                    [ud setObject:getFakeCUID() forKey:k];
-                }
-            }
-            [ud synchronize];
-        } @catch (id e) {}
-
-        // ---- 8. Hook ALL device ID methods ----
-        hookDeviceIDMethods();
-
-        // ---- 9. Bundle ID hook ----
+        // ---- 3. Bundle ID hook (payment compatibility) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
-                Method m1 = class_getInstanceMethod(bc, @selector(bundleIdentifier));
-                if (m1) {
-                    IMP orig1 = method_getImplementation(m1);
-                    IMP imp1 = imp_implementationWithBlock(^NSString *(id s) {
+                Method bm = class_getInstanceMethod(bc, @selector(bundleIdentifier));
+                if (bm) {
+                    IMP origBI = method_getImplementation(bm);
+                    IMP newBI = imp_implementationWithBlock(^NSString *(id s) {
                         if ([s isEqual:[NSBundle mainBundle]]) return kOrigBundleID;
-                        return ((NSString *(*)(id, SEL))orig1)(s, @selector(bundleIdentifier));
+                        return ((NSString *(*)(id, SEL))origBI)(s, @selector(bundleIdentifier));
                     });
-                    class_replaceMethod(bc, @selector(bundleIdentifier), imp1, method_getTypeEncoding(m1));
-                }
-                Method m2 = class_getInstanceMethod(bc, @selector(objectForInfoDictionaryKey:));
-                if (m2) {
-                    IMP orig2 = method_getImplementation(m2);
-                    IMP imp2 = imp_implementationWithBlock(^id(id s, NSString *key) {
-                        if ([s isEqual:[NSBundle mainBundle]] && key &&
-                            [key isEqualToString:@"CFBundleIdentifier"]) return kOrigBundleID;
-                        return ((id (*)(id, SEL, NSString *))orig2)(s, @selector(objectForInfoDictionaryKey:), key);
-                    });
-                    class_replaceMethod(bc, @selector(objectForInfoDictionaryKey:), imp2, method_getTypeEncoding(m2));
-                }
-                Method m3 = class_getInstanceMethod(bc, @selector(infoDictionary));
-                if (m3) {
-                    IMP orig3 = method_getImplementation(m3);
-                    IMP imp3 = imp_implementationWithBlock(^NSDictionary *(id s) {
-                        NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig3)(s, @selector(infoDictionary));
-                        if ([s isEqual:[NSBundle mainBundle]] && dict) {
-                            NSMutableDictionary *md = [NSMutableDictionary dictionaryWithDictionary:dict];
-                            md[@"CFBundleIdentifier"] = kOrigBundleID;
-                            return md;
-                        }
-                        return dict;
-                    });
-                    class_replaceMethod(bc, @selector(infoDictionary), imp3, method_getTypeEncoding(m3));
+                    class_replaceMethod(bc, @selector(bundleIdentifier), newBI, method_getTypeEncoding(bm));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 10. UIDevice hooks ----
+        // ---- 4. UIDevice hooks (systemVersion, name, IDFV, model) ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -972,7 +380,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 11. IDFA hook ----
+        // ---- 5. IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -981,62 +389,25 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 12. ANTI-CLONE: Hook clone detection methods ----
+        // ---- 6. Device model hooks ----
         @try {
-            unsigned int classCount = 0;
-            Class *classes = objc_copyClassList(&classCount);
-
-            NSArray *returnNoSelectors = @[@"isDeviceCloned"];
-            NSArray *returnCUIDSelectors = @[@"getCUID", @"getCuid", @"getCUid", @"getCUIDStr", @"getCuidFromCookie", @"getConfigCuid:", @"getPassCuid", @"getCurrentCuid"];
-            NSArray *noopSelectors = @[
-                @"cloneDeviceSynchronizeCuidStorage:newCuid:deviceInfo:",
-                @"cuidStatisticsCloneDevice:previousCuid:deviceType:from:",
-                @"bba_doCloneDeviceActivation",
-                @"registForCloneDeviceCuid:",
-                @"cuidDealedWithCloneAction",
-                @"deleteDeviceCloneInfo",
-            ];
-
-            for (unsigned int ci = 0; ci < classCount; ci++) {
-                Class cls = classes[ci];
-                for (NSString *selName in returnNoSelectors) {
-                    SEL sel = NSSelectorFromString(selName);
-                    Method m = class_getInstanceMethod(cls, sel);
-                    if (m) { IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; }); class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m)); }
-                    m = class_getClassMethod(cls, sel);
-                    if (m) { IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; }); class_replaceMethod(object_getClass(cls), sel, imp, method_getTypeEncoding(m)); }
-                }
-                for (NSString *selName in returnCUIDSelectors) {
-                    SEL sel = NSSelectorFromString(selName);
-                    Method m = class_getInstanceMethod(cls, sel);
-                    if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeCUID(); }); class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m)); }
-                    m = class_getClassMethod(cls, sel);
-                    if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeCUID(); }); class_replaceMethod(object_getClass(cls), sel, imp, method_getTypeEncoding(m)); }
-                }
-                for (NSString *selName in noopSelectors) {
-                    SEL sel = NSSelectorFromString(selName);
-                    Method m = class_getInstanceMethod(cls, sel);
-                    if (m) { IMP imp = imp_implementationWithBlock(^void(id s) {}); class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m)); }
-                    m = class_getClassMethod(cls, sel);
-                    if (m) { IMP imp = imp_implementationWithBlock(^void(id s) {}); class_replaceMethod(object_getClass(cls), sel, imp, method_getTypeEncoding(m)); }
-                }
+            Class cls = objc_getClass("DMDeviceInfoWrapper");
+            if (cls) {
+                Method m = class_getClassMethod(cls, @selector(deviceModel));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeMachine(); }); class_replaceMethod(object_getClass(cls), @selector(deviceModel), imp, method_getTypeEncoding(m)); }
+                m = class_getClassMethod(cls, @selector(systemVersion));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); }); }); class_replaceMethod(object_getClass(cls), @selector(systemVersion), imp, method_getTypeEncoding(m)); }
             }
-            free(classes);
+            Class cls2 = objc_getClass("BIMDeviceInfoUtility");
+            if (cls2) {
+                Method m = class_getInstanceMethod(cls2, @selector(deviceModelVersion));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeMachine(); }); class_replaceMethod(cls2, @selector(deviceModelVersion), imp, method_getTypeEncoding(m)); }
+            }
         } @catch (id e) {}
 
-        // ---- 12b. ANTI-INJECTION: Hook jailbreak/tamper detection methods ----
+        // ---- 7. Anti-jailbreak/hook detection method hooks ----
         @try {
-            // +[HDANA_ComUtils getJailbrokenApp]
-            Class hdanaCom = objc_getClass("HDANA_ComUtils");
-            if (hdanaCom) {
-                Method m = class_getClassMethod(hdanaCom, @selector(getJailbrokenApp));
-                if (m) {
-                    IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
-                    class_replaceMethod(object_getClass(hdanaCom), @selector(getJailbrokenApp), imp, method_getTypeEncoding(m));
-                }
-            }
-
-            // BDPanJailbreakDetectTool - neutralize all methods
+            // BDPanJailbreakDetectTool
             Class jbDetect = objc_getClass("BDPanJailbreakDetectTool");
             if (jbDetect) {
                 unsigned int methodCount = 0;
@@ -1044,74 +415,33 @@ static void initPrivacyHook(void) {
                 for (unsigned int i = 0; i < methodCount; i++) {
                     SEL sel = method_getName(methods[i]);
                     const char *typeEnc = method_getTypeEncoding(methods[i]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    // Return NO for bool methods, nil for object methods
-                    if ([selName.lowercaseString containsString:@"jailbreak"] ||
-                        [selName.lowercaseString containsString:@"detect"] ||
-                        [selName.lowercaseString containsString:@"check"]) {
-                        if (typeEnc[0] == 'B') {
-                            IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
-                            class_replaceMethod(jbDetect, sel, imp, typeEnc);
-                        } else {
-                            IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
-                            class_replaceMethod(jbDetect, sel, imp, typeEnc);
-                        }
+                    if (typeEnc[0] == 'B') {
+                        IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
+                        class_replaceMethod(jbDetect, sel, imp, typeEnc);
+                    } else {
+                        IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
+                        class_replaceMethod(jbDetect, sel, imp, typeEnc);
                     }
                 }
                 free(methods);
-
-                // Also hook class methods
-                Method *clsMethods = class_copyMethodList(object_getClass(jbDetect), &methodCount);
-                for (unsigned int i = 0; i < methodCount; i++) {
-                    SEL sel = method_getName(clsMethods[i]);
-                    const char *typeEnc = method_getTypeEncoding(clsMethods[i]);
-                    NSString *selName = NSStringFromSelector(sel);
-                    if ([selName.lowercaseString containsString:@"jailbreak"] ||
-                        [selName.lowercaseString containsString:@"detect"] ||
-                        [selName.lowercaseString containsString:@"check"]) {
-                        if (typeEnc[0] == 'B') {
-                            IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
-                            class_replaceMethod(object_getClass(jbDetect), sel, imp, typeEnc);
-                        }
-                    }
-                }
-                free(clsMethods);
             }
 
-            // Hook IsValidate_hookDetection everywhere
-            // preventingTampering → return NO
-            // use_jailbreak_detect_tool → return NO
-            // jailbreakDetectToolType → return 0
-            // enableBDPTraceSwizzlingMethod → return NO
-            unsigned int classCount2 = 0;
-            Class *classes2 = objc_copyClassList(&classCount2);
+            // Hook all jailbreak/tamper/hook detection selectors
+            unsigned int classCount = 0;
+            Class *classes = objc_copyClassList(&classCount);
             NSArray *antiDetectSelectors = @[
-                @"IsValidate_hookDetection",
-                @"preventingTampering",
-                @"use_jailbreak_detect_tool",
-                @"jailbreakDetectToolType",
+                @"IsValidate_hookDetection", @"preventingTampering",
+                @"use_jailbreak_detect_tool", @"jailbreakDetectToolType",
                 @"enableBDPTraceSwizzlingMethod",
-                @"isJailbroken",
-                @"isJailBreak",
-                @"jailbroken",
-                @"hasJailbreak",
-                @"detectJailbreak",
-                @"checkJailbreak",
-                @"isHooked",
-                @"hookDetect",
-                @"detectHook",
-                @"checkHook",
-                @"isTampered",
-                @"tamperDetect",
-                @"detectTamper",
-                @"checkTamper",
-                @"isInjected",
-                @"injectDetect",
-                @"detectInject",
-                @"checkInject",
+                @"isJailbroken", @"isJailBreak", @"jailbroken", @"hasJailbreak",
+                @"detectJailbreak", @"checkJailbreak",
+                @"isHooked", @"hookDetect", @"detectHook", @"checkHook",
+                @"isTampered", @"tamperDetect", @"detectTamper", @"checkTamper",
+                @"isInjected", @"injectDetect", @"detectInject", @"checkInject",
+                @"isDeviceCloned",
             ];
-            for (unsigned int ci = 0; ci < classCount2; ci++) {
-                Class cls = classes2[ci];
+            for (unsigned int ci = 0; ci < classCount; ci++) {
+                Class cls = classes[ci];
                 for (NSString *selName in antiDetectSelectors) {
                     SEL sel = NSSelectorFromString(selName);
                     Method m = class_getInstanceMethod(cls, sel);
@@ -1128,7 +458,6 @@ static void initPrivacyHook(void) {
                             class_replaceMethod(cls, sel, imp, typeEnc);
                         }
                     }
-                    // Also class methods
                     m = class_getClassMethod(cls, sel);
                     if (m) {
                         const char *typeEnc = method_getTypeEncoding(m);
@@ -1144,180 +473,69 @@ static void initPrivacyHook(void) {
                         }
                     }
                 }
-
-                // Also hook setters for preventingTampering
-                SEL setTamper = NSSelectorFromString(@"setPreventingTampering:");
-                Method setM = class_getInstanceMethod(cls, setTamper);
-                if (setM) {
-                    IMP imp = imp_implementationWithBlock(^void(id s, BOOL v) {});
-                    class_replaceMethod(cls, setTamper, imp, method_getTypeEncoding(setM));
-                }
             }
-            free(classes2);
+            free(classes);
         } @catch (id e) {}
 
-        // ---- 13. NSMutableURLRequest hooks (URL + headers, NOT body) ----
-        @try {
-            Class reqClass = objc_getClass("NSMutableURLRequest");
-
-            Method im1 = class_getInstanceMethod(reqClass, @selector(initWithURL:));
-            if (im1) {
-                IMP origI1 = method_getImplementation(im1);
-                IMP newI1 = imp_implementationWithBlock(^id(id s, NSURL *url) {
-                    if (!g_inHook && url) { NSURL *nu = replaceDeviceIDsInURL(url); if (nu != url) { g_inHook = YES; id r = ((id (*)(id, SEL, NSURL *))origI1)(s, @selector(initWithURL:), nu); g_inHook = NO; return r; } }
-                    return ((id (*)(id, SEL, NSURL *))origI1)(s, @selector(initWithURL:), url);
-                });
-                class_replaceMethod(reqClass, @selector(initWithURL:), newI1, method_getTypeEncoding(im1));
-            }
-
-            Method im2 = class_getInstanceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:));
-            if (im2) {
-                IMP origI2 = method_getImplementation(im2);
-                IMP newI2 = imp_implementationWithBlock(^id(id s, NSURL *url, NSURLRequestCachePolicy p, NSTimeInterval t) {
-                    if (!g_inHook && url) { NSURL *nu = replaceDeviceIDsInURL(url); if (nu != url) { g_inHook = YES; id r = ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origI2)(s, @selector(initWithURL:cachePolicy:timeoutInterval:), nu, p, t); g_inHook = NO; return r; } }
-                    return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origI2)(s, @selector(initWithURL:cachePolicy:timeoutInterval:), url, p, t);
-                });
-                class_replaceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:), newI2, method_getTypeEncoding(im2));
-            }
-
-            Method sum = class_getInstanceMethod(reqClass, @selector(setURL:));
-            if (sum) {
-                IMP origSU = method_getImplementation(sum);
-                IMP newSU = imp_implementationWithBlock(^void(id s, NSURL *url) {
-                    if (!g_inHook && url) { NSURL *nu = replaceDeviceIDsInURL(url); if (nu != url) { g_inHook = YES; ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), nu); g_inHook = NO; return; } }
-                    ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), url);
-                });
-                class_replaceMethod(reqClass, @selector(setURL:), newSU, method_getTypeEncoding(sum));
-            }
-
-            Method svm = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
-            if (svm) {
-                IMP origSV = method_getImplementation(svm);
-                IMP newSV = imp_implementationWithBlock(^void(id s, NSString *v, NSString *f) {
-                    if (!g_inHook && v) {
-                        if (f && containsDeviceID(f)) { g_inHook = YES; ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), containsCUID(f) ? getFakeCUID() : getFakeBAIDUID(), f); g_inHook = NO; return; }
-                        if (containsDeviceID(v)) { g_inHook = YES; ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), replaceDeviceIDsInString(v), f); g_inHook = NO; return; }
-                    }
-                    ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), v, f);
-                });
-                class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svm));
-            }
-
-            Method avm = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
-            if (avm) {
-                IMP origAV = method_getImplementation(avm);
-                IMP newAV = imp_implementationWithBlock(^void(id s, NSString *v, NSString *f) {
-                    if (!g_inHook && v) {
-                        if (f && containsDeviceID(f)) { g_inHook = YES; ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), containsCUID(f) ? getFakeCUID() : getFakeBAIDUID(), f); g_inHook = NO; return; }
-                        if (containsDeviceID(v)) { g_inHook = YES; ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), replaceDeviceIDsInString(v), f); g_inHook = NO; return; }
-                    }
-                    ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), v, f);
-                });
-                class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAV, method_getTypeEncoding(avm));
-            }
-
-            Method sahM = class_getInstanceMethod(reqClass, @selector(setAllHTTPHeaderFields:));
-            if (sahM) {
-                IMP origSAH = method_getImplementation(sahM);
-                IMP newSAH = imp_implementationWithBlock(^void(id s, NSDictionary *headers) {
-                    if (!g_inHook && headers) {
-                        BOOL mod = NO; NSMutableDictionary *md = [NSMutableDictionary dictionary];
-                        for (NSString *k in headers) { NSString *v = headers[k];
-                            if (containsDeviceID(k)) { md[k] = containsCUID(k) ? getFakeCUID() : getFakeBAIDUID(); mod = YES; }
-                            else if (v && containsDeviceID(v)) { md[k] = replaceDeviceIDsInString(v); mod = YES; }
-                            else md[k] = v;
-                        }
-                        if (mod) { g_inHook = YES; ((void (*)(id, SEL, NSDictionary *))origSAH)(s, @selector(setAllHTTPHeaderFields:), md); g_inHook = NO; return; }
-                    }
-                    ((void (*)(id, SEL, NSDictionary *))origSAH)(s, @selector(setAllHTTPHeaderFields:), headers);
-                });
-                class_replaceMethod(reqClass, @selector(setAllHTTPHeaderFields:), newSAH, method_getTypeEncoding(sahM));
-            }
-        } @catch (id e) {}
-
-        // ---- 14. NSHTTPCookieStorage hooks (now handles BAIDUID too!) ----
-        @try {
-            Class cs = objc_getClass("NSHTTPCookieStorage");
-            if (cs) {
-                Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
-                if (cfuM) {
-                    IMP origCFU = method_getImplementation(cfuM);
-                    IMP newCFU = imp_implementationWithBlock(^NSArray *(id s, NSURL *url) {
-                        NSArray *c = ((NSArray *(*)(id, SEL, NSURL *))origCFU)(s, @selector(cookiesForURL:), url);
-                        if (g_inHook) return c;
-                        g_inHook = YES; @try { NSArray *m = modifiedCookies(c); g_inHook = NO; return m; } @catch (id e) { g_inHook = NO; return c; }
-                    });
-                    class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
-                }
-                Method allM = class_getInstanceMethod(cs, @selector(cookies));
-                if (allM) {
-                    IMP origAll = method_getImplementation(allM);
-                    IMP newAll = imp_implementationWithBlock(^NSArray *(id s) {
-                        NSArray *c = ((NSArray *(*)(id, SEL))origAll)(s, @selector(cookies));
-                        if (g_inHook) return c;
-                        g_inHook = YES; @try { NSArray *m = modifiedCookies(c); g_inHook = NO; return m; } @catch (id e) { g_inHook = NO; return c; }
-                    });
-                    class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
-                }
-                Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
-                if (scM) {
-                    IMP origSC = method_getImplementation(scM);
-                    IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
-                        ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), g_inHook ? cookie : modifiedCookie(cookie));
-                    });
-                    class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
-                }
-                Method scfM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
-                if (scfM) {
-                    IMP origSCF = method_getImplementation(scfM);
-                    IMP newSCF = imp_implementationWithBlock(^void(id s, NSArray *cookies, NSURL *url, NSURL *md) {
-                        ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCF)(s, @selector(setCookies:forURL:mainDocumentURL:), g_inHook ? cookies : modifiedCookies(cookies), url, md);
-                    });
-                    class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCF, method_getTypeEncoding(scfM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 15. CoreTelephony hooks ----
+        // ---- 8. CoreTelephony hooks ----
         @try {
             Class ctniClass = objc_getClass("CTTelephonyNetworkInfo");
             if (ctniClass) {
-                Method sscpM = class_getInstanceMethod(ctniClass, @selector(serviceSubscriberCellularProviders));
-                if (sscpM) { IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) { return @{}; }); class_replaceMethod(ctniClass, @selector(serviceSubscriberCellularProviders), imp, method_getTypeEncoding(sscpM)); }
-                Method scratM = class_getInstanceMethod(ctniClass, @selector(serviceCurrentRadioAccessTechnology));
-                if (scratM) { IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) { return @{}; }); class_replaceMethod(ctniClass, @selector(serviceCurrentRadioAccessTechnology), imp, method_getTypeEncoding(scratM)); }
-                Method scpM = class_getInstanceMethod(ctniClass, @selector(subscriberCellularProvider));
-                if (scpM) { IMP imp = imp_implementationWithBlock(^id(id s) { return nil; }); class_replaceMethod(ctniClass, @selector(subscriberCellularProvider), imp, method_getTypeEncoding(scpM)); }
-                Method cratM = class_getInstanceMethod(ctniClass, @selector(currentRadioAccessTechnology));
-                if (cratM) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return nil; }); class_replaceMethod(ctniClass, @selector(currentRadioAccessTechnology), imp, method_getTypeEncoding(cratM)); }
+                Method m = class_getInstanceMethod(ctniClass, @selector(serviceSubscriberCellularProviders));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) { return @{}; }); class_replaceMethod(ctniClass, @selector(serviceSubscriberCellularProviders), imp, method_getTypeEncoding(m)); }
+                m = class_getInstanceMethod(ctniClass, @selector(serviceCurrentRadioAccessTechnology));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) { return @{}; }); class_replaceMethod(ctniClass, @selector(serviceCurrentRadioAccessTechnology), imp, method_getTypeEncoding(m)); }
+                m = class_getInstanceMethod(ctniClass, @selector(subscriberCellularProvider));
+                if (m) { IMP imp = imp_implementationWithBlock(^id(id s) { return nil; }); class_replaceMethod(ctniClass, @selector(subscriberCellularProvider), imp, method_getTypeEncoding(m)); }
             }
             Class carrierClass = objc_getClass("CTCarrier");
             if (carrierClass) {
-                Method cnM = class_getInstanceMethod(carrierClass, @selector(carrierName));
-                if (cnM) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(carrierName), imp, method_getTypeEncoding(cnM)); }
-                Method mccM = class_getInstanceMethod(carrierClass, @selector(mobileCountryCode));
-                if (mccM) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(mobileCountryCode), imp, method_getTypeEncoding(mccM)); }
-                Method mncM = class_getInstanceMethod(carrierClass, @selector(mobileNetworkCode));
-                if (mncM) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(mobileNetworkCode), imp, method_getTypeEncoding(mncM)); }
-                Method isoM = class_getInstanceMethod(carrierClass, @selector(isoCountryCode));
-                if (isoM) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(isoCountryCode), imp, method_getTypeEncoding(isoM)); }
-                Method voipM = class_getInstanceMethod(carrierClass, @selector(allowsVOIP));
-                if (voipM) { IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; }); class_replaceMethod(carrierClass, @selector(allowsVOIP), imp, method_getTypeEncoding(voipM)); }
+                Method m = class_getInstanceMethod(carrierClass, @selector(carrierName));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(carrierName), imp, method_getTypeEncoding(m)); }
+                m = class_getInstanceMethod(carrierClass, @selector(mobileCountryCode));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(mobileCountryCode), imp, method_getTypeEncoding(m)); }
+                m = class_getInstanceMethod(carrierClass, @selector(mobileNetworkCode));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(mobileNetworkCode), imp, method_getTypeEncoding(m)); }
+                m = class_getInstanceMethod(carrierClass, @selector(isoCountryCode));
+                if (m) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(isoCountryCode), imp, method_getTypeEncoding(m)); }
             }
         } @catch (id e) {}
 
-        // ---- 16. Security tokens: atbc/natbc/wcp ----
-        // REMOVED v41.1: Hooking fetchWcpInfoForNetwork broke ALL networking.
-        // These methods are called for every network request, not just orders.
-        // Returning fake tokens causes server to reject all requests → "no network".
-        // The tokens are generated from app binary signature which TrollStore changes,
-        // so fake tokens won't work anyway. Need a different approach.
+        // ---- 9. Anti-clone detection (return NO, don't replace CUID) ----
+        @try {
+            unsigned int classCount = 0;
+            Class *classes = objc_copyClassList(&classCount);
+            NSArray *noopSelectors = @[
+                @"cloneDeviceSynchronizeCuidStorage:newCuid:deviceInfo:",
+                @"cuidStatisticsCloneDevice:previousCuid:deviceType:from:",
+                @"bba_doCloneDeviceActivation",
+                @"registForCloneDeviceCuid:",
+                @"cuidDealedWithCloneAction",
+                @"deleteDeviceCloneInfo",
+            ];
+            for (unsigned int ci = 0; ci < classCount; ci++) {
+                Class cls = classes[ci];
+                for (NSString *selName in noopSelectors) {
+                    SEL sel = NSSelectorFromString(selName);
+                    Method m = class_getInstanceMethod(cls, sel);
+                    if (m) { IMP imp = imp_implementationWithBlock(^void(id s) {}); class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m)); }
+                    m = class_getClassMethod(cls, sel);
+                    if (m) { IMP imp = imp_implementationWithBlock(^void(id s) {}); class_replaceMethod(object_getClass(cls), sel, imp, method_getTypeEncoding(m)); }
+                }
+            }
+            free(classes);
+        } @catch (id e) {}
 
-//        // ---- 17. App Store receipt hook ----
-//        // REMOVED v41.1: bundlePath/executablePath/appStoreReceiptURL hooks
-//        // broke networking + login (app can't find its own resources/certs/keychain).
-//        @try {
-//            Class bc2 = objc_getClass("NSBundle");
-//        } @catch (id e) {}
+        // ---- 10. HDANA jailbreak detection ----
+        @try {
+            Class hdanaCom = objc_getClass("HDANA_ComUtils");
+            if (hdanaCom) {
+                Method m = class_getClassMethod(hdanaCom, @selector(getJailbrokenApp));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
+                    class_replaceMethod(object_getClass(hdanaCom), @selector(getJailbrokenApp), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
     }
 }
