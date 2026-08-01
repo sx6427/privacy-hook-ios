@@ -1,17 +1,17 @@
 //
-// PrivacyHook.m — v41: atbc/natbc/wcp security tokens + receipt + jailbreak file hiding
+// PrivacyHook.m — v42: task_info(TASK_DYLD_INFO) + objc_copyImageNames anti-injection
 //
-// ROOT CAUSE: Baidu sends atbc/natbc/wcp security tokens in order requests.
-//   These tokens are generated based on app integrity (code signature, binary hash).
-//   TrollStore app has different signature → tokens are invalid → server rejects.
-//   Also: appStoreReceiptURL check, jailbreak file path checks.
+// ROOT CAUSE (CONFIRMED): Original TrollStore app (no dylib) works fine!
+//   → TrollStore signature is NOT the problem.
+//   → Our INJECTED DYLIB is detected by atbc/natbc/wcp token generation.
+//   → v40 hooks (_dyld_get_image_name, dladdr, getenv) are NOT enough.
+//   → App uses task_info(TASK_DYLD_INFO) to read kernel-level image list,
+//     bypassing our dyld hooks.
 //
-// v41 FIX:
-//   1. Hook fetchAtbcForNetworking/fetchNatbcForNetworking/fetchWcpInfoForNetwork
-//   2. Hook appStoreReceiptURL to return fake URL
-//   3. Hook access()/stat()/lstat() via fishhook to hide jailbreak files
-//   4. Hook bundlePath/executablePath to return fake App Store paths
-//   5. Keep all v40 anti-injection + device fingerprint hooks
+// v42 FIX:
+//   1. Hook task_info(TASK_DYLD_INFO) — modify dyld_all_image_infos to hide our dylib
+//   2. Hook objc_copyImageNames — replace our image name with fake
+//   3. Keep all v41.1 hooks
 //
 
 #import <Foundation/Foundation.h>
@@ -26,6 +26,9 @@
 #import <sys/utsname.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <mach/mach_init.h>
+#import <mach/task_info.h>
+#import <mach-o/dyld_images.h>
 #import "fishhook.h"
 
 #define NSLog(...)
@@ -477,6 +480,97 @@ static const char *hooked_class_getImageName(Class cls) {
 }
 
 // ============================================================
+// v42: Hook task_info(TASK_DYLD_INFO) — kernel-level image list
+// This is the MOST IMPORTANT hook! App reads dyld_all_image_infos directly
+// from kernel memory, bypassing _dyld_get_image_name.
+// ============================================================
+static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t hooked_task_info(task_name_t target_task, task_flavor_t flavor,
+                                       task_info_t task_info_out, mach_msg_type_number_t *task_info_count) {
+    kern_return_t ret = orig_task_info(target_task, flavor, task_info_out, task_info_count);
+    if (ret != KERN_SUCCESS) return ret;
+
+    // TASK_DYLD_INFO = 17, TASK_DYLD_INFO_32 = 18, TASK_DYLD_INFO_64 = 19
+    if (flavor < 17 || flavor > 19) return ret;
+    if (!task_info_out) return ret;
+
+    // The result is a struct task_dyld_info with all_image_info_addr
+    // pointing to dyld_all_image_infos in user memory
+    mach_vm_address_t infoAddr = 0;
+    if (flavor == 17) {  // TASK_DYLD_INFO
+        struct task_dyld_info *di = (struct task_dyld_info *)task_info_out;
+        infoAddr = di->all_image_info_addr;
+    } else if (flavor == 19) {  // TASK_DYLD_INFO_64
+        struct task_dyld_info *di = (struct task_dyld_info *)task_info_out;
+        infoAddr = di->all_image_info_addr;
+    } else {
+        // TASK_DYLD_INFO_32 — 32-bit variant
+        uint32_t *p = (uint32_t *)task_info_out;
+        infoAddr = p[0];
+    }
+
+    if (!infoAddr) return ret;
+
+    // Read dyld_all_image_infos structure
+    struct dyld_all_image_infos *allInfos = (struct dyld_all_image_infos *)infoAddr;
+    if (!allInfos || !allInfos->infoArray || allInfos->infoArrayCount == 0) return ret;
+
+    // Replace our dylib's path in the infoArray
+    for (uint32_t i = 0; i < allInfos->infoArrayCount; i++) {
+        const char *path = allInfos->infoArray[i].imageFilePath;
+        if (path && shouldHideImageName(path)) {
+            // Replace the path pointer with our fake path
+            // Cast away const to modify the pointer
+            *(const char **)&allInfos->infoArray[i].imageFilePath = getFakeImageName();
+        }
+    }
+
+    return ret;
+}
+
+// ============================================================
+// v42: Hook objc_copyImageNames — ObjC runtime image list
+// ============================================================
+static const char **(*orig_objc_copyImageNames)(unsigned int *) = NULL;
+
+static const char **hooked_objc_copyImageNames(unsigned int *outCount) {
+    unsigned int count = 0;
+    const char **names = orig_objc_copyImageNames(&count);
+    if (!names || count == 0) {
+        if (outCount) *outCount = count;
+        return names;
+    }
+
+    // Replace our dylib's name with fake path
+    for (unsigned int i = 0; i < count; i++) {
+        if (names[i] && shouldHideImageName(names[i])) {
+            names[i] = getFakeImageName();
+        }
+    }
+
+    if (outCount) *outCount = count;
+    return names;
+}
+
+// ============================================================
+// v42: Hook _dyld_image_count — return count minus our hidden images
+// ============================================================
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+
+static uint32_t hooked_dyld_image_count(void) {
+    if (!orig_dyld_image_count) return 0;
+    uint32_t count = orig_dyld_image_count();
+    // Count how many of our images are hidden
+    uint32_t hiddenCount = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (shouldHideImageName(name)) hiddenCount++;
+    }
+    return count > hiddenCount ? count - hiddenCount : count;
+}
+
+// ============================================================
 // Fishhook: sysctlbyname and uname
 // ============================================================
 static char g_fakeModel[32] = {0};
@@ -715,6 +809,10 @@ static void initPrivacyHook(void) {
                 {"dladdr",                (void *)hooked_dladdr,                (void **)&orig_dladdr},
                 {"getenv",                (void *)hooked_getenv,                (void **)&orig_getenv},
                 {"class_getImageName",    (void *)hooked_class_getImageName,    (void **)&orig_class_getImageName},
+                // v42: Kernel-level image list hiding
+                {"task_info",             (void *)hooked_task_info,             (void **)&orig_task_info},
+                {"objc_copyImageNames",   (void *)hooked_objc_copyImageNames,   (void **)&orig_objc_copyImageNames},
+                {"_dyld_image_count",     (void *)hooked_dyld_image_count,      (void **)&orig_dyld_image_count},
                 // Anti-jailbreak: hide jailbreak files
                 {"access",                (void *)hooked_access,                (void **)&orig_access},
                 {"stat",                  (void *)hooked_stat,                  (void **)&orig_stat},
@@ -735,7 +833,7 @@ static void initPrivacyHook(void) {
                 if (header) {
                     Dl_info info;
                     if (dladdr(header, &info)) {
-                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 9);
+                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 12);
                     }
                 }
             }
