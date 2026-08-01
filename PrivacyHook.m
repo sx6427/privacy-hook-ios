@@ -1,23 +1,20 @@
 //
-// PrivacyHook.m — v29: sysctlbyname hook (pre-loaded, no recursion) + CUID interception
+// PrivacyHook.m — v30: Pure ObjC, CUID full interception, no fishhook, no crash
 //
-// v28: CUID HTTP interception works but device model still "iPhone7.2"
-// v27: fishhook crashed → getPersistent() inside hook calls CFPreferences
-//      which internally calls sysctlbyname → infinite recursion → crash
+// v29/v27 crash: fishhook globally hooking sysctlbyname → system libs crash
+// v30: Remove fishhook entirely. Pure ObjC method swizzling only.
 //
-// v29 fix: Pre-load ALL fake values into static variables BEFORE rebind_symbols.
-//   Hook functions ONLY read static vars → zero function calls → no recursion.
-//   Backup recursion guard (__thread flag) as safety net.
+// CUID interception at all 3 exits (the real fix for "下单人数过多"):
+//   1. Cookie  (NSHTTPCookieStorage) — BAIDUCUID=xxx
+//   2. URL params (NSMutableURLRequest setURL:) — ?cuid=xxx
+//   3. HTTP Header (NSMutableURLRequest setValue:forHTTPHeaderField:) — cuid: xxx
 //
-// Features:
-//   1. fishhook: sysctlbyname (hw.machine, kern.osversion, kern.osrelease)
-//   2. fishhook: uname (machine, release)
-//   3. CUID interception: Cookie + URL params + HTTP Header
-//   4. Selective Keychain CUID wipe (login tokens preserved)
-//   5. UIDevice hooks (systemVersion, name, IDFV, model)
-//   6. IDFA hook
-//   7. Bundle ID hook (payment compatibility)
-//   8. vtool SDK 17.0 (payment compatibility)
+// Safety:
+//   - Only modify items whose name/key contains "cuid" (case-insensitive)
+//   - All other cookies/headers/params untouched → payment safe
+//   - No fishhook → no crash
+//   - Selective Keychain CUID wipe → login tokens preserved
+//   - vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
 //
 
 #import <Foundation/Foundation.h>
@@ -25,25 +22,12 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
-#import <sys/sysctl.h>
-#import <sys/utsname.h>
-#import <string.h>
-#import "fishhook.h"
 
 #define NSLog(...)
 
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
 static NSString *g_realBundleID = nil;
 static __thread BOOL g_inHook = NO;
-
-// ============================================================
-// Pre-loaded fake values (filled BEFORE fishhook installation)
-// Hook functions ONLY read these — never call getPersistent
-// ============================================================
-static char g_fakeMachine[64]   = {0};  // e.g. "iPhone14,5"
-static char g_fakeBuild[64]     = {0};  // e.g. "20G75"
-static char g_fakeRelease[64]   = {0};  // e.g. "22.6.0"
-static char g_fakeCUID[256]     = {0};  // per-clone fake CUID
 
 // ============================================================
 // Persistent fake IDs — keyed to REAL bundle ID
@@ -76,97 +60,19 @@ static NSString *genFakeSystemVersion(void) {
     return versions[arc4random_uniform((uint32_t)versions.count)];
 }
 
-static NSString *genFakeMachine(void) {
-    NSArray *models = @[
-        @"iPhone14,5", @"iPhone14,7", @"iPhone14,8",
-        @"iPhone15,2", @"iPhone15,3", @"iPhone15,4", @"iPhone15,5",
-        @"iPhone14,6", @"iPhone14,4",
-    ];
-    return models[arc4random_uniform((uint32_t)models.count)];
+static NSString *getFakeCUID(void) {
+    return getPersistent(@"Bdhk.cuid", ^{
+        NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        NSMutableString *s = [NSMutableString string];
+        for (int i = 0; i < 40; i++)
+            [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+        return s;
+    });
 }
 
-static NSString *genFakeCUID(void) {
-    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 40; i++)
-        [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-    return s;
-}
-
-static NSDictionary *versionInfoMap(NSString *version) {
-    NSDictionary *map = @{
-        @"15.7": @{@"build": @"19H221",  @"release": @"21.6.0"},
-        @"16.0": @{@"build": @"20A362",  @"release": @"22.0.0"},
-        @"16.1": @{@"build": @"20B82",   @"release": @"22.1.0"},
-        @"16.2": @{@"build": @"20C65",   @"release": @"22.2.0"},
-        @"16.3": @{@"build": @"20D47",   @"release": @"22.3.0"},
-        @"16.4": @{@"build": @"20E246",  @"release": @"22.4.0"},
-        @"16.5": @{@"build": @"20F66",   @"release": @"22.5.0"},
-        @"16.6": @{@"build": @"20G75",   @"release": @"22.6.0"},
-    };
-    return map[version] ?: @{@"build": @"20G75", @"release": @"22.6.0"};
-}
-
-// ============================================================
-// fishhook: sysctlbyname (READ-ONLY static vars, no recursion)
-// ============================================================
-static int (*orig_sysctlbyname)(const char *, void *, size_t *,
-                                 const void *, size_t) = NULL;
-
-static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
-                              const void *newp, size_t newlen) {
-    // Recursion guard: if CFPreferences internally calls sysctlbyname,
-    // pass through to original immediately
-    if (g_inHook) {
-        return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    }
-
-    if (name) {
-        const char *fakeStr = NULL;
-
-        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.product") == 0) {
-            fakeStr = g_fakeMachine;
-        } else if (strcmp(name, "kern.osversion") == 0) {
-            fakeStr = g_fakeBuild;
-        } else if (strcmp(name, "kern.osrelease") == 0) {
-            fakeStr = g_fakeRelease;
-        }
-
-        if (fakeStr && fakeStr[0]) {
-            size_t fakeLen = strlen(fakeStr) + 1;
-            if (oldp && oldlenp) {
-                if (*oldlenp >= fakeLen) {
-                    memcpy(oldp, fakeStr, fakeLen);
-                }
-                *oldlenp = fakeLen;
-                return 0;
-            } else if (oldlenp) {
-                *oldlenp = fakeLen;
-                return 0;
-            }
-        }
-    }
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-}
-
-// ============================================================
-// fishhook: uname (READ-ONLY static vars, no recursion)
-// ============================================================
-static int (*orig_uname)(struct utsname *) = NULL;
-
-static int hook_uname(struct utsname *name) {
-    int ret = orig_uname(name);
-    if (ret == 0 && name) {
-        if (g_fakeMachine[0]) {
-            memset(name->machine, 0, sizeof(name->machine));
-            strncpy(name->machine, g_fakeMachine, sizeof(name->machine) - 1);
-        }
-        if (g_fakeRelease[0]) {
-            memset(name->release, 0, sizeof(name->release));
-            strncpy(name->release, g_fakeRelease, sizeof(name->release) - 1);
-        }
-    }
-    return ret;
+static BOOL containsCUID(NSString *s) {
+    if (!s) return NO;
+    return [s.lowercaseString containsString:@"cuid"];
 }
 
 // ============================================================
@@ -217,17 +123,8 @@ static void wipeCUIDFromKeychain(void) {
 }
 
 // ============================================================
-// CUID helpers for HTTP interception
+// CUID URL replacement
 // ============================================================
-static BOOL containsCUID(NSString *s) {
-    if (!s) return NO;
-    return [s.lowercaseString containsString:@"cuid"];
-}
-
-static NSString *getFakeCUIDStr(void) {
-    return [NSString stringWithUTF8String:g_fakeCUID];
-}
-
 static NSURL *replaceCUIDInURL(NSURL *url) {
     if (!url) return url;
     NSString *query = [url query];
@@ -239,7 +136,7 @@ static NSURL *replaceCUIDInURL(NSURL *url) {
     NSMutableArray *newItems = [NSMutableArray array];
     for (NSURLQueryItem *item in comp.queryItems) {
         if (containsCUID(item.name)) {
-            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:getFakeCUIDStr()]];
+            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:getFakeCUID()]];
         } else {
             [newItems addObject:item];
         }
@@ -249,11 +146,14 @@ static NSURL *replaceCUIDInURL(NSURL *url) {
     return newURL ?: url;
 }
 
+// ============================================================
+// CUID Cookie replacement
+// ============================================================
 static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
     if (!cookie || !containsCUID(cookie.name)) return cookie;
     NSMutableDictionary *props = [NSMutableDictionary dictionary];
     props[NSHTTPCookieName] = cookie.name;
-    props[NSHTTPCookieValue] = getFakeCUIDStr();
+    props[NSHTTPCookieValue] = getFakeCUID();
     if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
     if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
     if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
@@ -285,25 +185,7 @@ static void initPrivacyHook(void) {
             g_realBundleID = [d[@"CFBundleIdentifier"] copy];
         } @catch (id e) {}
 
-        // ---- 1. Pre-load ALL fake values into static C strings ----
-        // This MUST happen BEFORE rebind_symbols, so that hook functions
-        // can read static vars without calling any ObjC/Foundation functions.
-        // This prevents the recursion crash that v27 had.
-        @try {
-            NSString *fakeSV = getPersistent(@"Bdhk.sv", ^{ return genFakeSystemVersion(); });
-            NSString *fakeHM = getPersistent(@"Bdhk.hm", ^{ return genFakeMachine(); });
-            NSString *fakeCUID = getPersistent(@"Bdhk.cuid", ^{ return genFakeCUID(); });
-
-            NSDictionary *vi = versionInfoMap(fakeSV);
-
-            // Copy to static C strings (no ObjC needed in hooks after this)
-            strncpy(g_fakeMachine, [fakeHM UTF8String], sizeof(g_fakeMachine) - 1);
-            strncpy(g_fakeBuild,   [vi[@"build"] UTF8String], sizeof(g_fakeBuild) - 1);
-            strncpy(g_fakeRelease, [vi[@"release"] UTF8String], sizeof(g_fakeRelease) - 1);
-            strncpy(g_fakeCUID,    [fakeCUID UTF8String], sizeof(g_fakeCUID) - 1);
-        } @catch (id e) {}
-
-        // ---- 2. Delete CUID-related NSUserDefaults keys ----
+        // ---- 1. Delete CUID-related NSUserDefaults keys ----
         @try {
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             NSDictionary *allDict = [ud dictionaryRepresentation];
@@ -317,22 +199,10 @@ static void initPrivacyHook(void) {
             [ud synchronize];
         } @catch (id e) {}
 
-        // ---- 2b. Selectively delete CUID from Keychain ----
+        // ---- 1b. Selectively delete CUID from Keychain ----
         wipeCUIDFromKeychain();
 
-        // ---- 3. fishhook: sysctlbyname + uname ----
-        // NOW safe: hook functions only read pre-loaded static C strings.
-        // No ObjC/Foundation calls inside hooks → no recursion.
-        // Backup recursion guard (g_inHook) as extra safety.
-        @try {
-            struct rebinding rebindings[] = {
-                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
-            };
-            rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
-        } @catch (id e) {}
-
-        // ---- 4. Bundle ID hook (3 methods) ----
+        // ---- 2. Bundle ID hook (3 methods) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -372,7 +242,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. UIDevice hooks ----
+        // ---- 3. UIDevice hooks ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -410,7 +280,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. ASIdentifierManager IDFA hook ----
+        // ---- 4. ASIdentifierManager IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -424,7 +294,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. NSMutableURLRequest hooks (HTTP Header + URL params) ----
+        // ---- 5. NSMutableURLRequest hooks (HTTP Header + URL params) ----
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
@@ -434,7 +304,7 @@ static void initPrivacyHook(void) {
                     IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
                         if (!g_inHook && field && containsCUID(field)) {
                             g_inHook = YES;
-                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), getFakeCUIDStr(), field);
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), getFakeCUID(), field);
                             g_inHook = NO;
                             return;
                         }
@@ -449,7 +319,7 @@ static void initPrivacyHook(void) {
                     IMP newAV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
                         if (!g_inHook && field && containsCUID(field)) {
                             g_inHook = YES;
-                            ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), getFakeCUIDStr(), field);
+                            ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), getFakeCUID(), field);
                             g_inHook = NO;
                             return;
                         }
@@ -478,7 +348,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 8. NSHTTPCookieStorage hooks (Cookie CUID replacement) ----
+        // ---- 6. NSHTTPCookieStorage hooks (Cookie CUID replacement) ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
             if (cs) {
@@ -530,9 +400,9 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. Pre-write fake CUID into NSUserDefaults ----
+        // ---- 7. Pre-write fake CUID into NSUserDefaults ----
         @try {
-            NSString *fakeCUID = getFakeCUIDStr();
+            NSString *fakeCUID = getFakeCUID();
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             for (NSString *k in @[@"CUID", @"cuid", @"BD_CUID", @"baidu_cuid",
                                   @"BAIDU_CUID", @"kCUID", @"com.baidu.cuid"]) {
