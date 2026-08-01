@@ -1,20 +1,14 @@
 //
-// PrivacyHook.m — v34: fishhook sysctlbyname/uname + CUID interception
+// PrivacyHook.m — v35: fishhook sysctlbyname/uname (MAIN IMAGE ONLY)
 //
-// v33 issue: Without setHTTPBody hook, body has REAL CUID → "下单人数过多"
-// v31/v32 issue: With setHTTPBody hook, body CUID modified but sign not updated → "接口签名错误"
+// v34 crash: rebind_symbols globally hooked ALL images including system
+//   frameworks → system frameworks got fake hw.machine during early boot
+//   → crash before app even launches.
 //
-// v34 ROOT FIX: Hook sysctlbyname/uname via fishhook so App generates FAKE CUID
-//   - App reads fake hw.machine → generates fake CUID from fake device info
-//   - Body contains fake CUID, sign calculated with fake CUID → consistent!
-//   - No need to hook setHTTPBody (sign stays valid)
-//   - URL/Cookie/Header hooks kept as safety net
-//
-// Fishhook safety (fixes v27/v29 crashes):
-//   1. Pre-cache ALL fake values as C strings BEFORE installing fishhook
-//   2. Hook function uses ONLY pre-cached C strings — ZERO ObjC calls
-//   3. Recursion guard (__thread BOOL) as extra safety
-//   4. Only intercept known names, pass through everything else to original
+// v35 fix: Use rebind_symbols_image to hook ONLY the main executable.
+//   System frameworks (UIKit, Foundation, etc.) keep using real sysctlbyname.
+//   Only BaiduBoxApp's own calls are intercepted.
+//   Also: dlsym pre-fetch + NULL checks for safety.
 //
 
 #import <Foundation/Foundation.h>
@@ -27,6 +21,8 @@
 #import <sys/utsname.h>
 #import <string.h>
 #import <errno.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import "fishhook.h"
 
 #define NSLog(...)
@@ -271,7 +267,11 @@ static void wipeCUIDFromKeychain(void) {
 // fishhook: sysctlbyname hook (PURE C, zero ObjC)
 // ============================================================
 static int hooked_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    // Recursion guard — if we're already inside a hook, call original
+    // NULL check — if fishhook didn't find the symbol, can't do anything
+    if (!orig_sysctlbyname) {
+        return -1;
+    }
+    // Recursion guard
     if (g_inSysctlHook || !name) {
         return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     }
@@ -332,6 +332,10 @@ static int hooked_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 // fishhook: uname hook (PURE C, zero ObjC)
 // ============================================================
 static int hooked_uname(struct utsname *name) {
+    // NULL check
+    if (!orig_uname) {
+        return -1;
+    }
     if (g_inSysctlHook || !name) {
         return orig_uname(name);
     }
@@ -407,11 +411,23 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 3. Install fishhook for sysctlbyname + uname ----
-        // Now safe: all fake values are pre-cached as C strings
-        rebind_symbols((struct rebinding[]){
-            {"sysctlbyname", hooked_sysctlbyname, (void *)&orig_sysctlbyname},
-            {"uname",        hooked_uname,        (void *)&orig_uname}
-        }, 2);
+        // v35: Only hook the MAIN EXECUTABLE, not system frameworks!
+        // v34 crashed because global rebind_symbols hooked all images.
+        // Pre-fetch originals via dlsym as safety net.
+        orig_sysctlbyname = dlsym(RTLD_DEFAULT, "sysctlbyname");
+        orig_uname = dlsym(RTLD_DEFAULT, "uname");
+
+        // Get main executable header (index 0)
+        const struct mach_header *mainHeader = _dyld_get_image_header(0);
+        intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
+
+        if (mainHeader) {
+            struct rebinding rebindings[] = {
+                {"sysctlbyname", hooked_sysctlbyname, (void **)&orig_sysctlbyname},
+                {"uname",        hooked_uname,        (void **)&orig_uname}
+            };
+            rebind_symbols_image((void *)mainHeader, mainSlide, rebindings, 2);
+        }
 
         // ---- 4. Bundle ID hook ----
         @try {
