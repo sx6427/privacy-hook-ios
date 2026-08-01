@@ -1,21 +1,17 @@
 //
-// PrivacyHook.m — v40: Anti-injection detection + device fingerprint
+// PrivacyHook.m — v41: atbc/natbc/wcp security tokens + receipt + jailbreak file hiding
 //
-// ROOT CAUSE: Baidu detects our injected dylib!
-//   - Scans _dyld_get_image_name for unknown dylibs
-//   - Checks DYLD_INSERT_LIBRARIES env var
-//   - Uses dladdr to check code origins
-//   - Scans objc_copyClassList for unknown classes
-//   - Has BDPanJailbreakDetectTool + IsValidate_hookDetection
-//   - Reports tampering to server → "下单人数过多"
+// ROOT CAUSE: Baidu sends atbc/natbc/wcp security tokens in order requests.
+//   These tokens are generated based on app integrity (code signature, binary hash).
+//   TrollStore app has different signature → tokens are invalid → server rejects.
+//   Also: appStoreReceiptURL check, jailbreak file path checks.
 //
-// v40 FIX: Hide injection traces
-//   1. Hook _dyld_get_image_name to return fake name for our dylib
-//   2. Hook dladdr to return fake info for our dylib
-//   3. Hook getenv to return NULL for DYLD_INSERT_LIBRARIES
-//   4. Hook class_getImageName to return fake name for our classes
-//   5. Hook jailbreak/hook detection ObjC methods
-//   6. Keep all v39 device fingerprint hooks
+// v41 FIX:
+//   1. Hook fetchAtbcForNetworking/fetchNatbcForNetworking/fetchWcpInfoForNetwork
+//   2. Hook appStoreReceiptURL to return fake URL
+//   3. Hook access()/stat()/lstat() via fishhook to hide jailbreak files
+//   4. Hook bundlePath/executablePath to return fake App Store paths
+//   5. Keep all v40 anti-injection + device fingerprint hooks
 //
 
 #import <Foundation/Foundation.h>
@@ -28,6 +24,8 @@
 #import <dlfcn.h>
 #import <sys/sysctl.h>
 #import <sys/utsname.h>
+#import <sys/stat.h>
+#import <unistd.h>
 #import "fishhook.h"
 
 #define NSLog(...)
@@ -343,6 +341,74 @@ static void wipeAllKeychainExceptLogin(void) {
 }
 
 // ============================================================
+// Anti-jailbreak: Hook access() to hide jailbreak files
+// ============================================================
+static int (*orig_access)(const char *, int) = NULL;
+static int hooked_access(const char *path, int mode) {
+    if (!orig_access) return -1;
+    if (path) {
+        // Hide jailbreak/TrollStore files
+        if (strstr(path, "/Applications/Cydia.app") ||
+            strstr(path, "/private/var/lib/apt") ||
+            strstr(path, "/private/var/lib/cydia") ||
+            strstr(path, "/private/var/tmp/cydia") ||
+            strstr(path, "/private/var/stash") ||
+            strstr(path, "/usr/lib/libcycript") ||
+            strstr(path, "/usr/sbin/sshd") ||
+            strstr(path, "/usr/bin/ssh") ||
+            strstr(path, "/bin/bash") ||
+            strstr(path, "/bin/sh") ||
+            strstr(path, "/Applications/Sileo.app") ||
+            strstr(path, "/var/jb/") ||
+            strstr(path, "/var/checkra1n") ||
+            strstr(path, "/usr/lib/TweakInject") ||
+            strstr(path, "/usr/sbin/trollstore") ||
+            strstr(path, "/TrollStore/") ||
+            strstr(path, "trollstore")) {
+            return -1;
+        }
+    }
+    return orig_access(path, mode);
+}
+
+// Hook stat() to hide jailbreak files
+static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int hooked_stat(const char *path, struct stat *buf) {
+    if (!orig_stat) return -1;
+    if (path) {
+        if (strstr(path, "/Applications/Cydia.app") ||
+            strstr(path, "/private/var/lib/apt") ||
+            strstr(path, "/private/var/lib/cydia") ||
+            strstr(path, "/private/var/stash") ||
+            strstr(path, "/usr/lib/libcycript") ||
+            strstr(path, "/var/jb/") ||
+            strstr(path, "trollstore") ||
+            strstr(path, "/TrollStore/")) {
+            return -1;
+        }
+    }
+    return orig_stat(path, buf);
+}
+
+// Hook lstat() to hide jailbreak files
+static int (*orig_lstat)(const char *, struct stat *) = NULL;
+static int hooked_lstat(const char *path, struct stat *buf) {
+    if (!orig_lstat) return -1;
+    if (path) {
+        if (strstr(path, "/Applications/Cydia.app") ||
+            strstr(path, "/private/var/lib/apt") ||
+            strstr(path, "/private/var/lib/cydia") ||
+            strstr(path, "/private/var/stash") ||
+            strstr(path, "/var/jb/") ||
+            strstr(path, "trollstore") ||
+            strstr(path, "/TrollStore/")) {
+            return -1;
+        }
+    }
+    return orig_lstat(path, buf);
+}
+
+// ============================================================
 // Anti-injection detection: Hide our dylib from scans
 // ============================================================
 
@@ -649,6 +715,10 @@ static void initPrivacyHook(void) {
                 {"dladdr",                (void *)hooked_dladdr,                (void **)&orig_dladdr},
                 {"getenv",                (void *)hooked_getenv,                (void **)&orig_getenv},
                 {"class_getImageName",    (void *)hooked_class_getImageName,    (void **)&orig_class_getImageName},
+                // Anti-jailbreak: hide jailbreak files
+                {"access",                (void *)hooked_access,                (void **)&orig_access},
+                {"stat",                  (void *)hooked_stat,                  (void **)&orig_stat},
+                {"lstat",                 (void *)hooked_lstat,                 (void **)&orig_lstat},
             };
 
             // Hook in ALL non-system images (like v36)
@@ -665,7 +735,7 @@ static void initPrivacyHook(void) {
                 if (header) {
                     Dl_info info;
                     if (dladdr(header, &info)) {
-                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 6);
+                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 9);
                     }
                 }
             }
@@ -1135,6 +1205,103 @@ static void initPrivacyHook(void) {
                 if (isoM) { IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; }); class_replaceMethod(carrierClass, @selector(isoCountryCode), imp, method_getTypeEncoding(isoM)); }
                 Method voipM = class_getInstanceMethod(carrierClass, @selector(allowsVOIP));
                 if (voipM) { IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; }); class_replaceMethod(carrierClass, @selector(allowsVOIP), imp, method_getTypeEncoding(voipM)); }
+            }
+        } @catch (id e) {}
+
+        // ---- 16. Security tokens: atbc/natbc/wcp ----
+        // These tokens prove app integrity. Hook them to return dummy values.
+        @try {
+            unsigned int classCount3 = 0;
+            Class *classes3 = objc_copyClassList(&classCount3);
+
+            // Methods that return security tokens - hook to return persistent dummy string
+            NSArray *tokenSelectors = @[
+                @"fetchAtbcForNetworking",
+                @"fetchNatbcForNetworking",
+                @"fetchWcpInfoForNetwork",
+                @"fetchWcpInfoForDXMBankPay",
+                @"wcpEncoded",
+                @"fetchAtbc",
+                @"fetchNatbc",
+                @"fetchWcp",
+            ];
+
+            NSString *fakeToken = getPersistent(@"Bdhk.token", ^{
+                NSString *cs = @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                NSMutableString *s = [NSMutableString string];
+                for (int i = 0; i < 44; i++)
+                    [s appendFormat:@"%c", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
+                return s;
+            });
+
+            for (unsigned int ci = 0; ci < classCount3; ci++) {
+                Class cls = classes3[ci];
+                for (NSString *selName in tokenSelectors) {
+                    SEL sel = NSSelectorFromString(selName);
+                    // Instance method
+                    Method m = class_getInstanceMethod(cls, sel);
+                    if (m) {
+                        const char *typeEnc = method_getTypeEncoding(m);
+                        IMP imp = imp_implementationWithBlock(^NSString *(id s) { return fakeToken; });
+                        class_replaceMethod(cls, sel, imp, typeEnc);
+                    }
+                    // Class method
+                    m = class_getClassMethod(cls, sel);
+                    if (m) {
+                        const char *typeEnc = method_getTypeEncoding(m);
+                        IMP imp = imp_implementationWithBlock(^NSString *(id s) { return fakeToken; });
+                        class_replaceMethod(object_getClass(cls), sel, imp, typeEnc);
+                    }
+                }
+            }
+            free(classes3);
+        } @catch (id e) {}
+
+        // ---- 17. App Store receipt hook ----
+        // TrollStore apps don't have a receipt. Return a fake URL.
+        @try {
+            Class bc2 = objc_getClass("NSBundle");
+            if (bc2) {
+                Method rm = class_getInstanceMethod(bc2, @selector(appStoreReceiptURL));
+                if (rm) {
+                    IMP origR = method_getImplementation(rm);
+                    IMP newR = imp_implementationWithBlock(^NSURL *(id s) {
+                        if ([s isEqual:[NSBundle mainBundle]]) {
+                            // Return a fake receipt URL that looks like App Store
+                            NSString *fakePath = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:getPersistent(@"Bdhk.uuid", ^{ return genUUIDStr(); })];
+                            fakePath = [fakePath stringByAppendingPathComponent:@"BaiduBoxApp.app/_MASReceipt/receipt"];
+                            return [NSURL fileURLWithPath:fakePath];
+                        }
+                        return ((NSURL *(*)(id, SEL))origR)(s, @selector(appStoreReceiptURL));
+                    });
+                    class_replaceMethod(bc2, @selector(appStoreReceiptURL), newR, method_getTypeEncoding(rm));
+                }
+                // Also hook bundlePath to return App Store-like path
+                Method bpm = class_getInstanceMethod(bc2, @selector(bundlePath));
+                if (bpm) {
+                    IMP origBP = method_getImplementation(bpm);
+                    IMP newBP = imp_implementationWithBlock(^NSString *(id s) {
+                        if ([s isEqual:[NSBundle mainBundle]]) {
+                            NSString *fakePath = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:getPersistent(@"Bdhk.uuid", ^{ return genUUIDStr(); })];
+                            return [fakePath stringByAppendingPathComponent:@"BaiduBoxApp.app"];
+                        }
+                        return ((NSString *(*)(id, SEL))origBP)(s, @selector(bundlePath));
+                    });
+                    class_replaceMethod(bc2, @selector(bundlePath), newBP, method_getTypeEncoding(bpm));
+                }
+                // Hook executablePath
+                Method epm = class_getInstanceMethod(bc2, @selector(executablePath));
+                if (epm) {
+                    IMP origEP = method_getImplementation(epm);
+                    IMP newEP = imp_implementationWithBlock(^NSString *(id s) {
+                        if ([s isEqual:[NSBundle mainBundle]]) {
+                            NSString *fakePath = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:getPersistent(@"Bdhk.uuid", ^{ return genUUIDStr(); })];
+                            return [fakePath stringByAppendingPathComponent:@"BaiduBoxApp.app/BaiduBoxApp"];
+                        }
+                        return ((NSString *(*)(id, SEL))origEP)(s, @selector(executablePath));
+                    });
+                    class_replaceMethod(bc2, @selector(executablePath), newEP, method_getTypeEncoding(epm));
+                }
             }
         } @catch (id e) {}
     }
