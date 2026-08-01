@@ -1,9 +1,9 @@
 #
-# Makefile — v29: sysctlbyname hook (pre-loaded) + CUID interception + vtool SDK patch
+# Makefile — v30: Pure ObjC CUID interception + vtool SDK patch
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m fishhook.c
+SRC   = PrivacyHook.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
@@ -19,8 +19,8 @@ LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
 
 all: $(DYLIB)
 
-$(DYLIB): $(SRC) fishhook.h
-	clang $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
+$(DYLIB): $(SRC)
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "=== Patching LC_BUILD_VERSION SDK 26.5 → 17.0 ==="
 	vtool -set-build-version ios 14.0 17.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "=== Verifying ==="
