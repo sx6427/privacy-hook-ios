@@ -1,9 +1,9 @@
 #
-# Makefile — v38: Keychain-level CUID interception (no fishhook)
+# Makefile — v39: BAIDUID + all device IDs + fishhook
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
