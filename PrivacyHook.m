@@ -1,5 +1,5 @@
 //
-// PrivacyHook.m — v31: Comprehensive CUID interception (init + body + cookie value)
+// PrivacyHook.m — v32: CUID interception + CoreTelephony (SIM) spoofing
 //
 // v30 gaps causing "下单人数过多":
 //   1. initWithURL: not hooked → URL with cuid set at init, bypasses setURL:
@@ -22,6 +22,8 @@
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>
+#import <CoreTelephony/CTCarrier.h>
 #import <objc/runtime.h>
 
 #define NSLog(...)
@@ -584,7 +586,83 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. Pre-write fake CUID into NSUserDefaults ----
+        // ---- 7. CoreTelephony hooks (SIM/carrier spoofing) ----
+        // Baidu reads carrier info to fingerprint the device.
+        // Return empty/fake values so clones can't be linked via SIM.
+        @try {
+            Class ctniClass = objc_getClass("CTTelephonyNetworkInfo");
+            if (ctniClass) {
+                // serviceSubscriberCellularProviders → return empty dict
+                Method sscpM = class_getInstanceMethod(ctniClass, @selector(serviceSubscriberCellularProviders));
+                if (sscpM) {
+                    IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        return @{};
+                    });
+                    class_replaceMethod(ctniClass, @selector(serviceSubscriberCellularProviders), imp, method_getTypeEncoding(sscpM));
+                }
+                // serviceCurrentRadioAccessTechnology → return empty dict
+                Method scratM = class_getInstanceMethod(ctniClass, @selector(serviceCurrentRadioAccessTechnology));
+                    if (scratM) {
+                    IMP imp = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        return @{};
+                    });
+                    class_replaceMethod(ctniClass, @selector(serviceCurrentRadioAccessTechnology), imp, method_getTypeEncoding(scratM));
+                }
+                // subscriberCellularProvider → return nil (no carrier info)
+                Method scpM = class_getInstanceMethod(ctniClass, @selector(subscriberCellularProvider));
+                if (scpM) {
+                    IMP imp = imp_implementationWithBlock(^id(id s) {
+                        return nil;
+                    });
+                    class_replaceMethod(ctniClass, @selector(subscriberCellularProvider), imp, method_getTypeEncoding(scpM));
+                }
+                // currentRadioAccessTechnology → return nil
+                Method cratM = class_getInstanceMethod(ctniClass, @selector(currentRadioAccessTechnology));
+                if (cratM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return nil;
+                    });
+                    class_replaceMethod(ctniClass, @selector(currentRadioAccessTechnology), imp, method_getTypeEncoding(cratM));
+                }
+            }
+
+            // CTCarrier — return empty/nil for all properties
+            Class carrierClass = objc_getClass("CTCarrier");
+            if (carrierClass) {
+                // carrierName
+                Method cnM = class_getInstanceMethod(carrierClass, @selector(carrierName));
+                if (cnM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; });
+                    class_replaceMethod(carrierClass, @selector(carrierName), imp, method_getTypeEncoding(cnM));
+                }
+                // mobileCountryCode
+                Method mccM = class_getInstanceMethod(carrierClass, @selector(mobileCountryCode));
+                if (mccM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; });
+                    class_replaceMethod(carrierClass, @selector(mobileCountryCode), imp, method_getTypeEncoding(mccM));
+                }
+                // mobileNetworkCode
+                Method mncM = class_getInstanceMethod(carrierClass, @selector(mobileNetworkCode));
+                if (mncM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; });
+                    class_replaceMethod(carrierClass, @selector(mobileNetworkCode), imp, method_getTypeEncoding(mncM));
+                }
+                // isoCountryCode
+                Method isoM = class_getInstanceMethod(carrierClass, @selector(isoCountryCode));
+                if (isoM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @""; });
+                    class_replaceMethod(carrierClass, @selector(isoCountryCode), imp, method_getTypeEncoding(isoM));
+                }
+                // allowsVOIP
+                Method voipM = class_getInstanceMethod(carrierClass, @selector(allowsVOIP));
+                if (voipM) {
+                    IMP imp = imp_implementationWithBlock(^BOOL(id s) { return YES; });
+                    class_replaceMethod(carrierClass, @selector(allowsVOIP), imp, method_getTypeEncoding(voipM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 8. Pre-write fake CUID into NSUserDefaults ----
         @try {
             NSString *fakeCUID = getFakeCUID();
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
