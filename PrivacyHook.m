@@ -1,14 +1,12 @@
 //
-// PrivacyHook.m — v35: fishhook sysctlbyname/uname (MAIN IMAGE ONLY)
+// PrivacyHook.m — v36: fishhook ALL non-system images
 //
-// v34 crash: rebind_symbols globally hooked ALL images including system
-//   frameworks → system frameworks got fake hw.machine during early boot
-//   → crash before app even launches.
+// v35 issue: rebind_symbols_image only hooked index 0 (main executable).
+//   But Baidu's CUID generation code lives in its own frameworks/dylibs,
+//   not in the main executable → sysctlbyname not intercepted → real CUID.
 //
-// v35 fix: Use rebind_symbols_image to hook ONLY the main executable.
-//   System frameworks (UIKit, Foundation, etc.) keep using real sysctlbyname.
-//   Only BaiduBoxApp's own calls are intercepted.
-//   Also: dlsym pre-fetch + NULL checks for safety.
+// v36 fix: Iterate ALL loaded images, skip /System/ and /usr/lib/,
+//   hook every Baidu-owned image. System frameworks untouched → no crash.
 //
 
 #import <Foundation/Foundation.h>
@@ -411,22 +409,31 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 3. Install fishhook for sysctlbyname + uname ----
-        // v35: Only hook the MAIN EXECUTABLE, not system frameworks!
-        // v34 crashed because global rebind_symbols hooked all images.
-        // Pre-fetch originals via dlsym as safety net.
+        // v36: Hook ALL non-system images (main exe + Baidu frameworks)
+        // v35 only hooked index 0 which missed CUID generation in frameworks
+        // v34 hooked everything including system frameworks → crash
+        // v36: skip /System/, /usr/lib/, /Developer/ → only hook App's own images
         orig_sysctlbyname = dlsym(RTLD_DEFAULT, "sysctlbyname");
         orig_uname = dlsym(RTLD_DEFAULT, "uname");
 
-        // Get main executable header (index 0)
-        const struct mach_header *mainHeader = _dyld_get_image_header(0);
-        intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
+        uint32_t imgCount = _dyld_image_count();
+        for (uint32_t i = 0; i < imgCount; i++) {
+            const char *path = _dyld_get_image_name(i);
+            if (!path) continue;
+            // Skip system libraries and developer tools
+            if (strncmp(path, "/System/", 8) == 0) continue;
+            if (strncmp(path, "/usr/lib/", 9) == 0) continue;
+            if (strncmp(path, "/Developer/", 11) == 0) continue;
 
-        if (mainHeader) {
+            const struct mach_header *hdr = _dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            if (!hdr) continue;
+
             struct rebinding rebindings[] = {
                 {"sysctlbyname", hooked_sysctlbyname, (void **)&orig_sysctlbyname},
                 {"uname",        hooked_uname,        (void **)&orig_uname}
             };
-            rebind_symbols_image((void *)mainHeader, mainSlide, rebindings, 2);
+            rebind_symbols_image((void *)hdr, slide, rebindings, 2);
         }
 
         // ---- 4. Bundle ID hook ----
