@@ -1,9 +1,9 @@
 #
-# Makefile — v30: Pure ObjC CUID interception + vtool SDK patch
+# Makefile — v34: fishhook + CUID interception + vtool SDK patch
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
