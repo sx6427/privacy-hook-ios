@@ -661,7 +661,7 @@ static void initPrivacyHook(void) {
                 // Skip system frameworks
                 if ([ns containsString:@"/System/"] || [ns containsString:@"/Library/"]) continue;
                 // Hook all app/framework images
-                void *header = dlopen(name, RTLD_NO_LOAD);
+                void *header = dlopen(name, RTLD_NOLOAD);
                 if (header) {
                     Dl_info info;
                     if (dladdr(header, &info)) {
