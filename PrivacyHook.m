@@ -1,19 +1,16 @@
 //
-// PrivacyHook.m — v32: CUID interception + CoreTelephony (SIM) spoofing
+// PrivacyHook.m — v33: Fix payment signature error
 //
-// v30 gaps causing "下单人数过多":
-//   1. initWithURL: not hooked → URL with cuid set at init, bypasses setURL:
-//   2. setHTTPBody: not hooked → CUID in POST JSON/form body
-//   3. Cookie header value not checked → field name "Cookie" != "cuid"
+// v32 issue: setHTTPBody: hook modified CUID in POST body,
+//   but the sign parameter was calculated with original CUID.
+//   Server recalculated sign with modified CUID → mismatch → "接口签名错误"
 //
-// v31 fixes:
-//   - Hook NSMutableURLRequest initWithURL: + initWithURL:cachePolicy:timeoutInterval:
-//   - Hook setHTTPBody: → scan body for cuid, replace value
-//   - Hook setValue:forHTTPHeaderField: → also check VALUE for cuid (Cookie header)
-//   - Hook setAllHTTPHeaderFields: → scan all headers
-//   - Hook NSURLSession dataTaskWithRequest: as catch-all
+// v33 fix: REMOVE setHTTPBody: hook entirely.
+//   - Body params (cuid + sign) stay consistent → signature valid
+//   - v28 proved body CUID is NOT the cause of "下单人数过多"
+//   - URL query + Cookie + Header CUID replacement is sufficient
 //
-// Payment safe: only modify data containing "cuid" (case-insensitive)
+// Payment safe: only modify URL query, Cookie, and Header containing "cuid"
 // No fishhook → no crash
 // vtool SDK 17.0
 //
@@ -514,24 +511,9 @@ static void initPrivacyHook(void) {
                 class_replaceMethod(reqClass, @selector(setAllHTTPHeaderFields:), newSAH, method_getTypeEncoding(sahM));
             }
 
-            // 5g. setHTTPBody: — replace cuid in POST body (JSON/form)
-            Method sbm = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
-            if (sbm) {
-                IMP origSB = method_getImplementation(sbm);
-                IMP newSB = imp_implementationWithBlock(^void(id s, NSData *body) {
-                    if (!g_inHook && body) {
-                        NSData *newBody = replaceCUIDInBody(body);
-                        if (newBody != body) {
-                            g_inHook = YES;
-                            ((void (*)(id, SEL, NSData *))origSB)(s, @selector(setHTTPBody:), newBody);
-                            g_inHook = NO;
-                            return;
-                        }
-                    }
-                    ((void (*)(id, SEL, NSData *))origSB)(s, @selector(setHTTPBody:), body);
-                });
-                class_replaceMethod(reqClass, @selector(setHTTPBody:), newSB, method_getTypeEncoding(sbm));
-            }
+            // 5g. setHTTPBody: — REMOVED in v33
+            // Modifying body CUID breaks API signature (sign calculated with original CUID)
+            // Body params (cuid + sign) must stay consistent for server-side signature verification
         } @catch (id e) {}
 
         // ---- 6. NSHTTPCookieStorage hooks ----
