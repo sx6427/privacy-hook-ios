@@ -21,6 +21,7 @@
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
 #import <CoreTelephony/CTCarrier.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 
 #define NSLog(...)
 
@@ -393,31 +394,7 @@ static void initPrivacyHook(void) {
             [ud synchronize];
         } @catch (id e) {}
 
-        // ---- 3. Hook SecItemCopyMatching + SecItemAdd ----
-        // This intercepts ALL keychain reads/writes
-        // When CUID is read, return fake CUID
-        // When CUID is written, write fake CUID
-        @try {
-            Method m1 = class_getClassMethod(objc_getClass("Security"), NSSelectorFromString(@"SecItemCopyMatching:"));
-            // SecItemCopyMatching is a C function, use dlsym + fishhook approach
-            // Actually, let's use method_exchangeImplementations on the wrapper
-            // Or better: directly replace the function pointer
-
-            // Get original function pointers
-            orig_SecItemCopyMatching = dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
-            orig_SecItemAdd = dlsym(RTLD_DEFAULT, "SecItemAdd");
-
-            // We need fishhook to rebind these C functions
-            // But fishhook might not work with chained fixups...
-            // Instead, let's use a different approach:
-            // Override the Security framework's ObjC wrapper if one exists
-            // Or use the inline function replacement
-
-            // Actually, the best approach for C functions without fishhook:
-            // Write our fake CUID to ALL possible keychain locations NOW
-            // Then the app will read our fake CUID even without hooking SecItemCopyMatching
-
-        } @catch (id e) {}
+        // ---- 3. (Keychain wipe already done in step 1; pre-write in step 4) ----
 
         // ---- 4. Pre-write fake CUID to ALL keychain locations ----
         // Since we can't hook SecItemCopyMatching without fishhook,
@@ -436,7 +413,7 @@ static void initPrivacyHook(void) {
             ];
             NSArray *accounts = @[
                 @"cuid", @"CUID", @"SAPICUID", @"default",
-                @"com.baidu.cuid", @"", nil,
+                @"com.baidu.cuid", @"",
             ];
 
             for (NSString *svc in services) {
