@@ -1,20 +1,21 @@
 //
-// PrivacyHook.m — v30: Pure ObjC, CUID full interception, no fishhook, no crash
+// PrivacyHook.m — v31: Comprehensive CUID interception (init + body + cookie value)
 //
-// v29/v27 crash: fishhook globally hooking sysctlbyname → system libs crash
-// v30: Remove fishhook entirely. Pure ObjC method swizzling only.
+// v30 gaps causing "下单人数过多":
+//   1. initWithURL: not hooked → URL with cuid set at init, bypasses setURL:
+//   2. setHTTPBody: not hooked → CUID in POST JSON/form body
+//   3. Cookie header value not checked → field name "Cookie" != "cuid"
 //
-// CUID interception at all 3 exits (the real fix for "下单人数过多"):
-//   1. Cookie  (NSHTTPCookieStorage) — BAIDUCUID=xxx
-//   2. URL params (NSMutableURLRequest setURL:) — ?cuid=xxx
-//   3. HTTP Header (NSMutableURLRequest setValue:forHTTPHeaderField:) — cuid: xxx
+// v31 fixes:
+//   - Hook NSMutableURLRequest initWithURL: + initWithURL:cachePolicy:timeoutInterval:
+//   - Hook setHTTPBody: → scan body for cuid, replace value
+//   - Hook setValue:forHTTPHeaderField: → also check VALUE for cuid (Cookie header)
+//   - Hook setAllHTTPHeaderFields: → scan all headers
+//   - Hook NSURLSession dataTaskWithRequest: as catch-all
 //
-// Safety:
-//   - Only modify items whose name/key contains "cuid" (case-insensitive)
-//   - All other cookies/headers/params untouched → payment safe
-//   - No fishhook → no crash
-//   - Selective Keychain CUID wipe → login tokens preserved
-//   - vtool patches LC_BUILD_VERSION SDK to 17.0 (critical for payment)
+// Payment safe: only modify data containing "cuid" (case-insensitive)
+// No fishhook → no crash
+// vtool SDK 17.0
 //
 
 #import <Foundation/Foundation.h>
@@ -30,7 +31,7 @@ static NSString *g_realBundleID = nil;
 static __thread BOOL g_inHook = NO;
 
 // ============================================================
-// Persistent fake IDs — keyed to REAL bundle ID
+// Persistent fake IDs
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfDomain = (__bridge CFStringRef)(g_realBundleID ?: kOrigBundleID);
@@ -73,6 +74,126 @@ static NSString *getFakeCUID(void) {
 static BOOL containsCUID(NSString *s) {
     if (!s) return NO;
     return [s.lowercaseString containsString:@"cuid"];
+}
+
+// ============================================================
+// Replace CUID value in a string
+// Handles patterns like: cuid=XXX, "cuid":"XXX", cuid%3DXXX
+// ============================================================
+static NSString *replaceCUIDInString(NSString *str) {
+    if (!str || !containsCUID(str)) return str;
+    NSString *fakeCUID = getFakeCUID();
+    NSMutableString *result = [str mutableCopy];
+
+    // Pattern: cuid=VALUE  (URL-encoded form, query string, cookie)
+    // Match cuid= followed by non-& non-; non-" characters
+    NSError *err = nil;
+    NSRegularExpression *regex1 = [NSRegularExpression
+        regularExpressionWithPattern:@"(cuid=)([^&;\"' \r\n]+)"
+        options:NSRegularExpressionCaseInsensitive error:&err];
+    if (regex1) {
+        [regex1 replaceMatchesInString:result options:0
+            range:NSMakeRange(0, result.length)
+            withTemplate:[NSString stringWithFormat:@"$1%@", fakeCUID]];
+    }
+
+    // Pattern: "cuid":"VALUE"  (JSON)
+    NSRegularExpression *regex2 = [NSRegularExpression
+        regularExpressionWithPattern:@"(\"cuid\"\\s*:\\s*\")([^\"]+)(\")"
+        options:NSRegularExpressionCaseInsensitive error:&err];
+    if (regex2) {
+        [regex2 replaceMatchesInString:result options:0
+            range:NSMakeRange(0, result.length)
+            withTemplate:[NSString stringWithFormat:@"$1%@$3", fakeCUID]];
+    }
+
+    // Pattern: "cuid": VALUE  (JSON without quotes around value)
+    NSRegularExpression *regex3 = [NSRegularExpression
+        regularExpressionWithPattern:@"(\"cuid\"\\s*:\\s*)([0-9]+)"
+        options:NSRegularExpressionCaseInsensitive error:&err];
+    if (regex3) {
+        [regex3 replaceMatchesInString:result options:0
+            range:NSMakeRange(0, result.length)
+            withTemplate:[NSString stringWithFormat:@"$1\"%@\"", fakeCUID]];
+    }
+
+    // Pattern: cuid%3DVALUE (double-encoded)
+    NSRegularExpression *regex4 = [NSRegularExpression
+        regularExpressionWithPattern:@"(cuid%3[dD])([^&;%\"' ]+)"
+        options:0 error:&err];
+    if (regex4) {
+        [regex4 replaceMatchesInString:result options:0
+            range:NSMakeRange(0, result.length)
+            withTemplate:[NSString stringWithFormat:@"$1%@", fakeCUID]];
+    }
+
+    return result;
+}
+
+// ============================================================
+// Replace CUID in URL query params
+// ============================================================
+static NSURL *replaceCUIDInURL(NSURL *url) {
+    if (!url) return url;
+    NSString *query = [url query];
+    if (!query || !containsCUID(query)) return url;
+
+    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (!comp || !comp.queryItems) return url;
+
+    NSMutableArray *newItems = [NSMutableArray array];
+    NSString *fakeCUID = getFakeCUID();
+    for (NSURLQueryItem *item in comp.queryItems) {
+        if (containsCUID(item.name)) {
+            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:fakeCUID]];
+        } else {
+            [newItems addObject:item];
+        }
+    }
+    comp.queryItems = newItems;
+    NSURL *newURL = [comp URL];
+    return newURL ?: url;
+}
+
+// ============================================================
+// Replace CUID in HTTP body (JSON or form-encoded)
+// ============================================================
+static NSData *replaceCUIDInBody(NSData *body) {
+    if (!body || body.length == 0) return body;
+    // Try to interpret as string
+    NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (!bodyStr) return body;  // binary data, can't process
+    if (!containsCUID(bodyStr)) return body;
+
+    NSString *replaced = replaceCUIDInString(bodyStr);
+    if ([replaced isEqualToString:bodyStr]) return body;
+    return [replaced dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+// ============================================================
+// Cookie helpers
+// ============================================================
+static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
+    if (!cookie || !containsCUID(cookie.name)) return cookie;
+    NSMutableDictionary *props = [NSMutableDictionary dictionary];
+    props[NSHTTPCookieName] = cookie.name;
+    props[NSHTTPCookieValue] = getFakeCUID();
+    if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
+    if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
+    if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
+    props[NSHTTPCookieVersion] = @(cookie.version);
+    if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
+    NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
+    return newCookie ?: cookie;
+}
+
+static NSArray *modifiedCookies(NSArray *cookies) {
+    if (!cookies || cookies.count == 0) return cookies;
+    NSMutableArray *result = [NSMutableArray arrayWithCapacity:cookies.count];
+    for (NSHTTPCookie *cookie in cookies) {
+        [result addObject:modifiedCookie(cookie)];
+    }
+    return result;
 }
 
 // ============================================================
@@ -123,56 +244,6 @@ static void wipeCUIDFromKeychain(void) {
 }
 
 // ============================================================
-// CUID URL replacement
-// ============================================================
-static NSURL *replaceCUIDInURL(NSURL *url) {
-    if (!url) return url;
-    NSString *query = [url query];
-    if (!query || !containsCUID(query)) return url;
-
-    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-    if (!comp || !comp.queryItems) return url;
-
-    NSMutableArray *newItems = [NSMutableArray array];
-    for (NSURLQueryItem *item in comp.queryItems) {
-        if (containsCUID(item.name)) {
-            [newItems addObject:[NSURLQueryItem queryItemWithName:item.name value:getFakeCUID()]];
-        } else {
-            [newItems addObject:item];
-        }
-    }
-    comp.queryItems = newItems;
-    NSURL *newURL = [comp URL];
-    return newURL ?: url;
-}
-
-// ============================================================
-// CUID Cookie replacement
-// ============================================================
-static NSHTTPCookie *modifiedCookie(NSHTTPCookie *cookie) {
-    if (!cookie || !containsCUID(cookie.name)) return cookie;
-    NSMutableDictionary *props = [NSMutableDictionary dictionary];
-    props[NSHTTPCookieName] = cookie.name;
-    props[NSHTTPCookieValue] = getFakeCUID();
-    if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
-    if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
-    if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
-    props[NSHTTPCookieVersion] = @(cookie.version);
-    if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
-    NSHTTPCookie *newCookie = [[NSHTTPCookie alloc] initWithProperties:props];
-    return newCookie ?: cookie;
-}
-
-static NSArray *modifiedCookies(NSArray *cookies) {
-    if (!cookies || cookies.count == 0) return cookies;
-    NSMutableArray *result = [NSMutableArray arrayWithCapacity:cookies.count];
-    for (NSHTTPCookie *cookie in cookies) {
-        [result addObject:modifiedCookie(cookie)];
-    }
-    return result;
-}
-
-// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
@@ -185,7 +256,7 @@ static void initPrivacyHook(void) {
             g_realBundleID = [d[@"CFBundleIdentifier"] copy];
         } @catch (id e) {}
 
-        // ---- 1. Delete CUID-related NSUserDefaults keys ----
+        // ---- 1. Delete CUID from NSUserDefaults + Keychain ----
         @try {
             NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
             NSDictionary *allDict = [ud dictionaryRepresentation];
@@ -198,11 +269,9 @@ static void initPrivacyHook(void) {
             }
             [ud synchronize];
         } @catch (id e) {}
-
-        // ---- 1b. Selectively delete CUID from Keychain ----
         wipeCUIDFromKeychain();
 
-        // ---- 2. Bundle ID hook (3 methods) ----
+        // ---- 2. Bundle ID hook ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -280,7 +349,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. ASIdentifierManager IDFA hook ----
+        // ---- 4. IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -294,61 +363,176 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. NSMutableURLRequest hooks (HTTP Header + URL params) ----
+        // ---- 5. NSMutableURLRequest: init + URL + header + body ----
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
-            if (reqClass) {
-                Method svm = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
-                if (svm) {
-                    IMP origSV = method_getImplementation(svm);
-                    IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
-                        if (!g_inHook && field && containsCUID(field)) {
+
+            // 5a. initWithURL: — THE BIGGEST GAP in v30
+            // Most requests are created here, URL already contains cuid
+            Method im1 = class_getInstanceMethod(reqClass, @selector(initWithURL:));
+            if (im1) {
+                IMP origI1 = method_getImplementation(im1);
+                IMP newI1 = imp_implementationWithBlock(^id(id s, NSURL *url) {
+                    if (!g_inHook && url) {
+                        NSURL *newURL = replaceCUIDInURL(url);
+                        if (newURL != url) {
+                            g_inHook = YES;
+                            id r = ((id (*)(id, SEL, NSURL *))origI1)(s, @selector(initWithURL:), newURL);
+                            g_inHook = NO;
+                            return r;
+                        }
+                    }
+                    return ((id (*)(id, SEL, NSURL *))origI1)(s, @selector(initWithURL:), url);
+                });
+                class_replaceMethod(reqClass, @selector(initWithURL:), newI1, method_getTypeEncoding(im1));
+            }
+
+            // 5b. initWithURL:cachePolicy:timeoutInterval:
+            Method im2 = class_getInstanceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:));
+            if (im2) {
+                IMP origI2 = method_getImplementation(im2);
+                IMP newI2 = imp_implementationWithBlock(^id(id s, NSURL *url, NSURLRequestCachePolicy policy, NSTimeInterval timeout) {
+                    if (!g_inHook && url) {
+                        NSURL *newURL = replaceCUIDInURL(url);
+                        if (newURL != url) {
+                            g_inHook = YES;
+                            id r = ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origI2)(
+                                s, @selector(initWithURL:cachePolicy:timeoutInterval:), newURL, policy, timeout);
+                            g_inHook = NO;
+                            return r;
+                        }
+                    }
+                    return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origI2)(
+                        s, @selector(initWithURL:cachePolicy:timeoutInterval:), url, policy, timeout);
+                });
+                class_replaceMethod(reqClass, @selector(initWithURL:cachePolicy:timeoutInterval:), newI2, method_getTypeEncoding(im2));
+            }
+
+            // 5c. setURL: — replace cuid in URL query
+            Method sum = class_getInstanceMethod(reqClass, @selector(setURL:));
+            if (sum) {
+                IMP origSU = method_getImplementation(sum);
+                IMP newSU = imp_implementationWithBlock(^void(id s, NSURL *url) {
+                    if (!g_inHook && url) {
+                        NSURL *newURL = replaceCUIDInURL(url);
+                        if (newURL != url) {
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), newURL);
+                            g_inHook = NO;
+                            return;
+                        }
+                    }
+                    ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), url);
+                });
+                class_replaceMethod(reqClass, @selector(setURL:), newSU, method_getTypeEncoding(sum));
+            }
+
+            // 5d. setValue:forHTTPHeaderField: — check BOTH field name AND value
+            // "Cookie: BAIDUCUID=xxx" → field="Cookie", value contains "cuid"
+            Method svm = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+            if (svm) {
+                IMP origSV = method_getImplementation(svm);
+                IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                    if (!g_inHook && value) {
+                        // If field name contains cuid → replace entire value
+                        if (field && containsCUID(field)) {
                             g_inHook = YES;
                             ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), getFakeCUID(), field);
                             g_inHook = NO;
                             return;
                         }
-                        ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
-                    });
-                    class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svm));
-                }
+                        // If value contains cuid (e.g. Cookie: BAIDUCUID=xxx; BDUSS=yyy)
+                        if (containsCUID(value)) {
+                            NSString *newVal = replaceCUIDInString(value);
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), newVal, field);
+                            g_inHook = NO;
+                            return;
+                        }
+                    }
+                    ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
+                });
+                class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svm));
+            }
 
-                Method avm = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
-                if (avm) {
-                    IMP origAV = method_getImplementation(avm);
-                    IMP newAV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
-                        if (!g_inHook && field && containsCUID(field)) {
+            // 5e. addValue:forHTTPHeaderField: — same checks
+            Method avm = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
+            if (avm) {
+                IMP origAV = method_getImplementation(avm);
+                IMP newAV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                    if (!g_inHook && value) {
+                        if (field && containsCUID(field)) {
                             g_inHook = YES;
                             ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), getFakeCUID(), field);
                             g_inHook = NO;
                             return;
                         }
-                        ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), value, field);
-                    });
-                    class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAV, method_getTypeEncoding(avm));
-                }
+                        if (containsCUID(value)) {
+                            NSString *newVal = replaceCUIDInString(value);
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), newVal, field);
+                            g_inHook = NO;
+                            return;
+                        }
+                    }
+                    ((void (*)(id, SEL, NSString *, NSString *))origAV)(s, @selector(addValue:forHTTPHeaderField:), value, field);
+                });
+                class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAV, method_getTypeEncoding(avm));
+            }
 
-                Method sum = class_getInstanceMethod(reqClass, @selector(setURL:));
-                if (sum) {
-                    IMP origSU = method_getImplementation(sum);
-                    IMP newSU = imp_implementationWithBlock(^void(id s, NSURL *url) {
-                        if (!g_inHook && url) {
-                            NSURL *newURL = replaceCUIDInURL(url);
-                            if (newURL != url) {
-                                g_inHook = YES;
-                                ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), newURL);
-                                g_inHook = NO;
-                                return;
+            // 5f. setAllHTTPHeaderFields: — scan all headers
+            Method sahM = class_getInstanceMethod(reqClass, @selector(setAllHTTPHeaderFields:));
+            if (sahM) {
+                IMP origSAH = method_getImplementation(sahM);
+                IMP newSAH = imp_implementationWithBlock(^void(id s, NSDictionary *headers) {
+                    if (!g_inHook && headers) {
+                        BOOL modified = NO;
+                        NSMutableDictionary *md = [NSMutableDictionary dictionary];
+                        for (NSString *key in headers) {
+                            NSString *val = headers[key];
+                            if (containsCUID(key)) {
+                                md[key] = getFakeCUID();
+                                modified = YES;
+                            } else if (val && containsCUID(val)) {
+                                md[key] = replaceCUIDInString(val);
+                                modified = YES;
+                            } else {
+                                md[key] = val;
                             }
                         }
-                        ((void (*)(id, SEL, NSURL *))origSU)(s, @selector(setURL:), url);
-                    });
-                    class_replaceMethod(reqClass, @selector(setURL:), newSU, method_getTypeEncoding(sum));
-                }
+                        if (modified) {
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSDictionary *))origSAH)(s, @selector(setAllHTTPHeaderFields:), md);
+                            g_inHook = NO;
+                            return;
+                        }
+                    }
+                    ((void (*)(id, SEL, NSDictionary *))origSAH)(s, @selector(setAllHTTPHeaderFields:), headers);
+                });
+                class_replaceMethod(reqClass, @selector(setAllHTTPHeaderFields:), newSAH, method_getTypeEncoding(sahM));
+            }
+
+            // 5g. setHTTPBody: — replace cuid in POST body (JSON/form)
+            Method sbm = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
+            if (sbm) {
+                IMP origSB = method_getImplementation(sbm);
+                IMP newSB = imp_implementationWithBlock(^void(id s, NSData *body) {
+                    if (!g_inHook && body) {
+                        NSData *newBody = replaceCUIDInBody(body);
+                        if (newBody != body) {
+                            g_inHook = YES;
+                            ((void (*)(id, SEL, NSData *))origSB)(s, @selector(setHTTPBody:), newBody);
+                            g_inHook = NO;
+                            return;
+                        }
+                    }
+                    ((void (*)(id, SEL, NSData *))origSB)(s, @selector(setHTTPBody:), body);
+                });
+                class_replaceMethod(reqClass, @selector(setHTTPBody:), newSB, method_getTypeEncoding(sbm));
             }
         } @catch (id e) {}
 
-        // ---- 6. NSHTTPCookieStorage hooks (Cookie CUID replacement) ----
+        // ---- 6. NSHTTPCookieStorage hooks ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
             if (cs) {
