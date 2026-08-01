@@ -1,18 +1,21 @@
 //
-// PrivacyHook.m — v39: BAIDUID cookie + all device IDs + fishhook
+// PrivacyHook.m — v40: Anti-injection detection + device fingerprint
 //
-// ROOT CAUSE: BAIDUID cookie! (NOT CUID!)
-//   - BAIDUID is server-assigned, stored in NSHTTPCookieStorage
-//   - Original Baidu + A1 share cookie storage (TrollStore)
-//   - A1 reads original's BAIDUID → server sees same device → "下单人数过多"
-//   - Our previous hook only checked for "cuid" in cookie names
-//   - "BAIDUID" does NOT contain "cuid" → was NOT intercepted!
+// ROOT CAUSE: Baidu detects our injected dylib!
+//   - Scans _dyld_get_image_name for unknown dylibs
+//   - Checks DYLD_INSERT_LIBRARIES env var
+//   - Uses dladdr to check code origins
+//   - Scans objc_copyClassList for unknown classes
+//   - Has BDPanJailbreakDetectTool + IsValidate_hookDetection
+//   - Reports tampering to server → "下单人数过多"
 //
-// v39 FIX:
-//   1. Delete ALL cookies except BDUSS/STOKEN at startup (removes shared BAIDUID)
-//   2. Hook BAIDUID cookie (replace value with persistent fake BAIDUID)
-//   3. Hook ALL device ID methods (BIMBaiduUDID, getUniqueHardwareId, macAddress, etc.)
-//   4. Re-add fishhook for sysctlbyname/uname
+// v40 FIX: Hide injection traces
+//   1. Hook _dyld_get_image_name to return fake name for our dylib
+//   2. Hook dladdr to return fake info for our dylib
+//   3. Hook getenv to return NULL for DYLD_INSERT_LIBRARIES
+//   4. Hook class_getImageName to return fake name for our classes
+//   5. Hook jailbreak/hook detection ObjC methods
+//   6. Keep all v39 device fingerprint hooks
 //
 
 #import <Foundation/Foundation.h>
@@ -340,6 +343,74 @@ static void wipeAllKeychainExceptLogin(void) {
 }
 
 // ============================================================
+// Anti-injection detection: Hide our dylib from scans
+// ============================================================
+
+// The dylib is renamed to BaiduBoxSys.dylib in the IPA
+// We need to hide both "PrivacyHook" and "BaiduBoxSys" from detection
+static BOOL shouldHideImageName(const char *name) {
+    if (!name) return NO;
+    // Check for our dylib names
+    if (strstr(name, "PrivacyHook") || strstr(name, "BaiduBoxSys")) return YES;
+    // Also check for any dylib in the app's Frameworks dir that shouldn't be there
+    // (but be conservative - only hide our own)
+    return NO;
+}
+
+static const char *getFakeImageName(void) {
+    // Return a plausible system framework name
+    return "/System/Library/Frameworks/Foundation.framework/Foundation";
+}
+
+// Hook _dyld_get_image_name
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const char *hooked_dyld_get_image_name(uint32_t image_index) {
+    if (!orig_dyld_get_image_name) return NULL;
+    const char *name = orig_dyld_get_image_name(image_index);
+    if (shouldHideImageName(name)) {
+        return getFakeImageName();
+    }
+    return name;
+}
+
+// Hook dladdr - hide info about our dylib
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+static int hooked_dladdr(const void *addr, Dl_info *info) {
+    if (!orig_dladdr) return 0;
+    int ret = orig_dladdr(addr, info);
+    if (ret != 0 && info && info->dli_fname) {
+        if (shouldHideImageName(info->dli_fname)) {
+            // Replace with fake info
+            info->dli_fname = getFakeImageName();
+            info->dli_sname = NULL;
+            info->dli_saddr = NULL;
+        }
+    }
+    return ret;
+}
+
+// Hook getenv - hide DYLD_INSERT_LIBRARIES
+static char *(*orig_getenv)(const char *) = NULL;
+static char *hooked_getenv(const char *name) {
+    if (!orig_getenv) return NULL;
+    if (name && strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) {
+        return NULL;
+    }
+    return orig_getenv(name);
+}
+
+// Hook class_getImageName - hide our classes' image
+static const char *(*orig_class_getImageName)(Class) = NULL;
+static const char *hooked_class_getImageName(Class cls) {
+    if (!orig_class_getImageName) return NULL;
+    const char *name = orig_class_getImageName(cls);
+    if (shouldHideImageName(name)) {
+        return getFakeImageName();
+    }
+    return name;
+}
+
+// ============================================================
 // Fishhook: sysctlbyname and uname
 // ============================================================
 static char g_fakeModel[32] = {0};
@@ -568,11 +639,16 @@ static void initPrivacyHook(void) {
             strncpy(g_fakeVersion, [fakeVersion UTF8String], sizeof(g_fakeVersion) - 1);
         } @catch (id e) {}
 
-        // ---- 2. Fishhook: sysctlbyname + uname ----
+        // ---- 2. Fishhook: sysctlbyname + uname + anti-injection ----
         @try {
             struct rebinding rebindings[] = {
-                {"sysctlbyname", (void *)hooked_sysctlbyname, (void **)&orig_sysctlbyname},
-                {"uname",        (void *)hooked_uname,        (void **)&orig_uname},
+                {"sysctlbyname",          (void *)hooked_sysctlbyname,          (void **)&orig_sysctlbyname},
+                {"uname",                 (void *)hooked_uname,                 (void **)&orig_uname},
+                // Anti-injection: hide our dylib from dyld scans
+                {"_dyld_get_image_name",  (void *)hooked_dyld_get_image_name,  (void **)&orig_dyld_get_image_name},
+                {"dladdr",                (void *)hooked_dladdr,                (void **)&orig_dladdr},
+                {"getenv",                (void *)hooked_getenv,                (void **)&orig_getenv},
+                {"class_getImageName",    (void *)hooked_class_getImageName,    (void **)&orig_class_getImageName},
             };
 
             // Hook in ALL non-system images (like v36)
@@ -585,11 +661,11 @@ static void initPrivacyHook(void) {
                 // Skip system frameworks
                 if ([ns containsString:@"/System/"] || [ns containsString:@"/Library/"]) continue;
                 // Hook all app/framework images
-                void *header = dlopen(name, RTLD_NOLOAD);
+                void *header = dlopen(name, RTLD_NO_LOAD);
                 if (header) {
                     Dl_info info;
                     if (dladdr(header, &info)) {
-                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 2);
+                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 6);
                     }
                 }
             }
@@ -778,6 +854,138 @@ static void initPrivacyHook(void) {
                 }
             }
             free(classes);
+        } @catch (id e) {}
+
+        // ---- 12b. ANTI-INJECTION: Hook jailbreak/tamper detection methods ----
+        @try {
+            // +[HDANA_ComUtils getJailbrokenApp]
+            Class hdanaCom = objc_getClass("HDANA_ComUtils");
+            if (hdanaCom) {
+                Method m = class_getClassMethod(hdanaCom, @selector(getJailbrokenApp));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
+                    class_replaceMethod(object_getClass(hdanaCom), @selector(getJailbrokenApp), imp, method_getTypeEncoding(m));
+                }
+            }
+
+            // BDPanJailbreakDetectTool - neutralize all methods
+            Class jbDetect = objc_getClass("BDPanJailbreakDetectTool");
+            if (jbDetect) {
+                unsigned int methodCount = 0;
+                Method *methods = class_copyMethodList(jbDetect, &methodCount);
+                for (unsigned int i = 0; i < methodCount; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    const char *typeEnc = method_getTypeEncoding(methods[i]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    // Return NO for bool methods, nil for object methods
+                    if ([selName.lowercaseString containsString:@"jailbreak"] ||
+                        [selName.lowercaseString containsString:@"detect"] ||
+                        [selName.lowercaseString containsString:@"check"]) {
+                        if (typeEnc[0] == 'B') {
+                            IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
+                            class_replaceMethod(jbDetect, sel, imp, typeEnc);
+                        } else {
+                            IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
+                            class_replaceMethod(jbDetect, sel, imp, typeEnc);
+                        }
+                    }
+                }
+                free(methods);
+
+                // Also hook class methods
+                Method *clsMethods = class_copyMethodList(object_getClass(jbDetect), &methodCount);
+                for (unsigned int i = 0; i < methodCount; i++) {
+                    SEL sel = method_getName(clsMethods[i]);
+                    const char *typeEnc = method_getTypeEncoding(clsMethods[i]);
+                    NSString *selName = NSStringFromSelector(sel);
+                    if ([selName.lowercaseString containsString:@"jailbreak"] ||
+                        [selName.lowercaseString containsString:@"detect"] ||
+                        [selName.lowercaseString containsString:@"check"]) {
+                        if (typeEnc[0] == 'B') {
+                            IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
+                            class_replaceMethod(object_getClass(jbDetect), sel, imp, typeEnc);
+                        }
+                    }
+                }
+                free(clsMethods);
+            }
+
+            // Hook IsValidate_hookDetection everywhere
+            // preventingTampering → return NO
+            // use_jailbreak_detect_tool → return NO
+            // jailbreakDetectToolType → return 0
+            // enableBDPTraceSwizzlingMethod → return NO
+            unsigned int classCount2 = 0;
+            Class *classes2 = objc_copyClassList(&classCount2);
+            NSArray *antiDetectSelectors = @[
+                @"IsValidate_hookDetection",
+                @"preventingTampering",
+                @"use_jailbreak_detect_tool",
+                @"jailbreakDetectToolType",
+                @"enableBDPTraceSwizzlingMethod",
+                @"isJailbroken",
+                @"isJailBreak",
+                @"jailbroken",
+                @"hasJailbreak",
+                @"detectJailbreak",
+                @"checkJailbreak",
+                @"isHooked",
+                @"hookDetect",
+                @"detectHook",
+                @"checkHook",
+                @"isTampered",
+                @"tamperDetect",
+                @"detectTamper",
+                @"checkTamper",
+                @"isInjected",
+                @"injectDetect",
+                @"detectInject",
+                @"checkInject",
+            ];
+            for (unsigned int ci = 0; ci < classCount2; ci++) {
+                Class cls = classes2[ci];
+                for (NSString *selName in antiDetectSelectors) {
+                    SEL sel = NSSelectorFromString(selName);
+                    Method m = class_getInstanceMethod(cls, sel);
+                    if (m) {
+                        const char *typeEnc = method_getTypeEncoding(m);
+                        if (typeEnc[0] == 'B') {
+                            IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
+                            class_replaceMethod(cls, sel, imp, typeEnc);
+                        } else if (typeEnc[0] == 'q' || typeEnc[0] == 'i') {
+                            IMP imp = imp_implementationWithBlock(^long(id s) { return 0; });
+                            class_replaceMethod(cls, sel, imp, typeEnc);
+                        } else {
+                            IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
+                            class_replaceMethod(cls, sel, imp, typeEnc);
+                        }
+                    }
+                    // Also class methods
+                    m = class_getClassMethod(cls, sel);
+                    if (m) {
+                        const char *typeEnc = method_getTypeEncoding(m);
+                        if (typeEnc[0] == 'B') {
+                            IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
+                            class_replaceMethod(object_getClass(cls), sel, imp, typeEnc);
+                        } else if (typeEnc[0] == 'q' || typeEnc[0] == 'i') {
+                            IMP imp = imp_implementationWithBlock(^long(id s) { return 0; });
+                            class_replaceMethod(object_getClass(cls), sel, imp, typeEnc);
+                        } else {
+                            IMP imp = imp_implementationWithBlock(^id(id s) { return nil; });
+                            class_replaceMethod(object_getClass(cls), sel, imp, typeEnc);
+                        }
+                    }
+                }
+
+                // Also hook setters for preventingTampering
+                SEL setTamper = NSSelectorFromString(@"setPreventingTampering:");
+                Method setM = class_getInstanceMethod(cls, setTamper);
+                if (setM) {
+                    IMP imp = imp_implementationWithBlock(^void(id s, BOOL v) {});
+                    class_replaceMethod(cls, setTamper, imp, method_getTypeEncoding(setM));
+                }
+            }
+            free(classes2);
         } @catch (id e) {}
 
         // ---- 13. NSMutableURLRequest hooks (URL + headers, NOT body) ----
