@@ -19,8 +19,10 @@
 //   3. UIDevice.systemVersion hook — return version matching profile
 //      (was missing in v49 — Baidu could read real OS version via UIDevice)
 //
-// v49 RETAINED:
-//   - NO Keychain/Cookie clear (preserves login)
+// v50 COOKIE CLEAR:
+//   - Clear Cookie storage on first launch (BDUSS/STOKEN removed)
+//   - Forces re-login = proves to Baidu this is a NEW device
+//   - Keychain NOT cleared = login flow works correctly
 //   - Bd50. prefix (force regenerate all fake IDs)
 //   - All ObjC hooks (CUID, IDFV, IDFA, BIMBaiduUDID, etc.)
 //   - Bundle ID 3-method hook (payment)
@@ -323,7 +325,20 @@ static void initPrivacyHook(void) {
             }, 1);
         } @catch (id e) {}
 
-        // v50: NO Keychain/Cookie clear — preserves login state (BDUSS/STOKEN)
+        // ---- 1b. Clear Cookie storage (FIRST LAUNCH ONLY) ----
+        // This forces re-login — proves to Baidu that this is a NEW device.
+        // BDUSS/STOKEN are in cookies, clearing them = must re-login.
+        // Keychain is NOT cleared — ensures login flow works correctly.
+        @try {
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd50.cc"), kCFPreferencesCurrentApplication);
+            if (!cleared) {
+                NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+                NSArray *cookies = [storage cookies];
+                for (NSHTTPCookie *cookie in cookies) { [storage deleteCookie:cookie]; }
+                CFPreferencesSetAppValue(CFSTR("Bd50.cc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            } else { CFRelease(cleared); }
+        } @catch (id e) {}
 
         // ---- 2. Bundle ID hook (3 methods — payment critical) ----
         @try {
