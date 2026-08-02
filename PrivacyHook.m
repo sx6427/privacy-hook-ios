@@ -1,15 +1,52 @@
 //
-// PrivacyHook.m — v47: v6 Cookie read-only + Step33 3-method Bundle ID
+// PrivacyHook.m — v48: v47 + sysctl + WiFi block + ObjC device ID hooks
 //
-// Based on memory file:
-//   - v6 device spoofing SUCCESS (hook NSHTTPCookieStorage)
-//   - Step33 payment SUCCESS (3-method Bundle ID hook)
-//   - v8 = v6 (read-only) + Step33 → was "testing" in memory, never concluded
-//   - v20b: "remove cookie hooks (causes 下单人数过多)" → but that was WITH setCookie hook
+// Based on reverse analysis of BaiduBoxApp binary (376MB):
 //
-// v47 = v6 Cookie READ-ONLY (no setCookie/setCookies hook) + 3-method Bundle ID
-//   Read-only means: when app READS cookies, we replace device IDs.
-//   But when server WRITES new cookies, we don't interfere → session stays intact.
+// v47 base (retained):
+//   - Cookie read-only replacement (CUID, BAIDUCUID, etc.)
+//   - Bundle ID 3-method hook (payment compatibility)
+//   - IDFV/IDFA hook
+//   - Device name hook
+//   - NSUserDefaults device key hook
+//   - Cookie header replacement (NSMutableURLRequest)
+//   - Keychain/Cookie clear on first launch
+//
+// v48 NEW (from reverse analysis findings):
+//   1. fishhook: sysctlbyname — hw.machine, hw.model, hw.memsize, hw.ncpu, kern.osversion
+//      Found: sysctl queries for hw.machine (1), hw.model (1), hw.memsize (1), hw.ncpu (1), kern.osversion (1)
+//      These are hardware fingerprint components used by server-side risk control.
+//
+//   2. fishhook: CNCopySupportedInterfaces — return NULL
+//      Found: WIFISSID | WIFIBSSID in device fingerprint signature string
+//      String: IDFA | IDFAMD5 | OSVS | TERM | WIFI | WIFISSID | WIFIBSSID | SCWH | AKEY | ANAME | SDKVS | signString
+//      WiFi SSID/BSSID is a strong network fingerprint that identifies the device.
+//
+//   3. ObjC: +[BIMBaiduUDID value] — return fake UDID
+//      Found: +[BIMBaiduUDID value] in binary
+//      Found: baiduudidkey with getter/setter API (http://10.103.227.13:8866/v2/getter)
+//      This is Baidu's own device identifier, likely stored in Keychain and persisted.
+//
+//   4. ObjC: -[BIMConfigurationManager cuid] — return fake CUID
+//      Found: -[BIMConfigurationManager cuid] in binary
+//      IM SDK has its own CUID source that bypasses cookie storage.
+//
+//   5. ObjC: -[BARSDKProConfig CUID] — return fake CUID
+//      Found: -[BARSDKProConfig CUID] in binary
+//      AR SDK has its own CUID config.
+//
+//   6. ObjC: -[UtilsHelper getDeviceID] — return fake device ID
+//      Found: -[UtilsHelper getDeviceID] and -[UtilsHelper getDeviceIDAndUpdate] in binary
+//      This is a generic device ID getter that might bypass our hooks.
+//
+//   7. ObjC: -[DMDeviceInfoWrapper deviceModel/systemVersion/cellularProviderName] — return fake values
+//      Found: +[DMDeviceInfoWrapper cellularProviderName], +[DMDeviceInfoWrapper deviceModel], +[DMDeviceInfoWrapper systemVersion]
+//      Device info wrapper used for fingerprinting.
+//
+// Key insight: "下单人数过多" is NOT in the binary — it's a SERVER-SIDE response.
+// The server identifies the device by combining: CUID + IDFV + IDFA + BaiduUDID +
+// WiFi SSID/BSSID + hw.machine + screen resolution + IP address.
+// Our v47 hooks cover CUID (cookie) + IDFV + IDFA, but NOT the others.
 //
 
 #import <Foundation/Foundation.h>
@@ -17,6 +54,11 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <sys/sysctl.h>
+#import "fishhook.h"
+
+// Forward declaration for fishhook rebind (no need to link SystemConfiguration framework)
+extern CFArrayRef CNCopySupportedInterfaces(void);
 
 #define NSLog(...)
 
@@ -88,6 +130,42 @@ static NSString *getFakeID(NSString *name) {
 }
 
 // ============================================================
+// Fake hardware info (for sysctlbyname hook)
+// ============================================================
+static NSString *getFakeMachine(void) {
+    return getPersistent(@"Bdhk.hw.machine", ^{
+        NSArray *models = @[@"iPhone14,2", @"iPhone14,3", @"iPhone14,4", @"iPhone14,5",
+                            @"iPhone14,7", @"iPhone14,8", @"iPhone15,2", @"iPhone15,3",
+                            @"iPhone15,4", @"iPhone15,5"];
+        return models[arc4random_uniform((uint32_t)models.count)];
+    });
+}
+
+static NSString *getFakeHWModel(void) {
+    return getPersistent(@"Bdhk.hw.model", ^{
+        NSArray *models = @[@"D63AP", @"D64AP", @"D61AP", @"D65AP",
+                            @"D28AP", @"D29AP", @"D73AP", @"D74AP",
+                            @"D79AP", @"D80AP"];
+        return models[arc4random_uniform((uint32_t)models.count)];
+    });
+}
+
+static NSString *getFakeOSVersion(void) {
+    return getPersistent(@"Bdhk.kern.osversion", ^{
+        NSArray *versions = @[@"21A329", @"21A350", @"21F90", @"21E240", @"21D60",
+                              @"22A3354", @"22A3311", @"22B5061e"];
+        return versions[arc4random_uniform((uint32_t)versions.count)];
+    });
+}
+
+static uint64_t getFakeMemSize(void) {
+    return [getPersistent(@"Bdhk.hw.memsize", ^{
+        NSArray *sizes = @[@(4ULL * 1024 * 1024 * 1024), @(6ULL * 1024 * 1024 * 1024), @(8ULL * 1024 * 1024 * 1024)];
+        return [NSString stringWithFormat:@"%llu", [sizes[arc4random_uniform((uint32_t)sizes.count)] unsignedLongLongValue]];
+    }) unsignedLongLongValue];
+}
+
+// ============================================================
 // Cookie device ID detection
 // ============================================================
 static BOOL isDeviceCookie(NSString *cookieName) {
@@ -155,6 +233,86 @@ static BOOL isDeviceKey(NSString *key) {
     }
     if ([key.lowercaseString hasPrefix:@"cuid"]) return YES;
     return NO;
+}
+
+// ============================================================
+// fishhook: sysctlbyname
+// ============================================================
+static int (*orig_sysctlbyname)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+
+static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (name && oldp && oldlenp) {
+        // hw.machine — device model identifier (e.g., "iPhone14,3")
+        if (strcmp(name, "hw.machine") == 0) {
+            const char *fake = [getFakeMachine() UTF8String];
+            size_t fakeLen = strlen(fake) + 1;
+            if (*oldlenp >= fakeLen) {
+                memcpy(oldp, fake, fakeLen);
+                *oldlenp = fakeLen;
+                return 0;
+            }
+            *oldlenp = fakeLen;
+            return -1; // ENOMEM
+        }
+        // hw.model — hardware model code (e.g., "D63AP")
+        if (strcmp(name, "hw.model") == 0) {
+            const char *fake = [getFakeHWModel() UTF8String];
+            size_t fakeLen = strlen(fake) + 1;
+            if (*oldlenp >= fakeLen) {
+                memcpy(oldp, fake, fakeLen);
+                *oldlenp = fakeLen;
+                return 0;
+            }
+            *oldlenp = fakeLen;
+            return -1;
+        }
+        // hw.memsize — total physical memory in bytes
+        if (strcmp(name, "hw.memsize") == 0) {
+            if (*oldlenp >= sizeof(uint64_t)) {
+                uint64_t fakeMem = getFakeMemSize();
+                memcpy(oldp, &fakeMem, sizeof(uint64_t));
+                *oldlenp = sizeof(uint64_t);
+                return 0;
+            }
+            *oldlenp = sizeof(uint64_t);
+            return -1;
+        }
+        // hw.ncpu — number of CPU cores
+        if (strcmp(name, "hw.ncpu") == 0) {
+            if (*oldlenp >= sizeof(int32_t)) {
+                int32_t fakeCPU = 6;
+                memcpy(oldp, &fakeCPU, sizeof(int32_t));
+                *oldlenp = sizeof(int32_t);
+                return 0;
+            }
+            *oldlenp = sizeof(int32_t);
+            return -1;
+        }
+        // kern.osversion — OS build version (e.g., "21A329")
+        if (strcmp(name, "kern.osversion") == 0) {
+            const char *fake = [getFakeOSVersion() UTF8String];
+            size_t fakeLen = strlen(fake) + 1;
+            if (*oldlenp >= fakeLen) {
+                memcpy(oldp, fake, fakeLen);
+                *oldlenp = fakeLen;
+                return 0;
+            }
+            *oldlenp = fakeLen;
+            return -1;
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// ============================================================
+// fishhook: CNCopySupportedInterfaces — block WiFi SSID/BSSID
+// ============================================================
+static CFArrayRef (*orig_CNCopySupportedInterfaces)(void);
+
+static CFArrayRef hook_CNCopySupportedInterfaces(void) {
+    // Return NULL to prevent WiFi SSID/BSSID access
+    // This blocks the device fingerprint component: WIFISSID | WIFIBSSID
+    return NULL;
 }
 
 // ============================================================
@@ -302,13 +460,10 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. Cookie READ-ONLY hooks (v8: no setCookie/setCookies) ----
-        // Replace device cookies when READ, but don't interfere when WRITTEN.
-        // This preserves session integrity while spoofing device IDs.
+        // ---- 7. Cookie READ-ONLY hooks (no setCookie/setCookies) ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
 
-            // Hook cookiesForURL: — READ only
             Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
             if (cfuM) {
                 IMP origCFU = method_getImplementation(cfuM);
@@ -322,7 +477,6 @@ static void initPrivacyHook(void) {
                 class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
             }
 
-            // Hook cookies (property) — READ only
             Method allM = class_getInstanceMethod(cs, @selector(cookies));
             if (allM) {
                 IMP origAll = method_getImplementation(allM);
@@ -335,9 +489,6 @@ static void initPrivacyHook(void) {
                 });
                 class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
             }
-
-            // NO setCookie: hook (v8: keep session writes intact)
-            // NO setCookies:forURL:mainDocumentURL: hook
         } @catch (id e) {}
 
         // ---- 8. NSMutableURLRequest Cookie header replacement ----
@@ -372,6 +523,150 @@ static void initPrivacyHook(void) {
                         ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
                     });
                     class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 9. fishhook: sysctlbyname (hardware fingerprint) ----
+        @try {
+            struct rebinding r1 = {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
+            rebind_symbols(&r1, 1);
+        } @catch (id e) {}
+
+        // ---- 10. fishhook: CNCopySupportedInterfaces (WiFi SSID/BSSID) ----
+        @try {
+            struct rebinding r2 = {"CNCopySupportedInterfaces", (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces};
+            rebind_symbols(&r2, 1);
+        } @catch (id e) {}
+
+        // ---- 11. ObjC: +[BIMBaiduUDID value] — Baidu device UDID ----
+        @try {
+            Class udidCls = objc_getClass("BIMBaiduUDID");
+            if (udidCls) {
+                Class metaCls = object_getClass(udidCls);
+                Method m = class_getInstanceMethod(metaCls, @selector(value));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bdhk.budid", ^{ return genUUIDStr(); });
+                    });
+                    class_replaceMethod(metaCls, @selector(value), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 12. ObjC: -[BIMConfigurationManager cuid] — IM SDK CUID ----
+        @try {
+            Class cfgCls = objc_getClass("BIMConfigurationManager");
+            if (cfgCls) {
+                Method m = class_getInstanceMethod(cfgCls, @selector(cuid));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getFakeID(@"cuid");
+                    });
+                    class_replaceMethod(cfgCls, @selector(cuid), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 13. ObjC: -[BARSDKProConfig CUID] — AR SDK CUID ----
+        @try {
+            Class arCls = objc_getClass("BARSDKProConfig");
+            if (arCls) {
+                Method m = class_getInstanceMethod(arCls, @selector(CUID));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getFakeID(@"cuid");
+                    });
+                    class_replaceMethod(arCls, @selector(CUID), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 14. ObjC: -[UtilsHelper getDeviceID] / getDeviceIDAndUpdate ----
+        @try {
+            Class uhCls = objc_getClass("UtilsHelper");
+            if (uhCls) {
+                Method m1 = class_getInstanceMethod(uhCls, @selector(getDeviceID));
+                if (m1) {
+                    IMP imp1 = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bdhk.udid", ^{ return genUUIDStr(); });
+                    });
+                    class_replaceMethod(uhCls, @selector(getDeviceID), imp1, method_getTypeEncoding(m1));
+                }
+                Method m2 = class_getInstanceMethod(uhCls, @selector(getDeviceIDAndUpdate));
+                if (m2) {
+                    IMP imp2 = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bdhk.udid", ^{ return genUUIDStr(); });
+                    });
+                    class_replaceMethod(uhCls, @selector(getDeviceIDAndUpdate), imp2, method_getTypeEncoding(m2));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 15. ObjC: -[DMDeviceInfoWrapper deviceModel/systemVersion/cellularProviderName] ----
+        @try {
+            Class dmCls = objc_getClass("DMDeviceInfoWrapper");
+            if (dmCls) {
+                // Class methods: +[DMDeviceInfoWrapper deviceModel], +[DMDeviceInfoWrapper systemVersion], +[DMDeviceInfoWrapper cellularProviderName]
+                Class metaCls = object_getClass(dmCls);
+
+                Method m1 = class_getInstanceMethod(metaCls, @selector(deviceModel));
+                if (m1) {
+                    IMP imp1 = imp_implementationWithBlock(^NSString *(id s) {
+                        return getFakeMachine();
+                    });
+                    class_replaceMethod(metaCls, @selector(deviceModel), imp1, method_getTypeEncoding(m1));
+                }
+
+                Method m2 = class_getInstanceMethod(metaCls, @selector(systemVersion));
+                if (m2) {
+                    IMP imp2 = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bdhk.osvs", ^{
+                            NSArray *versions = @[@"16.5", @"16.6", @"17.0", @"17.1", @"17.2", @"17.3", @"17.4", @"17.5", @"17.6", @"18.0", @"18.1", @"18.2", @"18.3", @"18.4"];
+                            return versions[arc4random_uniform((uint32_t)versions.count)];
+                        });
+                    });
+                    class_replaceMethod(metaCls, @selector(systemVersion), imp2, method_getTypeEncoding(m2));
+                }
+
+                Method m3 = class_getInstanceMethod(metaCls, @selector(cellularProviderName));
+                if (m3) {
+                    IMP imp3 = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bdhk.carrier", ^{
+                            NSArray *carriers = @[@"中国移动", @"中国联通", @"中国电信"];
+                            return carriers[arc4random_uniform((uint32_t)carriers.count)];
+                        });
+                    });
+                    class_replaceMethod(metaCls, @selector(cellularProviderName), imp3, method_getTypeEncoding(m3));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 16. ObjC: -[BIMDeviceInfoUtility deviceModelVersion] ----
+        @try {
+            Class diuCls = objc_getClass("BIMDeviceInfoUtility");
+            if (diuCls) {
+                Method m = class_getInstanceMethod(diuCls, @selector(deviceModelVersion));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getFakeMachine();
+                    });
+                    class_replaceMethod(diuCls, @selector(deviceModelVersion), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 17. ObjC: -[BBAMessageIMManagerUniform isForceCUIDLogin] ----
+        // Prevent CUID-based forced login (which might trigger risk control)
+        @try {
+            Class imCls = objc_getClass("BBAMessageIMManagerUniform");
+            if (imCls) {
+                Method m = class_getInstanceMethod(imCls, @selector(isForceCUIDLogin));
+                if (m) {
+                    IMP imp = imp_implementationWithBlock(^BOOL(id s) {
+                        return NO;
+                    });
+                    class_replaceMethod(imCls, @selector(isForceCUIDLogin), imp, method_getTypeEncoding(m));
                 }
             }
         } @catch (id e) {}
