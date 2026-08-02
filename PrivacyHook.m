@@ -25,9 +25,6 @@
 #import <sys/utsname.h>
 #import <sys/stat.h>
 #import <unistd.h>
-#import <mach/mach_init.h>
-#import <mach/task_info.h>
-#import <mach-o/dyld_images.h>
 #import "fishhook.h"
 
 #define NSLog(...)
@@ -193,65 +190,8 @@ static const char *hooked_class_getImageName(Class cls) {
     return name;
 }
 
-// v42: Hook task_info(TASK_DYLD_INFO) — kernel-level image list
-static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
-static kern_return_t hooked_task_info(task_name_t target_task, task_flavor_t flavor,
-                                       task_info_t task_info_out, mach_msg_type_number_t *task_info_count) {
-    kern_return_t ret = orig_task_info(target_task, flavor, task_info_out, task_info_count);
-    if (ret != KERN_SUCCESS) return ret;
-    if (flavor < 17 || flavor > 19) return ret;  // TASK_DYLD_INFO variants
-    if (!task_info_out) return ret;
-
-    mach_vm_address_t infoAddr = 0;
-    if (flavor == 17 || flavor == 19) {
-        struct task_dyld_info *di = (struct task_dyld_info *)task_info_out;
-        infoAddr = di->all_image_info_addr;
-    } else {
-        uint32_t *p = (uint32_t *)task_info_out;
-        infoAddr = p[0];
-    }
-    if (!infoAddr) return ret;
-
-    struct dyld_all_image_infos *allInfos = (struct dyld_all_image_infos *)infoAddr;
-    if (!allInfos || !allInfos->infoArray || allInfos->infoArrayCount == 0) return ret;
-
-    for (uint32_t i = 0; i < allInfos->infoArrayCount; i++) {
-        const char *path = allInfos->infoArray[i].imageFilePath;
-        if (path && shouldHideImageName(path)) {
-            *(const char **)&allInfos->infoArray[i].imageFilePath = getFakeImageName();
-        }
-    }
-    return ret;
-}
-
-static const char **(*orig_objc_copyImageNames)(unsigned int *) = NULL;
-static const char **hooked_objc_copyImageNames(unsigned int *outCount) {
-    unsigned int count = 0;
-    const char **names = orig_objc_copyImageNames(&count);
-    if (!names || count == 0) {
-        if (outCount) *outCount = count;
-        return names;
-    }
-    for (unsigned int i = 0; i < count; i++) {
-        if (names[i] && shouldHideImageName(names[i])) {
-            names[i] = getFakeImageName();
-        }
-    }
-    if (outCount) *outCount = count;
-    return names;
-}
-
-static uint32_t (*orig_dyld_image_count)(void) = NULL;
-static uint32_t hooked_dyld_image_count(void) {
-    if (!orig_dyld_image_count) return 0;
-    uint32_t count = orig_dyld_image_count();
-    uint32_t hiddenCount = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = orig_dyld_get_image_name(i);
-        if (shouldHideImageName(name)) hiddenCount++;
-    }
-    return count > hiddenCount ? count - hiddenCount : count;
-}
+// REMOVED v43.1: task_info/objc_copyImageNames/_dyld_image_count hooks
+// caused crashes (modifying kernel memory in task_info) → no network.
 
 // ============================================================
 // Fishhook: sysctlbyname + uname (device fingerprint)
@@ -319,9 +259,6 @@ __attribute__((constructor)) static void PrivacyHookConstructor(void) {
                 {"dladdr",                (void *)hooked_dladdr,                (void **)&orig_dladdr},
                 {"getenv",                (void *)hooked_getenv,                (void **)&orig_getenv},
                 {"class_getImageName",    (void *)hooked_class_getImageName,    (void **)&orig_class_getImageName},
-                {"task_info",             (void *)hooked_task_info,             (void **)&orig_task_info},
-                {"objc_copyImageNames",   (void *)hooked_objc_copyImageNames,   (void **)&orig_objc_copyImageNames},
-                {"_dyld_image_count",     (void *)hooked_dyld_image_count,      (void **)&orig_dyld_image_count},
                 // Anti-jailbreak: hide jailbreak files
                 {"access",                (void *)hooked_access,                (void **)&orig_access},
                 {"stat",                  (void *)hooked_stat,                  (void **)&orig_stat},
@@ -340,7 +277,7 @@ __attribute__((constructor)) static void PrivacyHookConstructor(void) {
                 if (header) {
                     Dl_info info;
                     if (dladdr(header, &info)) {
-                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 12);
+                        rebind_symbols_image(info.dli_fbase, 0, rebindings, 9);
                     }
                 }
             }
