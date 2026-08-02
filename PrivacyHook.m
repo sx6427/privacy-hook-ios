@@ -63,8 +63,13 @@ static BOOL g_inUDHook = NO;
 // ============================================================
 // Persistent fake IDs
 // ============================================================
+// v49: New prefix "Bd49." forces ALL fake IDs to regenerate.
+// Old prefix "Bdhk." values are ignored — device gets a completely new identity.
+// This breaks the link to any previously flagged device fingerprint.
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
-    CFStringRef cfKey = (__bridge CFStringRef)key;
+    // Always use Bd49. prefix regardless of what was passed
+    NSString *realKey = [key hasPrefix:@"Bdhk."] ? [NSString stringWithFormat:@"Bd49.%@", [key substringFromIndex:5]] : key;
+    CFStringRef cfKey = (__bridge CFStringRef)realKey;
     CFPropertyListRef val = CFPreferencesCopyAppValue(cfKey, kCFPreferencesCurrentApplication);
     if (val) {
         NSString *s = [(__bridge id)val isKindOfClass:[NSString class]] ? (__bridge NSString *)val : nil;
@@ -120,7 +125,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bdhk.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd49.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -219,6 +224,7 @@ static void clearCookieStorage(void) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
+    if ([key hasPrefix:@"Bd49"]) return NO;
     if ([key hasPrefix:@"Bdhk"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
@@ -238,25 +244,9 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. Clear cookie storage (FIRST LAUNCH ONLY) ----
-        @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.cc"), kCFPreferencesCurrentApplication);
-            if (!cleared) {
-                clearCookieStorage();
-                CFPreferencesSetAppValue(CFSTR("Bdhk.cc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
-                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-            } else { CFRelease(cleared); }
-        } @catch (id e) {}
-
-        // ---- 2. Clear keychain (FIRST LAUNCH ONLY) ----
-        @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bdhk.kc"), kCFPreferencesCurrentApplication);
-            if (!cleared) {
-                clearKeychain();
-                CFPreferencesSetAppValue(CFSTR("Bdhk.kc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
-                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-            } else { CFRelease(cleared); }
-        } @catch (id e) {}
+        // v49: NO Keychain clearing — preserves login state (BDUSS/STOKEN)
+        // v49: NO Cookie clearing — preserves login session
+        // Only the fake IDs are regenerated (via Bd49. prefix in getPersistent)
 
         // ---- 3. Bundle ID hook (3 methods — payment critical) ----
         @try {
