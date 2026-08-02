@@ -114,7 +114,7 @@ static NSString *genFakeCookie(NSString *name) {
     if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
         return genCUID();
     if ([name isEqualToString:@"DVIF"]) {
-        NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)(arc4random_uniform(9000000000000000ULL) + 1000000000000000ULL)];
+        NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)((uint64_t)arc4random() * arc4random() % 9000000000000000ULL + 1000000000000000ULL)];
         NSMutableData *d = [NSMutableData dataWithLength:300];
         arc4random_buf([d mutableBytes], 300);
         return [NSString stringWithFormat:@"%@_%@_%@", num, [d base64EncodedStringWithOptions:0], genRandStr(6, hexCS)];
@@ -159,10 +159,12 @@ static NSString *getFakeOSVersion(void) {
 }
 
 static uint64_t getFakeMemSize(void) {
-    return [getPersistent(@"Bdhk.hw.memsize", ^{
+    NSString *s = getPersistent(@"Bdhk.hw.memsize", ^{
         NSArray *sizes = @[@(4ULL * 1024 * 1024 * 1024), @(6ULL * 1024 * 1024 * 1024), @(8ULL * 1024 * 1024 * 1024)];
-        return [NSString stringWithFormat:@"%llu", [sizes[arc4random_uniform((uint32_t)sizes.count)] unsignedLongLongValue]];
-    }) unsignedLongLongValue];
+        NSNumber *n = sizes[arc4random_uniform((uint32_t)sizes.count)];
+        return [NSString stringWithFormat:@"%llu", [n unsignedLongLongValue]];
+    });
+    return (uint64_t)[s longLongValue];
 }
 
 // ============================================================
