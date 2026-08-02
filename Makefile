@@ -1,9 +1,9 @@
 #
-# Makefile — v48: sysctl + WiFi + ObjC device ID hooks + fishhook
+# Makefile — v52: v6 minimal (Cookie-only device ID replacement)
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m fishhook.c
+SRC   = PrivacyHook.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
@@ -11,7 +11,7 @@ CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-ar
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
           -dynamiclib -framework Foundation -framework UIKit \
-          -framework AdSupport -framework Security -framework CoreTelephony \
+          -framework AdSupport \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
@@ -25,7 +25,7 @@ $(DYLIB): $(SRC)
 	vtool -set-build-version ios 14.0 17.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "=== Verifying ==="
 	@otool -l $@ | grep -A4 "LC_BUILD_VERSION"
-	@otool -l $@ | grep "LC_DYLD_CHAINED" && echo "FAIL!" || echo "OK"
+	@otool -l $@ | grep "LC_DYLD_CHAINNED" && echo "FAIL!" || echo "OK"
 	@file $@
 
 clean:
