@@ -38,6 +38,7 @@
 #include <sys/sysctl.h>
 #include <string.h>
 #include <errno.h>
+#include <mach-o/dyld.h>
 #define NSLog(...)
 
 static NSString *const kOrigBundleID = @"com.baidu.BaiduMobile";
@@ -247,7 +248,9 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         }
     }
     // Call original for everything else
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    errno = ENOSYS;
+    return -1;
 }
 
 // ============================================================
@@ -317,12 +320,19 @@ static void initPrivacyHook(void) {
         // ---- 0. Initialize device profile (MUST be before fishhook) ----
         initDeviceProfile();
 
-        // ---- 1. Install sysctlbyname fishhook ----
-        // Pre-computed C strings are ready — hook uses only strcmp/memcpy
+        // ---- 1. Install sysctlbyname fishhook (MAIN EXECUTABLE ONLY) ----
+        // rebind_symbols affects ALL images including system frameworks → crash.
+        // rebind_symbols_image targets only the main executable → safe.
         @try {
-            rebind_symbols((struct rebinding[1]){
-                {"sysctlbyname", hook_sysctlbyname, (void **)&orig_sysctlbyname}
-            }, 1);
+            // Image 0 = main executable
+            const struct mach_header *mainHeader = _dyld_get_image_header(0);
+            intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
+            if (mainHeader) {
+                rebind_symbols_image((void *)mainHeader, mainSlide,
+                    (struct rebinding[1]){
+                        {"sysctlbyname", hook_sysctlbyname, (void **)&orig_sysctlbyname}
+                    }, 1);
+            }
         } @catch (id e) {}
 
         // ---- 1b. Clear Cookie storage (FIRST LAUNCH ONLY) ----
