@@ -161,16 +161,33 @@ static void initPrivacyHook(void) {
             } else { CFRelease(cleared); }
         } @catch (id e) {}
 
-        // ---- 2. UIDevice hooks (IDFV only) ----
+        // ---- 2. UIDevice hooks (v6 完整版: name + IDFV + model + localizedModel) ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
+                Method nameM = class_getInstanceMethod(dc, @selector(name));
+                if (nameM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bd52.dn", ^{ return genDeviceName(); });
+                    });
+                    class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
+                }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
                         return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd52.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
+                }
+                Method lmM = class_getInstanceMethod(dc, @selector(localizedModel));
+                if (lmM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
+                    class_replaceMethod(dc, @selector(localizedModel), imp, method_getTypeEncoding(lmM));
+                }
+                Method modelM = class_getInstanceMethod(dc, @selector(model));
+                if (modelM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
+                    class_replaceMethod(dc, @selector(model), imp, method_getTypeEncoding(modelM));
                 }
             }
         } @catch (id e) {}
