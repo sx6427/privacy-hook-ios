@@ -1,32 +1,21 @@
 //
-// PrivacyHook.m — v50: v49 (login preserved) + sysctlbyname fishhook (hardware fingerprint)
+// PrivacyHook.m — v51: FULL RESET + sysctlbyname fishhook
 //
-// THE MISSING COMBINATION:
-//   v48b had sysctlbyname hook but cleared Keychain → couldn't login → couldn't test ordering
-//   v49 preserved login but removed sysctlbyname → hw.machine returns REAL value → device detected
-//   v50 = v49 login preservation + v48b sysctlbyname hook = UNTESTED BUT CRITICAL COMBINATION
+// ROOT CAUSE:
+//   v50: cleared Cookie only → BDUSS in Keychain → still logged in → NOT new device
+//   v47: cleared Cookie+Keychain → NSUserDefaults had stale "isLogin" → broken login
 //
-// v50 NEW:
-//   1. fishhook: sysctlbyname — hw.machine, hw.model, hw.memsize, hw.ncpu, kern.osversion
-//      SAFE implementation: all fake values pre-computed as C strings at init time.
-//      Hook function uses ONLY strcmp/memcpy/strlen — NO ObjC calls inside hook.
-//      This was the crash cause in v48; v48b/v50 fix it by pre-computing.
+// v51 SOLUTION: Clear Cookie + Keychain + NSUserDefaults = COMPLETE RESET
+//   App treats itself as fresh install → MUST re-login → proves new device to Baidu
 //
-//   2. Consistent device profiles — pick ONE real device, use ALL its specs:
-//      hw.machine + hw.model + hw.memsize + kern.osversion + systemVersion
-//      all match the same real device. Inconsistent values = server-side detection.
-//
-//   3. UIDevice.systemVersion hook — return version matching profile
-//      (was missing in v49 — Baidu could read real OS version via UIDevice)
-//
-// v50 COOKIE CLEAR:
-//   - Clear Cookie storage on first launch (BDUSS/STOKEN removed)
-//   - Forces re-login = proves to Baidu this is a NEW device
-//   - Keychain NOT cleared = login flow works correctly
-//   - Bd50. prefix (force regenerate all fake IDs)
+// v51 ALSO:
+//   - sysctlbyname fishhook (rebind_symbols_image, main exe only, no crash)
+//   - Consistent device profiles (hw.machine+model+memsize+osversion+sysVer all match)
+//   - UIDevice.systemVersion hook
 //   - All ObjC hooks (CUID, IDFV, IDFA, BIMBaiduUDID, etc.)
 //   - Bundle ID 3-method hook (payment)
 //   - Cookie read-only replacement
+//   - Bd51. prefix (new identity)
 //
 
 #import <Foundation/Foundation.h>
@@ -49,27 +38,26 @@ static BOOL g_inUDHook = NO;
 // Consistent device profiles
 // ============================================================
 typedef struct {
-    const char *machine;     // hw.machine (e.g. "iPhone15,2")
-    const char *model;       // hw.model (e.g. "D83AP")
-    const char *osBuild;     // kern.osversion (e.g. "21F79")
-    const char *sysVer;      // systemVersion (e.g. "17.5")
-    uint64_t memSize;        // hw.memsize (bytes)
-    uint32_t ncpu;           // hw.ncpu
+    const char *machine;
+    const char *model;
+    const char *osBuild;
+    const char *sysVer;
+    uint64_t memSize;
+    uint32_t ncpu;
 } DeviceProfile;
 
 static DeviceProfile g_profiles[] = {
-    {"iPhone15,2", "D83AP", "21F79",   "17.5", 6ULL*1024*1024*1024, 6},  // iPhone 14 Pro
-    {"iPhone15,4", "D16AP", "21G80",   "17.6", 6ULL*1024*1024*1024, 6},  // iPhone 15
-    {"iPhone16,1", "D83AP", "22C152",  "18.2", 8ULL*1024*1024*1024, 6},  // iPhone 15 Pro
-    {"iPhone14,7", "D15AP", "20G75",   "16.6", 6ULL*1024*1024*1024, 6},  // iPhone 14
-    {"iPhone14,5", "D63AP", "20F66",   "16.5", 4ULL*1024*1024*1024, 6},  // iPhone 13
-    {"iPhone15,3", "D84AP", "21F90",   "17.5", 6ULL*1024*1024*1024, 6},  // iPhone 14 Pro Max
-    {"iPhone16,2", "D84AP", "22C152",  "18.2", 8ULL*1024*1024*1024, 6},  // iPhone 15 Pro Max
-    {"iPhone14,8", "D16AP", "20G75",   "16.6", 6ULL*1024*1024*1024, 6},  // iPhone 14 Plus
+    {"iPhone15,2", "D83AP", "21F79",  "17.5", 6ULL*1024*1024*1024, 6},
+    {"iPhone15,4", "D16AP", "21G80",  "17.6", 6ULL*1024*1024*1024, 6},
+    {"iPhone16,1", "D83AP", "22C152", "18.2", 8ULL*1024*1024*1024, 6},
+    {"iPhone14,7", "D15AP", "20G75",  "16.6", 6ULL*1024*1024*1024, 6},
+    {"iPhone14,5", "D63AP", "20F66",  "16.5", 4ULL*1024*1024*1024, 6},
+    {"iPhone15,3", "D84AP", "21F90",  "17.5", 6ULL*1024*1024*1024, 6},
+    {"iPhone16,2", "D84AP", "22C152", "18.2", 8ULL*1024*1024*1024, 6},
+    {"iPhone14,8", "D16AP", "20G75",  "16.6", 6ULL*1024*1024*1024, 6},
 };
 #define NUM_PROFILES (sizeof(g_profiles) / sizeof(g_profiles[0]))
 
-// Pre-computed C strings for sysctlbyname hook (NO ObjC in hook!)
 static char g_fakeMachine[32] = "";
 static char g_fakeModel[32]   = "";
 static char g_fakeOSBuild[32] = "";
@@ -78,11 +66,10 @@ static uint32_t g_fakeNCPU    = 6;
 static NSString *g_fakeSysVer = nil;
 
 // ============================================================
-// Persistent fake IDs
+// Persistent fake IDs (Bd51. prefix = new identity)
 // ============================================================
-// v50: New prefix "Bd50." forces ALL fake IDs to regenerate.
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
-    NSString *realKey = [key hasPrefix:@"Bdhk."] ? [NSString stringWithFormat:@"Bd50.%@", [key substringFromIndex:5]] : key;
+    NSString *realKey = [key hasPrefix:@"Bdhk."] ? [NSString stringWithFormat:@"Bd51.%@", [key substringFromIndex:5]] : key;
     CFStringRef cfKey = (__bridge CFStringRef)realKey;
     CFPropertyListRef val = CFPreferencesCopyAppValue(cfKey, kCFPreferencesCurrentApplication);
     if (val) {
@@ -139,23 +126,19 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd50.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd51.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
-// Device profile initialization (called BEFORE fishhook install)
+// Device profile init (MUST be before fishhook)
 // ============================================================
 static void initDeviceProfile(void) {
-    // Pick a random profile, persist it
-    NSString *idxStr = getPersistent(@"Bd50.profile", ^{
+    NSString *idxStr = getPersistent(@"Bd51.profile", ^{
         return [NSString stringWithFormat:@"%d", (int)arc4random_uniform((uint32_t)NUM_PROFILES)];
     });
     int idx = [idxStr intValue];
     if (idx < 0 || idx >= (int)NUM_PROFILES) idx = 0;
-
     DeviceProfile *p = &g_profiles[idx];
-
-    // Pre-compute C strings — safe for sysctlbyname hook (no ObjC needed)
     strlcpy(g_fakeMachine, p->machine, sizeof(g_fakeMachine));
     strlcpy(g_fakeModel,   p->model,   sizeof(g_fakeModel));
     strlcpy(g_fakeOSBuild, p->osBuild, sizeof(g_fakeOSBuild));
@@ -164,106 +147,66 @@ static void initDeviceProfile(void) {
     g_fakeSysVer  = [NSString stringWithUTF8String:p->sysVer];
 }
 
-// ObjC getters for hooks that need NSString
-static NSString *getFakeMachine(void) {
-    return [NSString stringWithUTF8String:g_fakeMachine];
-}
-static NSString *getFakeHWModel(void) {
-    return [NSString stringWithUTF8String:g_fakeModel];
-}
-static NSString *getFakeSysVersion(void) {
-    return g_fakeSysVer ?: @"17.5";
-}
+static NSString *getFakeMachine(void) { return [NSString stringWithUTF8String:g_fakeMachine]; }
+static NSString *getFakeSysVersion(void) { return g_fakeSysVer ?: @"17.5"; }
 
 // ============================================================
-// sysctlbyname fishhook (PURE C — no ObjC inside hook!)
+// sysctlbyname fishhook (PURE C — no ObjC inside hook)
 // ============================================================
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name != NULL) {
-        // --- String values: hw.machine, hw.model, kern.osversion ---
         const char *strVal = NULL;
-        if (strcmp(name, "hw.machine") == 0)      strVal = g_fakeMachine;
-        else if (strcmp(name, "hw.model") == 0)   strVal = g_fakeModel;
+        if (strcmp(name, "hw.machine") == 0)          strVal = g_fakeMachine;
+        else if (strcmp(name, "hw.model") == 0)       strVal = g_fakeModel;
         else if (strcmp(name, "kern.osversion") == 0) strVal = g_fakeOSBuild;
 
         if (strVal != NULL && strVal[0] != '\0') {
             size_t need = strlen(strVal) + 1;
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp) {
-                if (*oldlenp >= need) {
-                    memcpy(oldp, strVal, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-                *oldlenp = need;
-                return ENOMEM;
+                if (*oldlenp >= need) { memcpy(oldp, strVal, need); *oldlenp = need; return 0; }
+                *oldlenp = need; return ENOMEM;
             }
             return 0;
         }
 
-        // --- uint64_t value: hw.memsize ---
         if (strcmp(name, "hw.memsize") == 0 && g_fakeMemSize > 0) {
             size_t need = sizeof(uint64_t);
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp) {
-                if (*oldlenp >= need) {
-                    memcpy(oldp, &g_fakeMemSize, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-                *oldlenp = need;
-                return ENOMEM;
+                if (*oldlenp >= need) { memcpy(oldp, &g_fakeMemSize, need); *oldlenp = need; return 0; }
+                *oldlenp = need; return ENOMEM;
             }
             return 0;
         }
 
-        // --- uint32_t value: hw.ncpu, hw.logicalcpu, hw.physicalcpu, hw.activecpu ---
-        if ((strcmp(name, "hw.ncpu") == 0 ||
-             strcmp(name, "hw.logicalcpu") == 0 ||
-             strcmp(name, "hw.physicalcpu") == 0 ||
-             strcmp(name, "hw.activecpu") == 0) && g_fakeNCPU > 0) {
+        if ((strcmp(name, "hw.ncpu") == 0 || strcmp(name, "hw.logicalcpu") == 0 ||
+             strcmp(name, "hw.physicalcpu") == 0 || strcmp(name, "hw.activecpu") == 0) && g_fakeNCPU > 0) {
             size_t need = sizeof(uint32_t);
-            if (oldp == NULL) {
-                if (oldlenp) *oldlenp = need;
-                return 0;
-            }
+            if (oldp == NULL) { if (oldlenp) *oldlenp = need; return 0; }
             if (oldlenp) {
-                if (*oldlenp >= need) {
-                    memcpy(oldp, &g_fakeNCPU, need);
-                    *oldlenp = need;
-                    return 0;
-                }
-                *oldlenp = need;
-                return ENOMEM;
+                if (*oldlenp >= need) { memcpy(oldp, &g_fakeNCPU, need); *oldlenp = need; return 0; }
+                *oldlenp = need; return ENOMEM;
             }
             return 0;
         }
     }
-    // Call original for everything else
     if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     errno = ENOSYS;
     return -1;
 }
 
 // ============================================================
-// Cookie device ID detection
+// Cookie helpers
 // ============================================================
 static BOOL isDeviceCookie(NSString *cookieName) {
     if (!cookieName) return NO;
     NSString *lk = [cookieName lowercaseString];
     NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
                        @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid"];
-    for (NSString *n in names) {
-        if ([lk isEqualToString:n]) return YES;
-    }
+    for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
 
@@ -296,16 +239,14 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
+    if ([key hasPrefix:@"Bd51"]) return NO;
     if ([key hasPrefix:@"Bd50"]) return NO;
-    if ([key hasPrefix:@"Bd49"]) return NO;
     if ([key hasPrefix:@"Bdhk"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
                            @"bdudid", @"baiduid", @"bdid"];
-    for (NSString *k in exactKeys) {
-        if ([key isEqualToString:k]) return YES;
-    }
+    for (NSString *k in exactKeys) { if ([key isEqualToString:k]) return YES; }
     if ([key.lowercaseString hasPrefix:@"cuid"]) return YES;
     return NO;
 }
@@ -317,14 +258,11 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 0. Initialize device profile (MUST be before fishhook) ----
+        // ---- 0. Init device profile (before fishhook) ----
         initDeviceProfile();
 
-        // ---- 1. Install sysctlbyname fishhook (MAIN EXECUTABLE ONLY) ----
-        // rebind_symbols affects ALL images including system frameworks → crash.
-        // rebind_symbols_image targets only the main executable → safe.
+        // ---- 1. sysctlbyname fishhook (main executable only) ----
         @try {
-            // Image 0 = main executable
             const struct mach_header *mainHeader = _dyld_get_image_header(0);
             intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
             if (mainHeader) {
@@ -335,22 +273,39 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 1b. Clear Cookie storage (FIRST LAUNCH ONLY) ----
-        // This forces re-login — proves to Baidu that this is a NEW device.
-        // BDUSS/STOKEN are in cookies, clearing them = must re-login.
-        // Keychain is NOT cleared — ensures login flow works correctly.
+        // ---- 2. FULL RESET on first launch (Cookie + Keychain + NSUserDefaults) ----
+        // v50: Cookie only → BDUSS in Keychain → still logged in → device NOT new
+        // v47: Cookie+Keychain → NSUserDefaults stale "isLogin" → broken login
+        // v51: Clear ALL THREE → fresh install → MUST re-login → new device
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd50.cc"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd51.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
+                // 2a. Clear Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 NSArray *cookies = [storage cookies];
                 for (NSHTTPCookie *cookie in cookies) { [storage deleteCookie:cookie]; }
-                CFPreferencesSetAppValue(CFSTR("Bd50.cc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+
+                // 2b. Clear Keychain (all classes)
+                NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
+                                     (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
+                for (id cls in classes) {
+                    SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
+                }
+
+                // 2c. Clear NSUserDefaults (removes stale login flags + old device IDs)
+                NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+                if (bid) {
+                    [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+                }
+
+                // 2d. Set flag so we don't reset again
+                CFPreferencesSetAppValue(CFSTR("Bd51.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
 
-        // ---- 2. Bundle ID hook (3 methods — payment critical) ----
+        // ---- 3. Bundle ID hook (3 methods — payment critical) ----
         @try {
             Class bc = objc_getClass("NSBundle");
             if (bc) {
@@ -390,7 +345,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 3. UIDevice hooks (including systemVersion — NEW in v50) ----
+        // ---- 4. UIDevice hooks (including systemVersion) ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -408,7 +363,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
-                // NEW: systemVersion hook — return version matching device profile
                 Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
                 if (svM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
@@ -429,7 +383,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. IDFA hook ----
+        // ---- 5. IDFA hook ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
@@ -443,7 +397,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. NSUserDefaults hooks (exact key matching) ----
+        // ---- 6. NSUserDefaults hooks ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
@@ -476,10 +430,9 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. Cookie READ-ONLY hooks ----
+        // ---- 7. Cookie READ-ONLY hooks ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
-
             Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
             if (cfuM) {
                 IMP origCFU = method_getImplementation(cfuM);
@@ -492,7 +445,6 @@ static void initPrivacyHook(void) {
                 });
                 class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
             }
-
             Method allM = class_getInstanceMethod(cs, @selector(cookies));
             if (allM) {
                 IMP origAll = method_getImplementation(allM);
@@ -507,7 +459,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. NSMutableURLRequest Cookie header replacement ----
+        // ---- 8. NSMutableURLRequest Cookie header replacement ----
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
@@ -543,7 +495,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 8. ObjC: +[BIMBaiduUDID value] ----
+        // ---- 9. +[BIMBaiduUDID value] ----
         @try {
             Class udidCls = objc_getClass("BIMBaiduUDID");
             if (udidCls) {
@@ -558,35 +510,31 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. ObjC: -[BIMConfigurationManager cuid] ----
+        // ---- 10. -[BIMConfigurationManager cuid] ----
         @try {
             Class cfgCls = objc_getClass("BIMConfigurationManager");
             if (cfgCls) {
                 Method m = class_getInstanceMethod(cfgCls, @selector(cuid));
                 if (m) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getFakeID(@"cuid");
-                    });
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeID(@"cuid"); });
                     class_replaceMethod(cfgCls, @selector(cuid), imp, method_getTypeEncoding(m));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 10. ObjC: -[BARSDKProConfig CUID] ----
+        // ---- 11. -[BARSDKProConfig CUID] ----
         @try {
             Class arCls = objc_getClass("BARSDKProConfig");
             if (arCls) {
                 Method m = class_getInstanceMethod(arCls, @selector(CUID));
                 if (m) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getFakeID(@"cuid");
-                    });
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeID(@"cuid"); });
                     class_replaceMethod(arCls, @selector(CUID), imp, method_getTypeEncoding(m));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 11. ObjC: -[UtilsHelper getDeviceID] ----
+        // ---- 12. -[UtilsHelper getDeviceID] ----
         @try {
             Class uhCls = objc_getClass("UtilsHelper");
             if (uhCls) {
@@ -607,28 +555,21 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 12. ObjC: +[DMDeviceInfoWrapper deviceModel/systemVersion/cellularProviderName] ----
+        // ---- 13. +[DMDeviceInfoWrapper deviceModel/systemVersion/cellularProviderName] ----
         @try {
             Class dmCls = objc_getClass("DMDeviceInfoWrapper");
             if (dmCls) {
                 Class metaCls = object_getClass(dmCls);
-
                 Method m1 = class_getInstanceMethod(metaCls, @selector(deviceModel));
                 if (m1) {
-                    IMP imp1 = imp_implementationWithBlock(^NSString *(id s) {
-                        return getFakeMachine();
-                    });
+                    IMP imp1 = imp_implementationWithBlock(^NSString *(id s) { return getFakeMachine(); });
                     class_replaceMethod(metaCls, @selector(deviceModel), imp1, method_getTypeEncoding(m1));
                 }
-
                 Method m2 = class_getInstanceMethod(metaCls, @selector(systemVersion));
                 if (m2) {
-                    IMP imp2 = imp_implementationWithBlock(^NSString *(id s) {
-                        return getFakeSysVersion();
-                    });
+                    IMP imp2 = imp_implementationWithBlock(^NSString *(id s) { return getFakeSysVersion(); });
                     class_replaceMethod(metaCls, @selector(systemVersion), imp2, method_getTypeEncoding(m2));
                 }
-
                 Method m3 = class_getInstanceMethod(metaCls, @selector(cellularProviderName));
                 if (m3) {
                     IMP imp3 = imp_implementationWithBlock(^NSString *(id s) {
@@ -642,29 +583,25 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 13. ObjC: -[BIMDeviceInfoUtility deviceModelVersion] ----
+        // ---- 14. -[BIMDeviceInfoUtility deviceModelVersion] ----
         @try {
             Class diuCls = objc_getClass("BIMDeviceInfoUtility");
             if (diuCls) {
                 Method m = class_getInstanceMethod(diuCls, @selector(deviceModelVersion));
                 if (m) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getFakeMachine();
-                    });
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return getFakeMachine(); });
                     class_replaceMethod(diuCls, @selector(deviceModelVersion), imp, method_getTypeEncoding(m));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 14. ObjC: -[BBAMessageIMManagerUniform isForceCUIDLogin] ----
+        // ---- 15. -[BBAMessageIMManagerUniform isForceCUIDLogin] ----
         @try {
             Class imCls = objc_getClass("BBAMessageIMManagerUniform");
             if (imCls) {
                 Method m = class_getInstanceMethod(imCls, @selector(isForceCUIDLogin));
                 if (m) {
-                    IMP imp = imp_implementationWithBlock(^BOOL(id s) {
-                        return NO;
-                    });
+                    IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
                     class_replaceMethod(imCls, @selector(isForceCUIDLogin), imp, method_getTypeEncoding(m));
                 }
             }
