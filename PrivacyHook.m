@@ -51,6 +51,12 @@ static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
 
 static NSString *genUUIDStr(void) { return [[NSUUID UUID] UUIDString]; }
 
+static NSString *genDeviceName(void) {
+    NSArray *sn = @[@"张",@"王",@"李",@"赵",@"刘",@"陈",@"杨",@"黄",@"周",@"吴",@"徐",@"孙",@"马",@"朱",@"胡",@"林",@"郭",@"何",@"高",@"罗"];
+    NSArray *md = @[@"iPhone",@"iPhone 13",@"iPhone 14",@"iPhone 15",@"iPhone 12",@"iPhone 11",@"iPhone SE"];
+    return [NSString stringWithFormat:@"%@的%@", sn[arc4random_uniform((uint32_t)sn.count)], md[arc4random_uniform((uint32_t)md.count)]];
+}
+
 static NSString *genRandStr(NSUInteger len, NSString *cs) {
     NSMutableString *s = [NSMutableString stringWithCapacity:len];
     for (NSUInteger i = 0; i < len; i++)
