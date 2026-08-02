@@ -26,6 +26,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AdSupport/AdSupport.h>
+#import <Security/Security.h>
 #import <objc/runtime.h>
 #define NSLog(...)
 
@@ -153,16 +154,27 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. Clear Cookie storage (FIRST LAUNCH ONLY) ----
-        // v6 成功方案：首次启动清 Cookie → 删除旧 CUID → 服务器认为是新设备
-        // 只清 Cookie，不清 Keychain/UserDefaults（避免破坏支付SDK）
+        // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
+        // v52b: 加回 Keychain 清除 — 解决 A1/A2 Keychain 共享 BDUSS 问题
+        // A1 登录后 BDUSS 存入 Keychain，A2 通过 keychain-access-groups 读取 → 自动登录
+        // 清 Keychain → A2 没有 BDUSS → 必须重新登录 → 验证码 → 证明是新设备
+        // 只首次清一次，不影响后续使用
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd52.cc"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd52b.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
+                // 1a. Clear Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 NSArray *cookies = [storage cookies];
                 for (NSHTTPCookie *cookie in cookies) { [storage deleteCookie:cookie]; }
-                CFPreferencesSetAppValue(CFSTR("Bd52.cc"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+
+                // 1b. Clear Keychain (all classes)
+                NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
+                                     (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
+                for (id cls in classes) {
+                    SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
+                }
+
+                CFPreferencesSetAppValue(CFSTR("Bd52b.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
