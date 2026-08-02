@@ -12,7 +12,6 @@ CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-ar
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
           -dynamiclib -framework Foundation -framework UIKit \
           -framework AdSupport -framework Security -framework CoreTelephony \
-          -framework SystemConfiguration \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
