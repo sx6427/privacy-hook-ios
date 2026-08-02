@@ -239,63 +239,64 @@ static BOOL isDeviceKey(NSString *key) {
 
 // ============================================================
 // fishhook: sysctlbyname
+// IMPORTANT: This function is called by ALL system frameworks.
+// It MUST NOT call any Objective-C methods — only use pre-computed C strings.
 // ============================================================
 static int (*orig_sysctlbyname)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 
+// Pre-computed fake values (set in constructor, read in hook)
+static char g_fakeMachine[32] = {0};
+static char g_fakeHWModel[32] = {0};
+static char g_fakeOSVersion[32] = {0};
+static uint64_t g_fakeMemSize = 0;
+static int32_t g_fakeNCPU = 6;
+static BOOL g_sysctlReady = NO;
+
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (name && oldp && oldlenp) {
-        // hw.machine — device model identifier (e.g., "iPhone14,3")
-        if (strcmp(name, "hw.machine") == 0) {
-            const char *fake = [getFakeMachine() UTF8String];
-            size_t fakeLen = strlen(fake) + 1;
+    // Only intercept if our fake values are ready
+    if (g_sysctlReady && name && oldp && oldlenp) {
+        if (strcmp(name, "hw.machine") == 0 && g_fakeMachine[0]) {
+            size_t fakeLen = strlen(g_fakeMachine) + 1;
             if (*oldlenp >= fakeLen) {
-                memcpy(oldp, fake, fakeLen);
-                *oldlenp = fakeLen;
-                return 0;
-            }
-            *oldlenp = fakeLen;
-            return -1; // ENOMEM
-        }
-        // hw.model — hardware model code (e.g., "D63AP")
-        if (strcmp(name, "hw.model") == 0) {
-            const char *fake = [getFakeHWModel() UTF8String];
-            size_t fakeLen = strlen(fake) + 1;
-            if (*oldlenp >= fakeLen) {
-                memcpy(oldp, fake, fakeLen);
+                memcpy(oldp, g_fakeMachine, fakeLen);
                 *oldlenp = fakeLen;
                 return 0;
             }
             *oldlenp = fakeLen;
             return -1;
         }
-        // hw.memsize — total physical memory in bytes
-        if (strcmp(name, "hw.memsize") == 0) {
+        if (strcmp(name, "hw.model") == 0 && g_fakeHWModel[0]) {
+            size_t fakeLen = strlen(g_fakeHWModel) + 1;
+            if (*oldlenp >= fakeLen) {
+                memcpy(oldp, g_fakeHWModel, fakeLen);
+                *oldlenp = fakeLen;
+                return 0;
+            }
+            *oldlenp = fakeLen;
+            return -1;
+        }
+        if (strcmp(name, "hw.memsize") == 0 && g_fakeMemSize > 0) {
             if (*oldlenp >= sizeof(uint64_t)) {
-                uint64_t fakeMem = getFakeMemSize();
-                memcpy(oldp, &fakeMem, sizeof(uint64_t));
+                memcpy(oldp, &g_fakeMemSize, sizeof(uint64_t));
                 *oldlenp = sizeof(uint64_t);
                 return 0;
             }
             *oldlenp = sizeof(uint64_t);
             return -1;
         }
-        // hw.ncpu — number of CPU cores
         if (strcmp(name, "hw.ncpu") == 0) {
             if (*oldlenp >= sizeof(int32_t)) {
-                int32_t fakeCPU = 6;
-                memcpy(oldp, &fakeCPU, sizeof(int32_t));
+                memcpy(oldp, &g_fakeNCPU, sizeof(int32_t));
                 *oldlenp = sizeof(int32_t);
                 return 0;
             }
             *oldlenp = sizeof(int32_t);
             return -1;
         }
-        // kern.osversion — OS build version (e.g., "21A329")
-        if (strcmp(name, "kern.osversion") == 0) {
-            const char *fake = [getFakeOSVersion() UTF8String];
-            size_t fakeLen = strlen(fake) + 1;
+        if (strcmp(name, "kern.osversion") == 0 && g_fakeOSVersion[0]) {
+            size_t fakeLen = strlen(g_fakeOSVersion) + 1;
             if (*oldlenp >= fakeLen) {
-                memcpy(oldp, fake, fakeLen);
+                memcpy(oldp, g_fakeOSVersion, fakeLen);
                 *oldlenp = fakeLen;
                 return 0;
             }
@@ -529,13 +530,24 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. fishhook: sysctlbyname (hardware fingerprint) ----
+        // ---- 9. Pre-compute fake hardware values for sysctlbyname hook ----
+        // Must be done BEFORE installing the fishhook, so the C buffers are ready.
+        @try {
+            strlcpy(g_fakeMachine, [getFakeMachine() UTF8String], sizeof(g_fakeMachine));
+            strlcpy(g_fakeHWModel, [getFakeHWModel() UTF8String], sizeof(g_fakeHWModel));
+            strlcpy(g_fakeOSVersion, [getFakeOSVersion() UTF8String], sizeof(g_fakeOSVersion));
+            g_fakeMemSize = getFakeMemSize();
+            g_fakeNCPU = 6;
+            g_sysctlReady = YES;
+        } @catch (id e) { g_sysctlReady = NO; }
+
+        // ---- 10. fishhook: sysctlbyname (hardware fingerprint) ----
         @try {
             struct rebinding r1 = {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
             rebind_symbols(&r1, 1);
         } @catch (id e) {}
 
-        // ---- 10. fishhook: CNCopySupportedInterfaces (WiFi SSID/BSSID) ----
+        // ---- 11. fishhook: CNCopySupportedInterfaces (WiFi SSID/BSSID) ----
         @try {
             struct rebinding r2 = {"CNCopySupportedInterfaces", (void *)hook_CNCopySupportedInterfaces, (void **)&orig_CNCopySupportedInterfaces};
             rebind_symbols(&r2, 1);
