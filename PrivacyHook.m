@@ -257,11 +257,13 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5. Cookie READ-ONLY hooks (核心：v6 成功方案) ----
-        // 只 hook 读，不 hook 写（保持 session 完整性）
+        // ---- 5. Cookie hooks (v6 完整方案：读+写都替换) ----
+        // v6 成功的关键：不仅读时替换，写入时也替换
+        // App 写入真实 CUID → 我们拦截写入 → 存入假 CUID → 服务器只看到假 CUID
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
 
+            // 5a. 读 hook: cookiesForURL:
             Method cfuM = class_getInstanceMethod(cs, @selector(cookiesForURL:));
             if (cfuM) {
                 IMP origCFU = method_getImplementation(cfuM);
@@ -275,6 +277,7 @@ static void initPrivacyHook(void) {
                 class_replaceMethod(cs, @selector(cookiesForURL:), newCFU, method_getTypeEncoding(cfuM));
             }
 
+            // 5b. 读 hook: cookies
             Method allM = class_getInstanceMethod(cs, @selector(cookies));
             if (allM) {
                 IMP origAll = method_getImplementation(allM);
@@ -286,6 +289,55 @@ static void initPrivacyHook(void) {
                     @catch (id e) { g_inCookieHook = NO; return cookies; }
                 });
                 class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
+            }
+
+            // 5c. 写 hook: setCookie: — v6 关键！写入时替换设备 Cookie
+            Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
+            if (scM) {
+                IMP origSC = method_getImplementation(scM);
+                IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
+                    if (cookie && isDeviceCookie(cookie.name)) {
+                        @try {
+                            NSString *fakeValue = getFakeID(cookie.name);
+                            NSMutableDictionary *props = [NSMutableDictionary dictionary];
+                            props[NSHTTPCookieName] = cookie.name;
+                            props[NSHTTPCookieValue] = fakeValue;
+                            if (cookie.domain) props[NSHTTPCookieDomain] = cookie.domain;
+                            if (cookie.path) props[NSHTTPCookiePath] = cookie.path;
+                            if (cookie.expiresDate) props[NSHTTPCookieExpires] = cookie.expiresDate;
+                            props[NSHTTPCookieVersion] = @(cookie.version);
+                            if (cookie.secure) props[NSHTTPCookieSecure] = @YES;
+                            NSHTTPCookie *fakeCookie = [[NSHTTPCookie alloc] initWithProperties:props];
+                            if (fakeCookie) {
+                                ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), fakeCookie);
+                                return;
+                            }
+                        } @catch (id e) {}
+                    }
+                    ((void (*)(id, SEL, NSHTTPCookie *))origSC)(s, @selector(setCookie:), cookie);
+                });
+                class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
+            }
+
+            // 5d. 写 hook: setCookies:forURL:mainDocumentURL: — v6 关键！
+            Method scsM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
+            if (scsM) {
+                IMP origSCS = method_getImplementation(scsM);
+                IMP newSCS = imp_implementationWithBlock(^void(id s, NSArray *cookies, NSURL *URL, NSURL *mainDocumentURL) {
+                    if (g_inCookieHook) {
+                        ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCS)(s, @selector(setCookies:forURL:mainDocumentURL:), cookies, URL, mainDocumentURL);
+                        return;
+                    }
+                    g_inCookieHook = YES;
+                    @try {
+                        NSArray *m = modifiedCookies(cookies);
+                        g_inCookieHook = NO;
+                        ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCS)(s, @selector(setCookies:forURL:mainDocumentURL:), m, URL, mainDocumentURL);
+                        return;
+                    } @catch (id e) { g_inCookieHook = NO; }
+                    ((void (*)(id, SEL, NSArray *, NSURL *, NSURL *))origSCS)(s, @selector(setCookies:forURL:mainDocumentURL:), cookies, URL, mainDocumentURL);
+                });
+                class_replaceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:), newSCS, method_getTypeEncoding(scsM));
             }
         } @catch (id e) {}
 
