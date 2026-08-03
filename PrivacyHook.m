@@ -48,6 +48,9 @@ static CGFloat g_fakeScreenWidth = 0;    // points
 static CGFloat g_fakeScreenHeight = 0;
 static CGFloat g_fakeScreenScale = 0;    // 2.0 or 3.0
 
+// v58b: 安全跳过标志 — 防止 orig_* 为 NULL 时崩溃
+static BOOL g_hookInstalled = NO;
+
 // v57: sysctlbyname / uname / sysctl 原始函数指针
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
@@ -57,8 +60,8 @@ static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL
 // v58: sysctlbyname hook — 纯 C 实现，ZERO ObjC 调用
 // ============================================================
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    // v58: 守卫 — 如果还没初始化，直接 fallthrough
-    if (!g_fishhookReady || !name) goto fallback;
+    // v58b: 守卫 — 如果还没初始化或 orig 为 NULL，直接 fallthrough
+    if (!g_fishhookReady || !name || !orig_sysctlbyname) goto fallback;
 
     const char *fakeStr = NULL;
 
@@ -120,7 +123,7 @@ fallback:
 // v58: sysctl() hook — 旧 API (CTL_HW, HW_MACHINE 等)
 // ============================================================
 static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!g_fishhookReady || !name || namelen == 0) goto fallback;
+    if (!g_fishhookReady || !name || namelen == 0 || !orig_sysctl) goto fallback;
 
     // CTL_HW (6) == name[0]
     // HW_MACHINE (1), HW_MODEL (2), HW_PRODUCT (36)
@@ -224,6 +227,8 @@ fallback:
 // v57: uname hook — 纯 C 实现
 // ============================================================
 static int hook_uname(struct utsname *name) {
+    // v58b: NULL 保护
+    if (!orig_uname) return -1;
     int ret = orig_uname(name);
     if (ret == 0 && name && g_fishhookReady) {
         if (g_fakeMachine[0]) {
@@ -945,18 +950,32 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 10. v58: fishhook — rebind_symbols (ALL images!) ----
-        // v57 的致命问题：rebind_symbols_image 只 hook 主程序
-        // 百度的 sysctlbyname 调用在动态框架中，没有被 hook
-        // v58 改用 rebind_symbols，hook 所有已加载和未来加载的镜像
-        // 安全性：hook 函数纯 C (strcmp/memcpy/strlen)，无 ObjC，系统框架调用也安全
+        // ---- 10. v58b: fishhook — 只 hook 非系统镜像 ----
+        // v58 问题：rebind_symbols hook 了系统框架，dyld 早期阶段 orig_* 为 NULL → 闪退
+        // v58b 修复：遍历所有镜像，跳过 /usr/lib/ 和 /System/ 路径
+        //   只 hook 主程序 + 百度动态框架
         @try {
             struct rebinding rebindings[] = {
                 {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
                 {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
                 {"uname",        (void *)hook_uname,        (void **)&orig_uname},
             };
-            rebind_symbols(rebindings, 3);
+            uint32_t imgCount = _dyld_image_count();
+            for (uint32_t i = 0; i < imgCount; i++) {
+                const char *path = _dyld_get_image_name(i);
+                if (!path) continue;
+                // 跳过系统框架路径
+                if (strncmp(path, "/usr/lib/", 9) == 0) continue;
+                if (strncmp(path, "/System/", 8) == 0) continue;
+                if (strncmp(path, "/Developer/", 11) == 0) continue;
+                // hook 这个镜像
+                const struct mach_header *hdr = _dyld_get_image_header(i);
+                intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+                if (hdr) {
+                    rebind_symbols_image((void *)hdr, slide, rebindings, 3);
+                }
+            }
+            g_hookInstalled = YES;
         } @catch (id e) {}
     }
 }
