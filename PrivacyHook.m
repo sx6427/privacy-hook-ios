@@ -1,32 +1,19 @@
 //
-// PrivacyHook.m — v57: 内核级设备指纹伪装 (sysctlbyname + uname)
+// PrivacyHook.m — v58: 全镜像 fishhook + sysctl() + UIScreen 伪装
 //
-// v56 问题（用户反馈"第一次付款成功，然后又下单人数过多"）：
-//   v56 hook 了 UIDevice + NSProcessInfo + User-Agent，第一次付款通过。
-//   但第二次失败 → 百度在首次交易后交叉比对设备数据，发现不一致。
+// v57 问题（用户反馈"一样的问题"）：
+//   v57 用 rebind_symbols_image 只 hook 主程序，但百度的 sysctlbyname 调用
+//   在动态框架 (BaiduBoxSys.dylib 等) 中，完全没被 hook 到！
+//   → 内核层仍返回真实 16.4/iPhone14,7 → 交叉比对矛盾 → 风控拦截
 //
-// 根因分析：
-//   百度可以通过 sysctlbyname (内核级 C API) 绕过所有 ObjC hook 获取真实设备信息：
-//   1. sysctlbyname("hw.machine") → 真实硬件型号 (如 "iPhone14,7") ← 未 hook!
-//   2. sysctlbyname("kern.osproductversion") → 真实 iOS 版本 ← 未 hook! 可能就是 16.4
-//   3. sysctlbyname("kern.osversion") → 真实 Build 号 ← 未 hook!
-//   4. sysctlbyname("hw.memsize") → 真实 RAM 大小 ← 未 hook!
-//   5. uname() → struct utsname.machine 真实硬件型号 ← 未 hook!
-//
-//   第一次付款：百度还没存储足够数据，放行
-//   第二次付款：百度交叉比对 ObjC 层(假) vs 内核层(真)，发现矛盾，拦截
-//
-// v57 修复：
-//   1. 用 fishhook (rebind_symbols_image) 只 hook 主程序的 sysctlbyname + uname
-//   2. 所有伪装值在 init 阶段预计算为 C 字符串，hook 函数中只用 C 函数
-//   3. iOS 版本 → 硬件型号映射（保证一致性）
-//   4. Hook NSProcessInfo.physicalMemory (RAM 大小)
-//   5. 新前缀 Bd57.
-//
-// 安全设计：
-//   - hook 函数中 ZERO ObjC 调用（避免 v48 闪退问题）
-//   - 只 hook 主程序 (rebind_symbols_image, 不用 rebind_symbols)
-//   - 所有值预计算为 static char[]，hook 中只做 strcmp/memcpy
+// v58 修复：
+//   1. rebind_symbols (ALL images) 替代 rebind_symbols_image (main only)
+//      安全性：hook 函数纯 C，无 ObjC 调用，系统框架调用也安全
+//   2. 添加 sysctl() 旧 API hook (CTL_HW/HW_MACHINE 等)
+//      有些代码用 sysctl() 而非 sysctlbyname()
+//   3. 添加 UIScreen 分辨率 hook (bounds/nativeBounds/scale/nativeScale)
+//   4. 添加初始化守卫：g_fakeMachine 为空时 fallthrough 到原始函数
+//   5. 新前缀 Bd58.
 //
 
 #import <Foundation/Foundation.h>
@@ -47,30 +34,38 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// v57: 预计算的内核级伪装值 (C 字符串，在 hook 安装前填充)
+// v58: 预计算的内核级伪装值 (C 字符串，在 hook 安装前填充)
 // ============================================================
 static char g_fakeMachine[32] = "";      // "iPhone14,7"
 static char g_fakeBuild[32] = "";        // "20F66"
 static char g_fakeOSVersion[32] = "";    // "16.5"
 static char g_fakeDarwinRel[32] = "";    // "22.5.0"
 static uint64_t g_fakeMemSize = 0;       // 6442450944 (6GB)
+static BOOL g_fishhookReady = NO;        // v58: 初始化守卫
 
-// v57: sysctlbyname / uname 原始函数指针
+// v58: 预计算的屏幕分辨率
+static CGFloat g_fakeScreenWidth = 0;    // points
+static CGFloat g_fakeScreenHeight = 0;
+static CGFloat g_fakeScreenScale = 0;    // 2.0 or 3.0
+
+// v57: sysctlbyname / uname / sysctl 原始函数指针
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 // ============================================================
-// v57: sysctlbyname hook — 纯 C 实现，ZERO ObjC 调用
+// v58: sysctlbyname hook — 纯 C 实现，ZERO ObjC 调用
 // ============================================================
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!name) goto fallback;
+    // v58: 守卫 — 如果还没初始化，直接 fallthrough
+    if (!g_fishhookReady || !name) goto fallback;
 
-    // 检查是否是我们需要拦截的 sysctl name
     const char *fakeStr = NULL;
 
     if (strcmp(name, "hw.machine") == 0 ||
         strcmp(name, "hw.model") == 0 ||
-        strcmp(name, "hw.product") == 0) {
+        strcmp(name, "hw.product") == 0 ||
+        strcmp(name, "hw.target") == 0) {
         fakeStr = g_fakeMachine;
     } else if (strcmp(name, "kern.osversion") == 0) {
         fakeStr = g_fakeBuild;
@@ -79,7 +74,6 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
     } else if (strcmp(name, "kern.osrelease") == 0) {
         fakeStr = g_fakeDarwinRel;
     } else if (strcmp(name, "hw.memsize") == 0) {
-        // 特殊处理：返回 uint64_t
         if (oldlenp) {
             if (oldp) {
                 if (*oldlenp >= sizeof(uint64_t)) {
@@ -98,8 +92,8 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         return 0;
     }
 
-    if (fakeStr) {
-        size_t fakeLen = strlen(fakeStr) + 1; // 包含 null terminator
+    if (fakeStr && fakeStr[0]) {
+        size_t fakeLen = strlen(fakeStr) + 1;
         if (oldlenp) {
             if (oldp) {
                 if (*oldlenp >= fakeLen) {
@@ -123,23 +117,129 @@ fallback:
 }
 
 // ============================================================
+// v58: sysctl() hook — 旧 API (CTL_HW, HW_MACHINE 等)
+// ============================================================
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (!g_fishhookReady || !name || namelen == 0) goto fallback;
+
+    // CTL_HW (6) == name[0]
+    // HW_MACHINE (1), HW_MODEL (2), HW_PRODUCT (36)
+    // HW_MEMSIZE (24)
+    if (name[0] == CTL_HW) {
+        if (namelen >= 2) {
+            if (name[1] == HW_MACHINE || name[1] == HW_MODEL ||
+                (name[1] == HW_PRODUCT && g_fakeMachine[0])) {
+                if (g_fakeMachine[0]) {
+                    size_t fakeLen = strlen(g_fakeMachine) + 1;
+                    if (oldlenp) {
+                        if (oldp) {
+                            if (*oldlenp >= fakeLen) {
+                                memcpy(oldp, g_fakeMachine, fakeLen);
+                                *oldlenp = fakeLen;
+                                return 0;
+                            } else {
+                                *oldlenp = fakeLen;
+                                return ENOMEM;
+                            }
+                        } else {
+                            *oldlenp = fakeLen;
+                            return 0;
+                        }
+                    }
+                    return 0;
+                }
+            }
+            #ifdef HW_MEMSIZE
+            if (name[1] == HW_MEMSIZE) {
+                if (oldlenp) {
+                    if (oldp) {
+                        if (*oldlenp >= sizeof(uint64_t)) {
+                            *(uint64_t *)oldp = g_fakeMemSize;
+                            *oldlenp = sizeof(uint64_t);
+                            return 0;
+                        } else {
+                            *oldlenp = sizeof(uint64_t);
+                            return ENOMEM;
+                        }
+                    } else {
+                        *oldlenp = sizeof(uint64_t);
+                        return 0;
+                    }
+                }
+                return 0;
+            }
+            #endif
+        }
+    }
+    // CTL_KERN (1) == name[0]
+    // KERN_OSVERSION (2), KERN_OSRELEASE (2), KERN_OSPRODUCTVERSION (202)
+    if (name[0] == CTL_KERN) {
+        if (namelen >= 2) {
+            if (name[1] == KERN_OSVERSION && g_fakeBuild[0]) {
+                size_t fakeLen = strlen(g_fakeBuild) + 1;
+                if (oldlenp) {
+                    if (oldp) {
+                        if (*oldlenp >= fakeLen) {
+                            memcpy(oldp, g_fakeBuild, fakeLen);
+                            *oldlenp = fakeLen;
+                            return 0;
+                        } else {
+                            *oldlenp = fakeLen;
+                            return ENOMEM;
+                        }
+                    } else {
+                        *oldlenp = fakeLen;
+                        return 0;
+                    }
+                }
+                return 0;
+            }
+            if (name[1] == KERN_OSRELEASE && g_fakeDarwinRel[0]) {
+                size_t fakeLen = strlen(g_fakeDarwinRel) + 1;
+                if (oldlenp) {
+                    if (oldp) {
+                        if (*oldlenp >= fakeLen) {
+                            memcpy(oldp, g_fakeDarwinRel, fakeLen);
+                            *oldlenp = fakeLen;
+                            return 0;
+                        } else {
+                            *oldlenp = fakeLen;
+                            return ENOMEM;
+                        }
+                    } else {
+                        *oldlenp = fakeLen;
+                        return 0;
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+
+fallback:
+    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+
+// ============================================================
 // v57: uname hook — 纯 C 实现
 // ============================================================
 static int hook_uname(struct utsname *name) {
     int ret = orig_uname(name);
-    if (ret == 0 && name) {
-        // 覆盖 machine 字段 (硬件型号)
-        strncpy(name->machine, g_fakeMachine, sizeof(name->machine) - 1);
-        name->machine[sizeof(name->machine) - 1] = '\0';
-        // 覆盖 release 字段 (Darwin 内核版本)
-        strncpy(name->release, g_fakeDarwinRel, sizeof(name->release) - 1);
-        name->release[sizeof(name->release) - 1] = '\0';
+    if (ret == 0 && name && g_fishhookReady) {
+        if (g_fakeMachine[0]) {
+            strncpy(name->machine, g_fakeMachine, sizeof(name->machine) - 1);
+            name->machine[sizeof(name->machine) - 1] = '\0';
+        }
+        if (g_fakeDarwinRel[0]) {
+            strncpy(name->release, g_fakeDarwinRel, sizeof(name->release) - 1);
+            name->release[sizeof(name->release) - 1] = '\0';
+        }
     }
     return ret;
 }
 
 // ============================================================
-// Persistent fake IDs (Bd57. prefix = new identity)
+// Persistent fake IDs (Bd58. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -157,7 +257,6 @@ static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
 
 static NSString *genUUIDStr(void) { return [[NSUUID UUID] UUIDString]; }
 
-// v56: 更真实的设备名称（完整中文名）
 static NSString *genDeviceName(void) {
     NSArray *surnames = @[@"张", @"王", @"李", @"赵", @"刘", @"陈", @"杨", @"黄", @"周", @"吴",
                           @"徐", @"孙", @"马", @"朱", @"胡", @"林", @"郭", @"何", @"高", @"罗",
@@ -187,7 +286,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 统一 iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd57.sv", ^{
+    return getPersistent(@"Bd58.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -198,7 +297,6 @@ static NSString *getFakeSystemVersion(void) {
     });
 }
 
-// 版本到 Build 号映射
 static NSString *versionToBuild(NSString *version) {
     NSDictionary *map = @{
         @"15.4.1": @"19E258", @"15.5": @"19F77", @"15.6.1": @"19G82",
@@ -213,22 +311,18 @@ static NSString *versionToBuild(NSString *version) {
     return map[version] ?: @"20F66";
 }
 
-// v57: iOS 版本 → 硬件型号映射 (保证一致性)
-// 返回: @"iPhone14,7" 等
+// v57: iOS 版本 → 硬件型号映射
 static NSString *versionToMachine(NSString *version) {
     NSInteger major = [[version componentsSeparatedByString:@"."][0] integerValue];
     if (major == 15) {
-        // iOS 15: iPhone 12/13 系列
         NSArray *models = @[@"iPhone14,5", @"iPhone14,4", @"iPhone14,2", @"iPhone14,3",
                             @"iPhone13,2", @"iPhone13,3"];
         return models[arc4random_uniform((uint32_t)models.count)];
     } else if (major == 16) {
-        // iOS 16: iPhone 14 系列 (也支持 iPhone 8/X/11/12/13)
         NSArray *models = @[@"iPhone14,7", @"iPhone14,8", @"iPhone15,2", @"iPhone15,3",
                             @"iPhone14,5", @"iPhone14,6", @"iPhone13,2", @"iPhone13,3"];
         return models[arc4random_uniform((uint32_t)models.count)];
     } else if (major == 17) {
-        // iOS 17: iPhone XR 及以上 (iPhone 15 系列 + 二手旧机型)
         NSArray *models = @[@"iPhone15,4", @"iPhone15,5", @"iPhone16,1", @"iPhone16,2",
                             @"iPhone14,7", @"iPhone14,8", @"iPhone14,2", @"iPhone14,3"];
         return models[arc4random_uniform((uint32_t)models.count)];
@@ -236,30 +330,54 @@ static NSString *versionToMachine(NSString *version) {
     return @"iPhone14,7";
 }
 
-// v57: 硬件型号 → RAM 大小映射
 static uint64_t machineToMemSize(NSString *machine) {
-    // 4GB 设备
     NSArray *fourGB = @[@"iPhone14,4", @"iPhone14,5", @"iPhone14,6",
                         @"iPhone13,2", @"iPhone13,3", @"iPhone12,1", @"iPhone11,8"];
-    // 6GB 设备
     NSArray *sixGB = @[@"iPhone14,7", @"iPhone14,8", @"iPhone15,2", @"iPhone15,3",
                        @"iPhone15,4", @"iPhone15,5", @"iPhone14,2", @"iPhone14,3"];
-    // 8GB 设备
     NSArray *eightGB = @[@"iPhone16,1", @"iPhone16,2"];
     if ([eightGB containsObject:machine]) return 8589934592ULL;
     if ([sixGB containsObject:machine]) return 6442450944ULL;
     if ([fourGB containsObject:machine]) return 4294967296ULL;
-    return 6442450944ULL; // 默认 6GB
+    return 6442450944ULL;
 }
 
-// v57: iOS 版本 → Darwin 内核版本
-// iOS 15.x → Darwin 21.x, iOS 16.x → Darwin 22.x, iOS 17.x → Darwin 23.x
 static NSString *versionToDarwinRelease(NSString *version) {
     NSArray *parts = [version componentsSeparatedByString:@"."];
     NSInteger major = [parts[0] integerValue];
     NSInteger minor = parts.count > 1 ? [parts[1] integerValue] : 0;
-    NSInteger darwinMajor = major + 6; // iOS 15 → Darwin 21, iOS 16 → Darwin 22, iOS 17 → Darwin 23
+    NSInteger darwinMajor = major + 6;
     return [NSString stringWithFormat:@"%ld.%ld.0", (long)darwinMajor, (long)minor];
+}
+
+// v58: 硬件型号 → 屏幕分辨率映射 (points)
+// 返回 {width, height, scale}
+static void machineToScreenSize(NSString *machine, CGFloat *w, CGFloat *h, CGFloat *scale) {
+    NSDictionary *map = @{
+        // 390x844 @3x: iPhone 12/13/14/15 mini & standard
+        @"iPhone13,2": @[@390, @844, @3],   // iPhone 12
+        @"iPhone13,3": @[@390, @844, @3],   // iPhone 12 Pro
+        @"iPhone14,4": @[@375, @812, @3],   // iPhone 13 mini
+        @"iPhone14,5": @[@390, @844, @3],   // iPhone 13
+        @"iPhone14,2": @[@390, @844, @3],   // iPhone 13 Pro
+        @"iPhone14,3": @[@390, @844, @3],   // iPhone 13 Pro Max
+        @"iPhone14,7": @[@390, @844, @3],   // iPhone 14
+        @"iPhone14,8": @[@428, @926, @3],   // iPhone 14 Plus
+        @"iPhone15,2": @[@393, @852, @3],   // iPhone 14 Pro
+        @"iPhone15,3": @[@430, @932, @3],   // iPhone 14 Pro Max
+        @"iPhone15,4": @[@393, @852, @3],   // iPhone 15
+        @"iPhone15,5": @[@430, @932, @3],   // iPhone 15 Plus
+        @"iPhone16,1": @[@393, @852, @3],   // iPhone 15 Pro
+        @"iPhone16,2": @[@430, @932, @3],   // iPhone 15 Pro Max
+    };
+    NSArray *info = map[machine];
+    if (info && info.count >= 3) {
+        *w = [info[0] floatValue];
+        *h = [info[1] floatValue];
+        *scale = [info[2] floatValue];
+    } else {
+        *w = 390; *h = 844; *scale = 3;
+    }
 }
 
 static NSOperatingSystemVersion parseVersion(NSString *versionStr) {
@@ -367,7 +485,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd57.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd58.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -412,7 +530,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd57"]) return NO;
+    if ([key hasPrefix:@"Bd58"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -429,16 +547,14 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 0. v57: 预计算内核级伪装值 (C 字符串) ----
-        // 必须在安装 fishhook 之前完成，hook 函数中不能调用 ObjC
+        // ---- 0. 预计算内核级伪装值 (C 字符串) ----
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd57.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd58.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
-        // 同步 RAM 大小到硬件型号
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd57.mem", ^{
+        NSString *memStr = getPersistent(@"Bd58.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -450,9 +566,15 @@ static void initPrivacyHook(void) {
         strlcpy(g_fakeDarwinRel, [fakeDarwin UTF8String], sizeof(g_fakeDarwinRel));
         g_fakeMemSize = fakeMem;
 
+        // v58: 预计算屏幕分辨率
+        machineToScreenSize(fakeMachine, &g_fakeScreenWidth, &g_fakeScreenHeight, &g_fakeScreenScale);
+
+        // 标记 fishhook 就绪
+        g_fishhookReady = YES;
+
         // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd57.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd58.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 NSArray *cookies = [storage cookies];
@@ -464,26 +586,26 @@ static void initPrivacyHook(void) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd57.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd58.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
 
-        // ---- 2. UIDevice hooks (name + IDFV + model + systemVersion) ----
+        // ---- 2. UIDevice hooks ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd57.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd58.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd57.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd58.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -507,11 +629,10 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 3. NSProcessInfo hooks (operatingSystemVersion + physicalMemory) ----
+        // ---- 3. NSProcessInfo hooks ----
         @try {
             Class pi = objc_getClass("NSProcessInfo");
             if (pi) {
-                // 3a. operatingSystemVersion
                 Method osvM = class_getInstanceMethod(pi, @selector(operatingSystemVersion));
                 if (osvM) {
                     IMP imp = imp_implementationWithBlock(^NSOperatingSystemVersion(id s) {
@@ -519,7 +640,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(pi, @selector(operatingSystemVersion), imp, method_getTypeEncoding(osvM));
                 }
-                // 3b. operatingSystemVersionString
                 Method osvsM = class_getInstanceMethod(pi, @selector(operatingSystemVersionString));
                 if (osvsM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
@@ -529,7 +649,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(pi, @selector(operatingSystemVersionString), imp, method_getTypeEncoding(osvsM));
                 }
-                // 3c. isOperatingSystemAtLeastVersion:
                 Method ialvM = class_getInstanceMethod(pi, @selector(isOperatingSystemAtLeastVersion:));
                 if (ialvM) {
                     IMP imp = imp_implementationWithBlock(^BOOL(id s, NSOperatingSystemVersion v) {
@@ -542,7 +661,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(pi, @selector(isOperatingSystemAtLeastVersion:), imp, method_getTypeEncoding(ialvM));
                 }
-                // v57 NEW: 3d. physicalMemory (RAM 大小)
                 Method pmM = class_getInstanceMethod(pi, @selector(physicalMemory));
                 if (pmM) {
                     IMP imp = imp_implementationWithBlock(^unsigned long long(id s) {
@@ -550,13 +668,11 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(pi, @selector(physicalMemory), imp, method_getTypeEncoding(pmM));
                 }
-                // v57 NEW: 3e. processorCount
                 Method pcM = class_getInstanceMethod(pi, @selector(processorCount));
                 if (pcM) {
                     IMP imp = imp_implementationWithBlock(^NSUInteger(id s) { return 6; });
                     class_replaceMethod(pi, @selector(processorCount), imp, method_getTypeEncoding(pcM));
                 }
-                // v57 NEW: 3f. activeProcessorCount
                 Method apcM = class_getInstanceMethod(pi, @selector(activeProcessorCount));
                 if (apcM) {
                     IMP imp = imp_implementationWithBlock(^NSUInteger(id s) { return 6; });
@@ -572,14 +688,14 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd57.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd58.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 5. NSUserDefaults hooks (CUID 等设备键) ----
+        // ---- 5. NSUserDefaults hooks ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
@@ -612,7 +728,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. Cookie hooks (读+写都替换) ----
+        // ---- 6. Cookie hooks ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
 
@@ -734,7 +850,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 8. WKWebView hooks (customUserAgent) ----
+        // ---- 8. WKWebView hooks ----
         @try {
             Class wkClass = objc_getClass("WKWebView");
             if (wkClass) {
@@ -775,19 +891,72 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. v57 NEW: fishhook — sysctlbyname + uname ----
-        // 只 hook 主程序，不影响系统框架
-        // 所有伪装值已在 step 0 预计算为 C 字符串
+        // ---- 9. v58: UIScreen hooks (分辨率伪装) ----
         @try {
-            const struct mach_header *mainHeader = _dyld_get_image_header(0);
-            intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
-            if (mainHeader) {
-                struct rebinding rebindings[] = {
-                    {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                    {"uname",        (void *)hook_uname,        (void **)&orig_uname},
-                };
-                rebind_symbols_image((void *)mainHeader, mainSlide, rebindings, 2);
+            Class sc = objc_getClass("UIScreen");
+            if (sc && g_fakeScreenWidth > 0) {
+                // bounds
+                Method boundsM = class_getInstanceMethod(sc, @selector(bounds));
+                if (boundsM) {
+                    IMP origBounds = method_getImplementation(boundsM);
+                    CGFloat fw = g_fakeScreenWidth, fh = g_fakeScreenHeight;
+                    IMP newBounds = imp_implementationWithBlock(^CGRect(id s) {
+                        CGRect r = ((CGRect (*)(id, SEL))origBounds)(s, @selector(bounds));
+                        r.size.width = fw;
+                        r.size.height = fh;
+                        return r;
+                    });
+                    class_replaceMethod(sc, @selector(bounds), newBounds, method_getTypeEncoding(boundsM));
+                }
+                // nativeBounds
+                Method nbM = class_getInstanceMethod(sc, @selector(nativeBounds));
+                if (nbM) {
+                    IMP origNB = method_getImplementation(nbM);
+                    CGFloat fw = g_fakeScreenWidth * g_fakeScreenScale;
+                    CGFloat fh = g_fakeScreenHeight * g_fakeScreenScale;
+                    IMP newNB = imp_implementationWithBlock(^CGRect(id s) {
+                        CGRect r = ((CGRect (*)(id, SEL))origNB)(s, @selector(nativeBounds));
+                        r.size.width = fw;
+                        r.size.height = fh;
+                        return r;
+                    });
+                    class_replaceMethod(sc, @selector(nativeBounds), newNB, method_getTypeEncoding(nbM));
+                }
+                // scale
+                Method scaleM = class_getInstanceMethod(sc, @selector(scale));
+                if (scaleM) {
+                    IMP origScale = method_getImplementation(scaleM);
+                    CGFloat fs = g_fakeScreenScale;
+                    IMP newScale = imp_implementationWithBlock(^CGFloat(id s) {
+                        return fs;
+                    });
+                    class_replaceMethod(sc, @selector(scale), newScale, method_getTypeEncoding(scaleM));
+                }
+                // nativeScale
+                Method nsM = class_getInstanceMethod(sc, @selector(nativeScale));
+                if (nsM) {
+                    IMP origNS = method_getImplementation(nsM);
+                    CGFloat fs = g_fakeScreenScale;
+                    IMP newNS = imp_implementationWithBlock(^CGFloat(id s) {
+                        return fs;
+                    });
+                    class_replaceMethod(sc, @selector(nativeScale), newNS, method_getTypeEncoding(nsM));
+                }
             }
+        } @catch (id e) {}
+
+        // ---- 10. v58: fishhook — rebind_symbols (ALL images!) ----
+        // v57 的致命问题：rebind_symbols_image 只 hook 主程序
+        // 百度的 sysctlbyname 调用在动态框架中，没有被 hook
+        // v58 改用 rebind_symbols，hook 所有已加载和未来加载的镜像
+        // 安全性：hook 函数纯 C (strcmp/memcpy/strlen)，无 ObjC，系统框架调用也安全
+        @try {
+            struct rebinding rebindings[] = {
+                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
+                {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
+                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
+            };
+            rebind_symbols(rebindings, 3);
         } @catch (id e) {}
     }
 }
