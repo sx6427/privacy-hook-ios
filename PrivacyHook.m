@@ -1,21 +1,16 @@
 //
-// PrivacyHook.m — v59: rebind_symbols + Bd59 前缀强制清理
+// PrivacyHook.m — v59b: 逐个非系统镜像 hook + 自定义 dyld 回调
 //
-// v58c 问题（用户反馈“没用，并且是登录状态，关闭再打开就不能付款了”）：
-//   1. 登录状态共享：v58c 用 Bd59 前缀，和 v58 相同，Bd59.reset 已存在 → 不清理
-//      → 残留被风控的 Cookie/Keychain → 直接是登录状态 → 第二次风控拦截
-//   2. fishhook 没生效：v58c 用遍历方式只 hook 当前已加载镜像
-//      但百度框架可能是启动后动态加载 (dlopen) 的 → 漏掉
-//      → sysctlbyname 仍返回真实值 → 交叉比对矛盾
+// v59 闪退原因：rebind_symbols(rebindings, 2) hook 了系统框架
+//   → dyld 早期初始化时 sysctlbyname 被替换 → 系统代码调用时崩溃
 //
-// v59 修复：
-//   1. 换前缀 Bd59. → 强制首次清理 Cookie/Keychain
-//   2. 用 rebind_symbols (ALL + future images) 替代遍历方式
-//      rebind_symbols 会注册 _dyld_register_func_for_add_image 回调
-//      → 未来动态加载的百度框架也会被 hook
-//   3. 只 hook sysctlbyname + uname (不 hook sysctl, 不 hook UIScreen)
-//   4. NULL 指针保护 (orig_* 为 NULL 时 fallthrough)
-//   5. v58 闪退原因已确认是 UIScreen + sysctl() hook，不是 rebind_symbols
+// v59b 修复：
+//   1. 不用 rebind_symbols (hook ALL)，改用 rebind_symbols_image 逐个 hook
+//   2. 遍历当前镜像时跳过系统路径 (/usr/lib/, /System/, /Developer/)
+//   3. 注册 _dyld_register_func_for_add_image 回调，对未来加载的镜像也跳过系统路径
+//   → 只 hook 非系统镜像（主程序 + 百度框架），不碰系统框架 → 不闪退
+//   → 未来动态加载的百度框架也会被 hook → 风控绕过生效
+//   4. 保留 v59 的 Bd59 前缀强制清理 + NULL 保护
 //
 
 #import <Foundation/Foundation.h>
@@ -28,6 +23,7 @@
 #include <sys/utsname.h>
 #include <errno.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
 #include "fishhook.h"
 
 #define NSLog(...)
@@ -52,6 +48,26 @@ static CGFloat g_fakeScreenScale = 0;    // 2.0 or 3.0
 
 // v58b: 安全跳过标志 — 防止 orig_* 为 NULL 时崩溃
 static BOOL g_hookInstalled = NO;
+
+// v59b: fishhook rebindings (全局，供回调使用)
+static struct rebinding g_rebindings[2];
+static int g_rebindingsCount = 0;
+
+// v59b: 自定义 dyld 回调 — 跳过系统路径，只 hook 非系统镜像
+static void hook_new_image(const struct mach_header *header, intptr_t slide) {
+    if (!header || !g_hookInstalled) return;
+    // 查找镜像路径
+    Dl_info info;
+    if (dladdr(header, &info) && info.dli_fname) {
+        const char *path = info.dli_fname;
+        // 跳过系统框架
+        if (strncmp(path, "/usr/lib/", 9) == 0) return;
+        if (strncmp(path, "/System/", 8) == 0) return;
+        if (strncmp(path, "/Developer/", 11) == 0) return;
+    }
+    // hook 这个非系统镜像
+    rebind_symbols_image((void *)header, slide, g_rebindings, g_rebindingsCount);
+}
 
 // v57: sysctlbyname / uname / sysctl 原始函数指针
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
@@ -796,16 +812,35 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. v59: fishhook — rebind_symbols (ALL + future images) ----
-        // v58c 问题：遍历方式只 hook 当前镜像，漏掉动态加载的百度框架
-        // v58 闪退已确认是 UIScreen + sysctl() hook 导致，不是 rebind_symbols
-        // v59 安全：只 hook sysctlbyname + uname，hook 函数纯 C + NULL 保护
+        // ---- 9. v59b: fishhook — 逐个非系统镜像 + 自定义 dyld 回调 ----
+        // v59 闪退原因：rebind_symbols hook 了系统框架 → dyld 早期初始化崩溃
+        // v58c 不闪退但漏掉动态加载的百度框架（dlopen）
+        // v59b 方案：
+        //   1. 遍历当前镜像，跳过系统路径 (/usr/lib/, /System/, /Developer/)
+        //   2. 注册 _dyld_register_func_for_add_image 回调，对未来加载的镜像也跳过系统路径
+        //   → 只 hook 非系统镜像（主程序 + 百度框架），不碰系统框架 → 不闪退
         @try {
-            struct rebinding rebindings[] = {
-                {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                {"uname",        (void *)hook_uname,        (void **)&orig_uname},
-            };
-            rebind_symbols(rebindings, 2);
+            g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
+            g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
+            g_rebindingsCount = 2;
+
+            // 9a. 遍历当前已加载镜像，只 hook 非系统镜像
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const struct mach_header *header = _dyld_get_image_header(i);
+                intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+                const char *path = _dyld_get_image_name(i);
+                if (!header || !path) continue;
+                // 跳过系统框架
+                if (strncmp(path, "/usr/lib/", 9) == 0) continue;
+                if (strncmp(path, "/System/", 8) == 0) continue;
+                if (strncmp(path, "/Developer/", 11) == 0) continue;
+                rebind_symbols_image((void *)header, slide, g_rebindings, g_rebindingsCount);
+            }
+
+            // 9b. 注册回调 — 未来加载的镜像（百度 dlopen 的框架）也会被 hook
+            _dyld_register_func_for_add_image(hook_new_image);
+
             g_hookInstalled = YES;
         } @catch (id e) {}
     }
