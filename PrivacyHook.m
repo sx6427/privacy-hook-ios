@@ -1,21 +1,20 @@
 //
-// PrivacyHook.m — v59f: 恢复 URL/POST Body 替换 + 修复首次清理 + 越狱检测 + UIScreen
+// PrivacyHook.m — v59g: v59e 基础 + URL/POST Body 替换 + 越狱检测（不加 UIScreen）
 //
-// v59e 问题：
-//   1. "还是登录状态" → setFirstLaunchDone() 在 dispatch_after(2s) 里，标记没及时设置
-//   2. "关了重新打开变未登录" → 2s 后 WKWebView 清理把新登录的 Cookie 删了
-//   3. "下单人数过多" → URL 查询参数和 POST Body 中的设备 ID 未被替换！
-//      百度 SDK 通过 URL ?cuid=真实CUID 发送设备标识 → 完全绕过 Cookie hook
+// v59f 问题：
+//   1. "没网" → UIScreen hook 破坏了 WKWebView 初始化
+//   2. "分辨率不对" → UIScreen bounds/scale hook 返回错误值
+//   3. "已登录" → Bd62 前缀的 .reset 已被 v59f 设置，首次清理没跑
+//   4. 删除 WebKit 目录太激进
 //
-// v59f 修复：
-//   1. 恢复 URL 查询参数替换 hook（setURL:, initWithURL:, initWithURL:cachePolicy:timeoutInterval:, URL getter）
-//   2. 恢复 POST Body 设备 ID 替换 hook（setHTTPBody:, HTTPBody getter）
-//   3. 修复首次清理：setFirstLaunchDone() 立即调用，WKWebView 清理移到主线程异步但不延迟
-//   4. 恢复越狱检测 hook（dxmpay_isJailbreak → NO, isJailbroken → NO）
-//   5. 添加 UIScreen hook（bounds, scale, nativeScale, nativeBounds）
-//   6. 换新前缀 Bd62（确保覆盖安装后首次清理生效）
-//   7. 添加 kern.boottime sysctl hook（防止通过启动时间关联设备）
-//   8. 保留 v59b per-image hook + dyld 回调
+// v59g 修复：
+//   1. 完全移除 UIScreen hook
+//   2. 移除删除 WebKit 目录
+//   3. 换新前缀 Bd63（Bd61/Bd62 .reset 都已存在，需新前缀强制首次清理）
+//   4. 保留 v59f 的 URL/POST Body 替换 hook（解决"下单人数过多"核心问题）
+//   5. 保留 v59f 的越狱检测 hook
+//   6. 保留 v59f 的首次清理时序修复（setFirstLaunchDone 立即调用）
+//   7. 保留 v59b per-image hook + dyld 回调
 //
 
 #import <Foundation/Foundation.h>
@@ -162,10 +161,10 @@ static int hook_uname(struct utsname *name) {
 }
 
 // ============================================================
-// v59f: 首次启动标记检查 (Bd62 前缀)
+// v59f: 首次启动标记检查 (Bd63 前缀)
 // ============================================================
 static BOOL isFirstLaunchAfterInstall(void) {
-    CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("Bd62.reset"), kCFPreferencesCurrentApplication);
+    CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("Bd63.reset"), kCFPreferencesCurrentApplication);
     BOOL isSet = NO;
     if (val) {
         isSet = [(__bridge id)val boolValue];
@@ -175,12 +174,12 @@ static BOOL isFirstLaunchAfterInstall(void) {
 }
 
 static void setFirstLaunchDone(void) {
-    CFPreferencesSetAppValue(CFSTR("Bd62.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+    CFPreferencesSetAppValue(CFSTR("Bd63.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
     CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
 }
 
 // ============================================================
-// Persistent fake IDs (Bd62. prefix = new identity)
+// Persistent fake IDs (Bd63. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -227,7 +226,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 统一 iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd62.sv", ^{
+    return getPersistent(@"Bd63.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -424,7 +423,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd62.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd63.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -560,7 +559,7 @@ static NSData *modifiedBody(NSData *body) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd62"]) return NO;
+    if ([key hasPrefix:@"Bd63"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -580,11 +579,11 @@ static void initPrivacyHook(void) {
         // ---- 0. 预计算内核级伪装值 (C 字符串) ----
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd62.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd63.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd62.mem", ^{
+        NSString *memStr = getPersistent(@"Bd63.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -599,7 +598,7 @@ static void initPrivacyHook(void) {
 
         g_fishhookReady = YES;
 
-        // ---- 1. v59f: 首次启动清理（立即设标记 + 同步清理 + 异步 WKWebView）----
+        // ---- 1. v59g: 首次启动清理（立即设标记 + 同步清理 + 异步 WKWebView）----
         if (isFirstLaunchAfterInstall()) {
             @try {
                 // 1a. 直接删除 Cookie 文件
@@ -623,13 +622,13 @@ static void initPrivacyHook(void) {
                 // 1d. 清除 URLCache
                 [[NSURLCache sharedURLCache] removeAllCachedResponses];
 
-                // 1e. 清除 App NSUserDefaults（保留 Bd62.* 设备身份）
+                // 1e. 清除 App NSUserDefaults（保留 Bd63.* 设备身份）
                 NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
                 if (bid) {
                     NSDictionary *appDefaults = [[NSUserDefaults standardUserDefaults] persistentDomainForName:bid];
                     if (appDefaults) {
                         for (NSString *key in appDefaults.allKeys) {
-                            if (![key hasPrefix:@"Bd62"]) {
+                            if (![key hasPrefix:@"Bd63"]) {
                                 [[NSUserDefaults standardUserDefaults] removeObjectForKey:key];
                             }
                         }
@@ -637,15 +636,7 @@ static void initPrivacyHook(void) {
                     }
                 }
 
-                // 1f. 删除 WebKit 数据目录
-                NSString *webkitDir = [NSHomeDirectory()
-                    stringByAppendingPathComponent:@"Library/WebKit"];
-                [[NSFileManager defaultManager] removeItemAtPath:webkitDir error:nil];
-
-                // 1g. 立即设标记 — 后续启动不再清理，保持登录状态
-                //     v59e 错误：setFirstLaunchDone() 在 dispatch_after(2s) 里
-                //     → 2s 后 WKWebView 清理把新登录的 Cookie 也删了
-                //     v59f 修复：立即设标记，WKWebView 只删目录不延迟
+                // 1f. 立即设标记 — 后续启动不再清理，保持登录状态
                 setFirstLaunchDone();
 
                 // 1h. 异步清理 WKWebsiteDataStore（不阻塞，不延迟设标记）
@@ -669,14 +660,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd62.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd63.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd62.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd63.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -759,7 +750,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd62.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd63.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -1038,49 +1029,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 8. UIScreen hooks (v59f NEW) ----
-        // 屏幕分辨率是设备指纹的重要部分，必须 hook
-        @try {
-            Class sc = objc_getClass("UIScreen");
-            if (sc) {
-                // bounds → 返回假屏幕尺寸
-                Method boundsM = class_getInstanceMethod(sc, @selector(bounds));
-                if (boundsM) {
-                    IMP imp = imp_implementationWithBlock(^CGRect(id s) {
-                        return CGRectMake(0, 0, g_fakeScreenWidth, g_fakeScreenHeight);
-                    });
-                    class_replaceMethod(sc, @selector(bounds), imp, method_getTypeEncoding(boundsM));
-                }
-                // scale → 返回假 scale
-                Method scaleM = class_getInstanceMethod(sc, @selector(scale));
-                if (scaleM) {
-                    IMP imp = imp_implementationWithBlock(^CGFloat(id s) {
-                        return g_fakeScreenScale;
-                    });
-                    class_replaceMethod(sc, @selector(scale), imp, method_getTypeEncoding(scaleM));
-                }
-                // nativeScale → 返回假 scale
-                Method nsM = class_getInstanceMethod(sc, @selector(nativeScale));
-                if (nsM) {
-                    IMP imp = imp_implementationWithBlock(^CGFloat(id s) {
-                        return g_fakeScreenScale;
-                    });
-                    class_replaceMethod(sc, @selector(nativeScale), imp, method_getTypeEncoding(nsM));
-                }
-                // nativeBounds → 返回假像素尺寸
-                Method nbM = class_getInstanceMethod(sc, @selector(nativeBounds));
-                if (nbM) {
-                    IMP imp = imp_implementationWithBlock(^CGRect(id s) {
-                        return CGRectMake(0, 0,
-                            g_fakeScreenWidth * g_fakeScreenScale,
-                            g_fakeScreenHeight * g_fakeScreenScale);
-                    });
-                    class_replaceMethod(sc, @selector(nativeBounds), imp, method_getTypeEncoding(nbM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 9. WKWebView hooks ----
+        // ---- 8. WKWebView hooks ----
         @try {
             Class wkClass = objc_getClass("WKWebView");
             if (wkClass) {
@@ -1121,11 +1070,11 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 10. v59f: 越狱检测 hook ----
+        // ---- 9. v59g: 越狱检测 hook ----
         // 百度检测路径: /Applications/Cydia.app /usr/sbin/sshd /bin/bash /private/var/lib/apt/
         // 支付SDK检测: dxmpay_isJailbreak
         @try {
-            // 10a. dxmpay_isJailbreak — NSString category 方法
+                // 9a. dxmpay_isJailbreak
             SEL jbSel = NSSelectorFromString(@"dxmpay_isJailbreak");
             Class nsStr = objc_getClass("NSString");
             if (nsStr) {
@@ -1135,7 +1084,7 @@ static void initPrivacyHook(void) {
                     class_replaceMethod(nsStr, jbSel, imp, method_getTypeEncoding(jbM));
                 }
             }
-            // 10b. 通用 isJailbroken / isJailbreak 方法
+                // 9b. 通用 isJailbroken
             for (NSString *clsName in @[@"UIDevice", @"NSBundle", @"NSString"]) {
                 Class cls = objc_getClass([clsName UTF8String]);
                 if (!cls) continue;
@@ -1150,7 +1099,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 11. v59b: fishhook — 逐个非系统镜像 + 自定义 dyld 回调 ----
+        // ---- 10. v59b: fishhook — 逐个非系统镜像 + 自定义 dyld 回调 ----
         @try {
             g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
             g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
