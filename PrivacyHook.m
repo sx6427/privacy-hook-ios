@@ -548,15 +548,15 @@ static void initPrivacyHook(void) {
                     IMP origInitFull = method_getImplementation(initFullM);
                     IMP newInitFull = imp_implementationWithBlock(^id(id s, NSURL *url, NSURLRequestCachePolicy policy, NSTimeInterval timeout) {
                         if (g_inURLHook || !url) {
-                            return ((id (*)(id, SEL, NSURL, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, url, policy, timeout);
+                            return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, url, policy, timeout);
                         }
                         g_inURLHook = YES;
                         @try {
                             NSURL *modified = modifiedURL(url);
                             g_inURLHook = NO;
-                            return ((id (*)(id, SEL, NSURL, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, modified, policy, timeout);
+                            return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, modified, policy, timeout);
                         } @catch (id e) { g_inURLHook = NO; }
-                        return ((id (*)(id, SEL, NSURL, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, url, policy, timeout);
+                        return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, url, policy, timeout);
                     });
                     class_replaceMethod(reqClass, initFullSel, newInitFull, method_getTypeEncoding(initFullM));
                 }
