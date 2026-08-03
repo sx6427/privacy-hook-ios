@@ -1,9 +1,9 @@
 #
-# Makefile — v56: NSProcessInfo + WKWebView + User-Agent hooks
+# Makefile — v57: fishhook sysctlbyname + uname hooks
 #
 
 DYLIB = PrivacyHook.dylib
-SRC   = PrivacyHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
