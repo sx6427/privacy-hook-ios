@@ -1,23 +1,18 @@
 //
-// PrivacyHook.m — v53b: 修复 containsDeviceID bug + 越狱检测 hook
+// PrivacyHook.m — v53c: 去掉 URL/Body 替换（签名错误）+ 保留越狱检测
 //
-// v53 致命 bug：containsDeviceID 检查首字符，但 URL 以 'h'(https://) 开头
-//   → 首字符 'h' 不在检查列表 → 所有 URL 返回 NO → URL 参数替换完全没生效！
-//   → CUID 仍通过 URL 参数以真实值发送 → 服务器检测到本机
+// v53b 问题：URL/Body 替换发生在签名计算之后
+//   百度支付流程：获取CUID → 计算sign → 拼URL/Body → 发请求
+//   我们替换了 URL/Body 中的 cuid → 但 sign 仍是基于原始 cuid 计算的 → 签名不匹配
 //
-// v53b 修复：
-//   1. 修复 containsDeviceID — 去掉首字符检查，直接全文搜索
-//   2. 加越狱检测 hook — dxmpay_isJailbreak → NO，isJailbroken → NO
-//   3. 加 initWithURL: hook — 捕获通过 init 设置的 URL
+// v53c 方案：
+//   去掉 URL/Body/initWithURL 替换（签名错误）
+//   保留 Cookie 读写 hook（v6 核心，在源头替换，不影响签名）
+//   保留越狱检测 hook（dxmpay_isJailbreak → NO）
+//   保留 Cookie 头替换（只影响 Cookie 头，不涉及签名）
+//   保留 systemVersion/IDFV/IDFA/UIDevice hook
 //
-// v53b 保留 v53 的：
-//   - Cookie 读写 hook（完整方案）
-//   - URL 参数 + POST Body 替换（现在真的生效了）
-//   - systemVersion hook
-//   - 首次清 Cookie + Keychain
-//   - IDFV / IDFA / UIDevice name/model hook
-//
-// 前缀：Bd53b.（全新身份）
+// 前缀：Bd53c.（全新身份）
 //
 
 #import <Foundation/Foundation.h>
@@ -28,13 +23,10 @@
 #define NSLog(...)
 
 static __thread BOOL g_inCookieHook = NO;
-static __thread BOOL g_inURLHook = NO;
-static __thread BOOL g_inBodyHook = NO;
 static BOOL g_inUDHook = NO;
-static BOOL g_jailbreakHooked = NO; // 标记越狱检测已 hook
 
 // ============================================================
-// Persistent fake IDs (Bd53. prefix = new identity)
+// Persistent fake IDs (Bd53c. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -95,7 +87,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd53b.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd53c.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -135,127 +127,11 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 }
 
 // ============================================================
-// URL / POST Body device ID replacement (v53 NEW)
-// ============================================================
-
-// 检查字符串是否包含设备标识关键词
-// v53b 修复：去掉首字符检查（URL 以 https:// 开头，首字符 'h' 不在旧检查列表中）
-static BOOL containsDeviceID(NSString *str) {
-    if (!str || str.length < 4) return NO;
-    return ([str containsString:@"cuid"] || [str containsString:@"CUID"] ||
-            [str containsString:@"DVIF"] || [str containsString:@"tcuid"] ||
-            [str containsString:@"__bid_n"] || [str containsString:@"fuid"] ||
-            [str containsString:@"idfa"] || [str containsString:@"IDFA"] ||
-            [str containsString:@"idfv"] || [str containsString:@"IDFV"] ||
-            [str containsString:@"device_id"] || [str containsString:@"bdudid"] ||
-            [str containsString:@"BAIDUID"]);
-}
-
-// 替换字符串中的设备标识
-// 适用于 URL 查询参数（cuid=value&...）和 POST Body（JSON 或 form-encoded）
-static NSString *replaceDeviceIDsInString(NSString *str) {
-    if (!str || str.length == 0) return str;
-
-    NSString *modified = str;
-
-    // 设备标识列表：(正则模式, 假ID名)
-    // 注意顺序：先替换长名称（BAIDUCUID_BFESS），再替换短名称（cuid）
-    struct { NSString *pattern; NSString *fakeName; } patterns[] = {
-        // BAIDUCUID_BFESS (最长，先替换)
-        { @"BAIDUCUID_BFESS=[^&;#\"\\\\}\\s]+", @"BAIDUCUID_BFESS" },
-        // BAIDUCUID
-        { @"BAIDUCUID=[^&;#\"\\\\}\\s]+", @"BAIDUCUID" },
-        // MAWEBCUID
-        { @"MAWEBCUID=[^&;#\"\\\\}\\s]+", @"MAWEBCUID" },
-        // cuid (不匹配 BAIDUCUID/MAWEBCUID 中的 cuid)
-        { @"(?<![A-Za-z_])cuid=[^&;#\"\\\\}\\s]+", @"cuid" },
-        // DVIF
-        { @"(?<![A-Za-z_])DVIF=[^&;#\"\\\\}\\s]+", @"DVIF" },
-        // tcuid
-        { @"(?<![A-Za-z_])tcuid=[^&;#\"\\\\}\\s]+", @"tcuid" },
-        // __bid_n
-        { @"__bid_n=[^&;#\"\\\\}\\s]+", @"__bid_n" },
-        // fuid
-        { @"(?<![A-Za-z_])fuid=[^&;#\"\\\\}\\s]+", @"fuid" },
-        // idfa
-        { @"(?<![A-Za-z_])idfa=[^&;#\"\\\\}\\s]+", @"idfa" },
-        // idfv
-        { @"(?<![A-Za-z_])idfv=[^&;#\"\\\\}\\s]+", @"idfv" },
-        // device_id
-        { @"(?<![A-Za-z_])device_id=[^&;#\"\\\\}\\s]+", @"device_id" },
-        // bdudid
-        { @"(?<![A-Za-z_])bdudid=[^&;#\"\\\\}\\s]+", @"bdudid" },
-    };
-
-    for (int i = 0; i < sizeof(patterns)/sizeof(patterns[0]); i++) {
-        NSRegularExpression *regex = [NSRegularExpression
-            regularExpressionWithPattern:patterns[i].pattern
-            options:NSRegularExpressionCaseInsensitive error:nil];
-        NSString *fakeVal = getFakeID(patterns[i].fakeName);
-        // 提取参数名（= 前面的部分）
-        NSString *paramName = [patterns[i].pattern componentsSeparatedByString:@"="][0];
-        // 清理正则特殊字符
-        paramName = [paramName stringByReplacingOccurrencesOfString:@"(?<![A-Za-z_])" withString:@""];
-
-        NSString *replacement = [NSString stringWithFormat:@"%@=%@", paramName, fakeVal];
-        modified = [regex stringByReplacingMatchesInString:modified
-            options:0 range:NSMakeRange(0, modified.length)
-            withTemplate:replacement];
-    }
-
-    // JSON 格式: "cuid":"value" → "cuid":"fake"
-    // 匹配 "key":"value" 模式
-    NSArray *jsonKeys = @[@"cuid", @"CUID", @"BAIDUCUID", @"BAIDUCUID_BFESS",
-                          @"MAWEBCUID", @"DVIF", @"tcuid", @"__bid_n",
-                          @"fuid", @"idfa", @"idfv", @"device_id", @"bdudid"];
-    for (NSString *key in jsonKeys) {
-        NSString *pattern = [NSString stringWithFormat:@"\"%@\"\\s*:\\s*\"[^\"]*\"", key];
-        NSRegularExpression *regex = [NSRegularExpression
-            regularExpressionWithPattern:pattern options:0 error:nil];
-        NSString *fakeVal = getFakeID(key);
-        NSString *replacement = [NSString stringWithFormat:@"\"%@\":\"%@\"", key, fakeVal];
-        modified = [regex stringByReplacingMatchesInString:modified
-            options:0 range:NSMakeRange(0, modified.length)
-            withTemplate:replacement];
-    }
-
-    return modified;
-}
-
-// 修改 NSURL 中的查询参数
-static NSURL *modifiedURL(NSURL *url) {
-    if (!url) return url;
-    NSString *urlStr = [url absoluteString];
-    if (!containsDeviceID(urlStr)) return url;
-
-    NSString *modified = replaceDeviceIDsInString(urlStr);
-    if ([modified isEqualToString:urlStr]) return url;
-
-    NSURL *result = [NSURL URLWithString:modified];
-    return result ?: url;
-}
-
-// 修改 HTTPBody 中的设备标识
-static NSData *modifiedBody(NSData *body) {
-    if (!body || body.length == 0) return body;
-    // 尝试解析为 UTF-8 字符串
-    NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-    if (!bodyStr) return body; // 二进制数据，跳过
-    if (!containsDeviceID(bodyStr)) return body;
-
-    NSString *modified = replaceDeviceIDsInString(bodyStr);
-    if ([modified isEqualToString:bodyStr]) return body;
-
-    NSData *result = [modified dataUsingEncoding:NSUTF8StringEncoding];
-    return result ?: body;
-}
-
-// ============================================================
 // NSUserDefaults device key detection
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd53b"]) return NO;
+    if ([key hasPrefix:@"Bd53c"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -274,7 +150,7 @@ static void initPrivacyHook(void) {
 
         // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd53b.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd53c.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 // 1a. Clear Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
@@ -288,7 +164,7 @@ static void initPrivacyHook(void) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd53b.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd53c.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
@@ -300,14 +176,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd53b.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd53c.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53b.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53c.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -321,11 +197,10 @@ static void initPrivacyHook(void) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
                     class_replaceMethod(dc, @selector(model), imp, method_getTypeEncoding(modelM));
                 }
-                // v53 NEW: systemVersion hook (OSVS 指纹)
                 Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
                 if (svM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd53b.sv", ^{
+                        return getPersistent(@"Bd53c.sv", ^{
                             NSArray *versions = @[@"15.5", @"16.0", @"16.5", @"16.7", @"17.0",
                                                   @"17.2", @"17.4", @"17.5", @"17.6", @"18.0"];
                             return versions[arc4random_uniform((uint32_t)versions.count)];
@@ -343,7 +218,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53b.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53c.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -465,11 +340,11 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. NSMutableURLRequest Cookie header + URL + Body replacement ----
+        // ---- 6. NSMutableURLRequest Cookie header replacement ----
+        // 只替换 Cookie 头中的设备标识，不碰 URL 和 Body（避免签名错误）
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
-                // 6a. Cookie 头替换 (v52b 保留)
                 Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
                 if (svM) {
                     IMP origSV = method_getImplementation(svM);
@@ -499,126 +374,10 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
                 }
-
-                // 6b. v53b: URL 查询参数替换 (setter)
-                Method setURLM = class_getInstanceMethod(reqClass, @selector(setURL:));
-                if (setURLM) {
-                    IMP origSetURL = method_getImplementation(setURLM);
-                    IMP newSetURL = imp_implementationWithBlock(^void(id s, NSURL *url) {
-                        if (g_inURLHook || !url) {
-                            ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), url);
-                            return;
-                        }
-                        g_inURLHook = YES;
-                        @try {
-                            NSURL *modified = modifiedURL(url);
-                            g_inURLHook = NO;
-                            ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), modified);
-                            return;
-                        } @catch (id e) { g_inURLHook = NO; }
-                        ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), url);
-                    });
-                    class_replaceMethod(reqClass, @selector(setURL:), newSetURL, method_getTypeEncoding(setURLM));
-                }
-
-                // 6b2. v53b NEW: initWithURL: hook — 捕获通过 init 设置的 URL
-                SEL initWithURLSel = @selector(initWithURL:);
-                Method initURLM = class_getInstanceMethod(reqClass, initWithURLSel);
-                if (initURLM) {
-                    IMP origInit = method_getImplementation(initURLM);
-                    IMP newInit = imp_implementationWithBlock(^id(id s, NSURL *url) {
-                        if (g_inURLHook || !url) {
-                            return ((id (*)(id, SEL, NSURL *))origInit)(s, initWithURLSel, url);
-                        }
-                        g_inURLHook = YES;
-                        @try {
-                            NSURL *modified = modifiedURL(url);
-                            g_inURLHook = NO;
-                            return ((id (*)(id, SEL, NSURL *))origInit)(s, initWithURLSel, modified);
-                        } @catch (id e) { g_inURLHook = NO; }
-                        return ((id (*)(id, SEL, NSURL *))origInit)(s, initWithURLSel, url);
-                    });
-                    class_replaceMethod(reqClass, initWithURLSel, newInit, method_getTypeEncoding(initURLM));
-                }
-
-                // 6b3. v53b NEW: initWithURL:cachePolicy:timeoutInterval: hook
-                SEL initFullSel = @selector(initWithURL:cachePolicy:timeoutInterval:);
-                Method initFullM = class_getInstanceMethod(reqClass, initFullSel);
-                if (initFullM) {
-                    IMP origInitFull = method_getImplementation(initFullM);
-                    IMP newInitFull = imp_implementationWithBlock(^id(id s, NSURL *url, NSURLRequestCachePolicy policy, NSTimeInterval timeout) {
-                        if (g_inURLHook || !url) {
-                            return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, url, policy, timeout);
-                        }
-                        g_inURLHook = YES;
-                        @try {
-                            NSURL *modified = modifiedURL(url);
-                            g_inURLHook = NO;
-                            return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, modified, policy, timeout);
-                        } @catch (id e) { g_inURLHook = NO; }
-                        return ((id (*)(id, SEL, NSURL *, NSURLRequestCachePolicy, NSTimeInterval))origInitFull)(s, initFullSel, url, policy, timeout);
-                    });
-                    class_replaceMethod(reqClass, initFullSel, newInitFull, method_getTypeEncoding(initFullM));
-                }
-
-                // 6c. v53 NEW: URL getter 替换 (安全网：捕获 initWithURL: 设置的 URL)
-                Method urlM = class_getInstanceMethod(reqClass, @selector(URL));
-                if (urlM) {
-                    IMP origURL = method_getImplementation(urlM);
-                    IMP newURL = imp_implementationWithBlock(^NSURL *(id s) {
-                        NSURL *url = ((NSURL *(*)(id, SEL))origURL)(s, @selector(URL));
-                        if (g_inURLHook || !url) return url;
-                        g_inURLHook = YES;
-                        @try {
-                            NSURL *modified = modifiedURL(url);
-                            g_inURLHook = NO;
-                            return modified;
-                        } @catch (id e) { g_inURLHook = NO; return url; }
-                    });
-                    class_replaceMethod(reqClass, @selector(URL), newURL, method_getTypeEncoding(urlM));
-                }
-
-                // 6d. v53 NEW: POST Body 替换 (setter)
-                Method setBodyM = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
-                if (setBodyM) {
-                    IMP origSetBody = method_getImplementation(setBodyM);
-                    IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
-                        if (g_inBodyHook || !body) {
-                            ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), body);
-                            return;
-                        }
-                        g_inBodyHook = YES;
-                        @try {
-                            NSData *modified = modifiedBody(body);
-                            g_inBodyHook = NO;
-                            ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), modified);
-                            return;
-                        } @catch (id e) { g_inBodyHook = NO; }
-                        ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), body);
-                    });
-                    class_replaceMethod(reqClass, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(setBodyM));
-                }
-
-                // 6e. v53 NEW: POST Body 替换 (getter，安全网)
-                Method bodyM = class_getInstanceMethod(reqClass, @selector(HTTPBody));
-                if (bodyM) {
-                    IMP origBody = method_getImplementation(bodyM);
-                    IMP newBody = imp_implementationWithBlock(^NSData *(id s) {
-                        NSData *body = ((NSData *(*)(id, SEL))origBody)(s, @selector(HTTPBody));
-                        if (g_inBodyHook || !body) return body;
-                        g_inBodyHook = YES;
-                        @try {
-                            NSData *modified = modifiedBody(body);
-                            g_inBodyHook = NO;
-                            return modified;
-                        } @catch (id e) { g_inBodyHook = NO; return body; }
-                    });
-                    class_replaceMethod(reqClass, @selector(HTTPBody), newBody, method_getTypeEncoding(bodyM));
-                }
             }
         } @catch (id e) {}
 
-        // ---- 7. v53b NEW: 越狱检测 hook ----
+        // ---- 7. 越狱检测 hook (v53b 保留) ----
         // 逆向发现：dxmpay_isJailbreak (支付SDK) + isJailbroken/isJailbreak
         // 百度检测路径: /Applications/Cydia.app /usr/sbin/sshd /bin/bash /private/var/lib/apt/
         // 支付宝SDK检测: MobileSubstrate mobilesubstrate
@@ -631,7 +390,6 @@ static void initPrivacyHook(void) {
                 if (jbM) {
                     IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
                     class_replaceMethod(nsStr, jbSel, imp, method_getTypeEncoding(jbM));
-                    g_jailbreakHooked = YES;
                 }
             }
             // 7b. 通用 isJailbroken / isJailbreak 方法（可能在多个类上）
