@@ -1,16 +1,15 @@
 //
-// PrivacyHook.m — v59b: 逐个非系统镜像 hook + 自定义 dyld 回调
+// PrivacyHook.m — v59c: Bd60 前缀强制清理 + 全面清除登录状态
 //
-// v59 闪退原因：rebind_symbols(rebindings, 2) hook 了系统框架
-//   → dyld 早期初始化时 sysctlbyname 被替换 → 系统代码调用时崩溃
+// v59b 问题：用户反馈"还是登录状态"
+//   原因：v59b 用 Bd59 前缀，和 v59 相同，Bd59.reset 已被 v59 设置 → 跳过清理
+//   → Cookie/Keychain/NSUserDefaults 残留 → 直接是登录状态
 //
-// v59b 修复：
-//   1. 不用 rebind_symbols (hook ALL)，改用 rebind_symbols_image 逐个 hook
-//   2. 遍历当前镜像时跳过系统路径 (/usr/lib/, /System/, /Developer/)
-//   3. 注册 _dyld_register_func_for_add_image 回调，对未来加载的镜像也跳过系统路径
-//   → 只 hook 非系统镜像（主程序 + 百度框架），不碰系统框架 → 不闪退
-//   → 未来动态加载的百度框架也会被 hook → 风控绕过生效
-//   4. 保留 v59 的 Bd59 前缀强制清理 + NULL 保护
+// v59c 修复：
+//   1. 换前缀 Bd60. → 强制首次清理
+//   2. 新增清理 NSUserDefaults (removePersistentDomainForName)
+//   3. 新增清理 WKWebView 数据 (WKWebsiteDataStore — cookies, cache, localStorage)
+//   4. 保留 v59b 的 per-image hook + 自定义 dyld 回调（不闪退 + 动态框架覆盖）
 //
 
 #import <Foundation/Foundation.h>
@@ -160,7 +159,7 @@ static int hook_uname(struct utsname *name) {
 }
 
 // ============================================================
-// Persistent fake IDs (Bd59. prefix = new identity)
+// Persistent fake IDs (Bd60. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -207,7 +206,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 统一 iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd59.sv", ^{
+    return getPersistent(@"Bd60.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -406,7 +405,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd59.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd60.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -451,7 +450,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd59"]) return NO;
+    if ([key hasPrefix:@"Bd60"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -471,11 +470,11 @@ static void initPrivacyHook(void) {
         // ---- 0. 预计算内核级伪装值 (C 字符串) ----
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd59.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd60.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd59.mem", ^{
+        NSString *memStr = getPersistent(@"Bd60.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -493,21 +492,40 @@ static void initPrivacyHook(void) {
         // 标记 fishhook 就绪
         g_fishhookReady = YES;
 
-        // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
+        // ---- 1. Clear Cookie + Keychain + NSUserDefaults (FIRST LAUNCH ONLY) ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd59.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd60.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
+                // 1a. Clear Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 NSArray *cookies = [storage cookies];
                 for (NSHTTPCookie *cookie in cookies) { [storage deleteCookie:cookie]; }
 
+                // 1b. Clear Keychain (all classes — delete ALL items)
                 NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
                                      (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
                 for (id cls in classes) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd59.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                // 1c. Clear NSUserDefaults (remove all keys for this bundle)
+                @try {
+                    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+                    if (bid) {
+                        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
+                        [[NSUserDefaults standardUserDefaults] synchronize];
+                    }
+                } @catch (id e) {}
+
+                // 1d. Clear WKWebView data store (cookies, cache, localStorage)
+                @try {
+                    WKWebsiteDataStore *store = [WKWebsiteDataStore defaultDataStore];
+                    NSSet *types = [WKWebsiteDataStore allWebsiteDataTypes];
+                    NSDate *past = [NSDate dateWithTimeIntervalSince1970:0];
+                    [store removeDataOfTypes:types modifiedSince:past completionHandler:^{}];
+                } @catch (id e) {}
+
+                CFPreferencesSetAppValue(CFSTR("Bd60.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
@@ -519,14 +537,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd59.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd60.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd59.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd60.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -609,7 +627,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd59.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd60.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
