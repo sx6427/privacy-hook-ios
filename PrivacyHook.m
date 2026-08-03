@@ -1,26 +1,23 @@
 //
-// PrivacyHook.m — v52: 回归 v6 极简方案（仅 Cookie 设备标识替换）
+// PrivacyHook.m — v53: v52b + URL参数/POST Body 设备标识替换
 //
-// 记忆文件教训：
-//   - sysctlbyname hook 无效（iOS限制普通App读不到）+ 危险（影响所有系统组件）
-//   - 不需要 Bundle ID hook（用户有自己的"非正版应用"绕过方法）
-//   - v6 成功方案：hook NSHTTPCookieStorage 源头（只读替换）+ 首次清 Cookie
-//   - 登录时要求验证码 = 服务器认为是新设备 = 伪装成功
+// 逆向发现：百度通过 URL 参数发送 CUID（35处），特别是支付系统
+//   com.baidu.wallet.baiduCoreRequestQueue → &cuid=%@&nonce=%@&session_id=%@
+// v52b 只 hook Cookie，完全漏掉 URL 参数中的 CUID → 服务器看到真实 CUID → 检测到本机
 //
-// v52 = v6 核心 + Bd52 新前缀（全新身份）
-//   只做：
-//   1. 首次启动清 Cookie（删除旧 CUID → 强制新设备身份）
-//   2. hook NSHTTPCookieStorage cookiesForURL: / cookies（只读替换设备标识）
-//   3. hook NSMutableURLRequest setValue:forHTTPHeaderField:（替换手动 Cookie 头）
-//   4. hook UIDevice.identifierForVendor + ASIdentifierManager.advertisingIdentifier
-//   5. hook NSUserDefaults 设备键（CUID 等）
+// v53 新增：
+//   1. hook NSMutableURLRequest setURL: → 替换 URL 查询参数中的设备标识
+//   2. hook NSMutableURLRequest setHTTPBody: → 替换 POST Body 中的设备标识
+//   3. hook UIDevice systemVersion → OSVS 指纹伪装
 //
-//   不做：
-//   - ❌ Bundle ID hook（不需要支付 hook）
-//   - ❌ sysctlbyname fishhook（无效 + 危险）
-//   - ❌ Keychain 清除（会导致登录问题）
-//   - ❌ NSUserDefaults 清除（会删支付SDK配置）
-//   - ❌ 任何 ObjC 设备类 hook（BIMBaiduUDID 等，不需要）
+// v53 保留 v52b 的：
+//   - Cookie 读写 hook（完整方案）
+//   - 首次清 Cookie + Keychain
+//   - IDFV / IDFA / UIDevice name/model hook
+//   - NSUserDefaults 设备键 hook
+//   - NSMutableURLRequest Cookie 头替换
+//
+// 前缀：Bd53.（全新身份）
 //
 
 #import <Foundation/Foundation.h>
@@ -31,10 +28,12 @@
 #define NSLog(...)
 
 static __thread BOOL g_inCookieHook = NO;
+static __thread BOOL g_inURLHook = NO;
+static __thread BOOL g_inBodyHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// Persistent fake IDs (Bd52. prefix = new identity)
+// Persistent fake IDs (Bd53. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -89,11 +88,13 @@ static NSString *genFakeCookie(NSString *name) {
     if ([name isEqualToString:@"tcuid"]) return [genRandStr(40, hexCS).uppercaseString stringByAppendingString:genRandStr(4, @"ABCDEFGHIJ")];
     if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
     if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
+    if ([name isEqualToString:@"bdudid"]) return genRandStr(40, hexCS);
+    if ([name isEqualToString:@"device_id"]) return genRandStr(40, hexCS);
     return genRandStr(32, cuidCS);
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd52.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd53.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -133,11 +134,134 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 }
 
 // ============================================================
+// URL / POST Body device ID replacement (v53 NEW)
+// ============================================================
+
+// 检查字符串是否包含设备标识关键词（快速过滤）
+static BOOL containsDeviceID(NSString *str) {
+    if (!str || str.length < 4) return NO;
+    // 快速检查：首字符
+    unichar c = [str characterAtIndex:0];
+    if (c == 'c' || c == 'C' || c == 'B' || c == 'b' || c == 'M' || c == 'm' ||
+        c == 'D' || c == 'd' || c == 't' || c == 'T' || c == '_' || c == 'f' ||
+        c == 'F' || c == 'i' || c == 'I') {
+        // 进一步检查
+        return ([str containsString:@"cuid"] || [str containsString:@"CUID"] ||
+                [str containsString:@"DVIF"] || [str containsString:@"tcuid"] ||
+                [str containsString:@"__bid_n"] || [str containsString:@"fuid"] ||
+                [str containsString:@"idfa"] || [str containsString:@"IDFA"] ||
+                [str containsString:@"idfv"] || [str containsString:@"IDFV"] ||
+                [str containsString:@"device_id"] || [str containsString:@"bdudid"] ||
+                [str containsString:@"BAIDUID"]);
+    }
+    return NO;
+}
+
+// 替换字符串中的设备标识
+// 适用于 URL 查询参数（cuid=value&...）和 POST Body（JSON 或 form-encoded）
+static NSString *replaceDeviceIDsInString(NSString *str) {
+    if (!str || str.length == 0) return str;
+
+    NSString *modified = str;
+
+    // 设备标识列表：(正则模式, 假ID名)
+    // 注意顺序：先替换长名称（BAIDUCUID_BFESS），再替换短名称（cuid）
+    struct { NSString *pattern; NSString *fakeName; } patterns[] = {
+        // BAIDUCUID_BFESS (最长，先替换)
+        { @"BAIDUCUID_BFESS=[^&;#\"\\\\}\\s]+", @"BAIDUCUID_BFESS" },
+        // BAIDUCUID
+        { @"BAIDUCUID=[^&;#\"\\\\}\\s]+", @"BAIDUCUID" },
+        // MAWEBCUID
+        { @"MAWEBCUID=[^&;#\"\\\\}\\s]+", @"MAWEBCUID" },
+        // cuid (不匹配 BAIDUCUID/MAWEBCUID 中的 cuid)
+        { @"(?<![A-Za-z_])cuid=[^&;#\"\\\\}\\s]+", @"cuid" },
+        // DVIF
+        { @"(?<![A-Za-z_])DVIF=[^&;#\"\\\\}\\s]+", @"DVIF" },
+        // tcuid
+        { @"(?<![A-Za-z_])tcuid=[^&;#\"\\\\}\\s]+", @"tcuid" },
+        // __bid_n
+        { @"__bid_n=[^&;#\"\\\\}\\s]+", @"__bid_n" },
+        // fuid
+        { @"(?<![A-Za-z_])fuid=[^&;#\"\\\\}\\s]+", @"fuid" },
+        // idfa
+        { @"(?<![A-Za-z_])idfa=[^&;#\"\\\\}\\s]+", @"idfa" },
+        // idfv
+        { @"(?<![A-Za-z_])idfv=[^&;#\"\\\\}\\s]+", @"idfv" },
+        // device_id
+        { @"(?<![A-Za-z_])device_id=[^&;#\"\\\\}\\s]+", @"device_id" },
+        // bdudid
+        { @"(?<![A-Za-z_])bdudid=[^&;#\"\\\\}\\s]+", @"bdudid" },
+    };
+
+    for (int i = 0; i < sizeof(patterns)/sizeof(patterns[0]); i++) {
+        NSRegularExpression *regex = [NSRegularExpression
+            regularExpressionWithPattern:patterns[i].pattern
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSString *fakeVal = getFakeID(patterns[i].fakeName);
+        // 提取参数名（= 前面的部分）
+        NSString *paramName = [patterns[i].pattern componentsSeparatedByString:@"="][0];
+        // 清理正则特殊字符
+        paramName = [paramName stringByReplacingOccurrencesOfString:@"(?<![A-Za-z_])" withString:@""];
+
+        NSString *replacement = [NSString stringWithFormat:@"%@=%@", paramName, fakeVal];
+        modified = [regex stringByReplacingMatchesInString:modified
+            options:0 range:NSMakeRange(0, modified.length)
+            withTemplate:replacement];
+    }
+
+    // JSON 格式: "cuid":"value" → "cuid":"fake"
+    // 匹配 "key":"value" 模式
+    NSArray *jsonKeys = @[@"cuid", @"CUID", @"BAIDUCUID", @"BAIDUCUID_BFESS",
+                          @"MAWEBCUID", @"DVIF", @"tcuid", @"__bid_n",
+                          @"fuid", @"idfa", @"idfv", @"device_id", @"bdudid"];
+    for (NSString *key in jsonKeys) {
+        NSString *pattern = [NSString stringWithFormat:@"\"%@\"\\s*:\\s*\"[^\"]*\"", key];
+        NSRegularExpression *regex = [NSRegularExpression
+            regularExpressionWithPattern:pattern options:0 error:nil];
+        NSString *fakeVal = getFakeID(key);
+        NSString *replacement = [NSString stringWithFormat:@"\"%@\":\"%@\"", key, fakeVal];
+        modified = [regex stringByReplacingMatchesInString:modified
+            options:0 range:NSMakeRange(0, modified.length)
+            withTemplate:replacement];
+    }
+
+    return modified;
+}
+
+// 修改 NSURL 中的查询参数
+static NSURL *modifiedURL(NSURL *url) {
+    if (!url) return url;
+    NSString *urlStr = [url absoluteString];
+    if (!containsDeviceID(urlStr)) return url;
+
+    NSString *modified = replaceDeviceIDsInString(urlStr);
+    if ([modified isEqualToString:urlStr]) return url;
+
+    NSURL *result = [NSURL URLWithString:modified];
+    return result ?: url;
+}
+
+// 修改 HTTPBody 中的设备标识
+static NSData *modifiedBody(NSData *body) {
+    if (!body || body.length == 0) return body;
+    // 尝试解析为 UTF-8 字符串
+    NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (!bodyStr) return body; // 二进制数据，跳过
+    if (!containsDeviceID(bodyStr)) return body;
+
+    NSString *modified = replaceDeviceIDsInString(bodyStr);
+    if ([modified isEqualToString:bodyStr]) return body;
+
+    NSData *result = [modified dataUsingEncoding:NSUTF8StringEncoding];
+    return result ?: body;
+}
+
+// ============================================================
 // NSUserDefaults device key detection
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd52"]) return NO;
+    if ([key hasPrefix:@"Bd53"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -155,12 +279,8 @@ static void initPrivacyHook(void) {
     @autoreleasepool {
 
         // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
-        // v52b: 加回 Keychain 清除 — 解决 A1/A2 Keychain 共享 BDUSS 问题
-        // A1 登录后 BDUSS 存入 Keychain，A2 通过 keychain-access-groups 读取 → 自动登录
-        // 清 Keychain → A2 没有 BDUSS → 必须重新登录 → 验证码 → 证明是新设备
-        // 只首次清一次，不影响后续使用
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd52b.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd53.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 // 1a. Clear Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
@@ -174,26 +294,26 @@ static void initPrivacyHook(void) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd52b.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd53.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
 
-        // ---- 2. UIDevice hooks (v6 完整版: name + IDFV + model + localizedModel) ----
+        // ---- 2. UIDevice hooks (name + IDFV + model + localizedModel + systemVersion) ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd52.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd53.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd52.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -207,6 +327,18 @@ static void initPrivacyHook(void) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
                     class_replaceMethod(dc, @selector(model), imp, method_getTypeEncoding(modelM));
                 }
+                // v53 NEW: systemVersion hook (OSVS 指纹)
+                Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
+                if (svM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return getPersistent(@"Bd53.sv", ^{
+                            NSArray *versions = @[@"15.5", @"16.0", @"16.5", @"16.7", @"17.0",
+                                                  @"17.2", @"17.4", @"17.5", @"17.6", @"18.0"];
+                            return versions[arc4random_uniform((uint32_t)versions.count)];
+                        });
+                    });
+                    class_replaceMethod(dc, @selector(systemVersion), imp, method_getTypeEncoding(svM));
+                }
             }
         } @catch (id e) {}
 
@@ -217,7 +349,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd52.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -258,8 +390,6 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 5. Cookie hooks (v6 完整方案：读+写都替换) ----
-        // v6 成功的关键：不仅读时替换，写入时也替换
-        // App 写入真实 CUID → 我们拦截写入 → 存入假 CUID → 服务器只看到假 CUID
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
 
@@ -291,7 +421,7 @@ static void initPrivacyHook(void) {
                 class_replaceMethod(cs, @selector(cookies), newAll, method_getTypeEncoding(allM));
             }
 
-            // 5c. 写 hook: setCookie: — v6 关键！写入时替换设备 Cookie
+            // 5c. 写 hook: setCookie:
             Method scM = class_getInstanceMethod(cs, @selector(setCookie:));
             if (scM) {
                 IMP origSC = method_getImplementation(scM);
@@ -319,7 +449,7 @@ static void initPrivacyHook(void) {
                 class_replaceMethod(cs, @selector(setCookie:), newSC, method_getTypeEncoding(scM));
             }
 
-            // 5d. 写 hook: setCookies:forURL:mainDocumentURL: — v6 关键！
+            // 5d. 写 hook: setCookies:forURL:mainDocumentURL:
             Method scsM = class_getInstanceMethod(cs, @selector(setCookies:forURL:mainDocumentURL:));
             if (scsM) {
                 IMP origSCS = method_getImplementation(scsM);
@@ -341,10 +471,11 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. NSMutableURLRequest Cookie header replacement ----
+        // ---- 6. NSMutableURLRequest Cookie header + URL + Body replacement ----
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
+                // 6a. Cookie 头替换 (v52b 保留)
                 Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
                 if (svM) {
                     IMP origSV = method_getImplementation(svM);
@@ -373,6 +504,82 @@ static void initPrivacyHook(void) {
                         ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
                     });
                     class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
+                }
+
+                // 6b. v53 NEW: URL 查询参数替换
+                Method setURLM = class_getInstanceMethod(reqClass, @selector(setURL:));
+                if (setURLM) {
+                    IMP origSetURL = method_getImplementation(setURLM);
+                    IMP newSetURL = imp_implementationWithBlock(^void(id s, NSURL *url) {
+                        if (g_inURLHook || !url) {
+                            ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), url);
+                            return;
+                        }
+                        g_inURLHook = YES;
+                        @try {
+                            NSURL *modified = modifiedURL(url);
+                            g_inURLHook = NO;
+                            ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), modified);
+                            return;
+                        } @catch (id e) { g_inURLHook = NO; }
+                        ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), url);
+                    });
+                    class_replaceMethod(reqClass, @selector(setURL:), newSetURL, method_getTypeEncoding(setURLM));
+                }
+
+                // 6c. v53 NEW: URL getter 替换 (安全网：捕获 initWithURL: 设置的 URL)
+                Method urlM = class_getInstanceMethod(reqClass, @selector(URL));
+                if (urlM) {
+                    IMP origURL = method_getImplementation(urlM);
+                    IMP newURL = imp_implementationWithBlock(^NSURL *(id s) {
+                        NSURL *url = ((NSURL *(*)(id, SEL))origURL)(s, @selector(URL));
+                        if (g_inURLHook || !url) return url;
+                        g_inURLHook = YES;
+                        @try {
+                            NSURL *modified = modifiedURL(url);
+                            g_inURLHook = NO;
+                            return modified;
+                        } @catch (id e) { g_inURLHook = NO; return url; }
+                    });
+                    class_replaceMethod(reqClass, @selector(URL), newURL, method_getTypeEncoding(urlM));
+                }
+
+                // 6d. v53 NEW: POST Body 替换 (setter)
+                Method setBodyM = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
+                if (setBodyM) {
+                    IMP origSetBody = method_getImplementation(setBodyM);
+                    IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
+                        if (g_inBodyHook || !body) {
+                            ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), body);
+                            return;
+                        }
+                        g_inBodyHook = YES;
+                        @try {
+                            NSData *modified = modifiedBody(body);
+                            g_inBodyHook = NO;
+                            ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), modified);
+                            return;
+                        } @catch (id e) { g_inBodyHook = NO; }
+                        ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), body);
+                    });
+                    class_replaceMethod(reqClass, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(setBodyM));
+                }
+
+                // 6e. v53 NEW: POST Body 替换 (getter，安全网)
+                Method bodyM = class_getInstanceMethod(reqClass, @selector(HTTPBody));
+                if (bodyM) {
+                    IMP origBody = method_getImplementation(bodyM);
+                    IMP newBody = imp_implementationWithBlock(^NSData *(id s) {
+                        NSData *body = ((NSData *(*)(id, SEL))origBody)(s, @selector(HTTPBody));
+                        if (g_inBodyHook || !body) return body;
+                        g_inBodyHook = YES;
+                        @try {
+                            NSData *modified = modifiedBody(body);
+                            g_inBodyHook = NO;
+                            return modified;
+                        } @catch (id e) { g_inBodyHook = NO; return body; }
+                    });
+                    class_replaceMethod(reqClass, @selector(HTTPBody), newBody, method_getTypeEncoding(bodyM));
                 }
             }
         } @catch (id e) {}
