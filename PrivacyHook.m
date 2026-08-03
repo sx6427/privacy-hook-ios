@@ -54,7 +54,6 @@ static BOOL g_hookInstalled = NO;
 // v57: sysctlbyname / uname / sysctl 原始函数指针
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 // ============================================================
 // v58: sysctlbyname hook — 纯 C 实现，ZERO ObjC 调用
@@ -120,111 +119,7 @@ fallback:
 }
 
 // ============================================================
-// v58: sysctl() hook — 旧 API (CTL_HW, HW_MACHINE 等)
-// ============================================================
-static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!g_fishhookReady || !name || namelen == 0 || !orig_sysctl) goto fallback;
-
-    // CTL_HW (6) == name[0]
-    // HW_MACHINE (1), HW_MODEL (2), HW_PRODUCT (36)
-    // HW_MEMSIZE (24)
-    if (name[0] == CTL_HW) {
-        if (namelen >= 2) {
-            if (name[1] == HW_MACHINE || name[1] == HW_MODEL ||
-                (name[1] == HW_PRODUCT && g_fakeMachine[0])) {
-                if (g_fakeMachine[0]) {
-                    size_t fakeLen = strlen(g_fakeMachine) + 1;
-                    if (oldlenp) {
-                        if (oldp) {
-                            if (*oldlenp >= fakeLen) {
-                                memcpy(oldp, g_fakeMachine, fakeLen);
-                                *oldlenp = fakeLen;
-                                return 0;
-                            } else {
-                                *oldlenp = fakeLen;
-                                return ENOMEM;
-                            }
-                        } else {
-                            *oldlenp = fakeLen;
-                            return 0;
-                        }
-                    }
-                    return 0;
-                }
-            }
-            #ifdef HW_MEMSIZE
-            if (name[1] == HW_MEMSIZE) {
-                if (oldlenp) {
-                    if (oldp) {
-                        if (*oldlenp >= sizeof(uint64_t)) {
-                            *(uint64_t *)oldp = g_fakeMemSize;
-                            *oldlenp = sizeof(uint64_t);
-                            return 0;
-                        } else {
-                            *oldlenp = sizeof(uint64_t);
-                            return ENOMEM;
-                        }
-                    } else {
-                        *oldlenp = sizeof(uint64_t);
-                        return 0;
-                    }
-                }
-                return 0;
-            }
-            #endif
-        }
-    }
-    // CTL_KERN (1) == name[0]
-    // KERN_OSVERSION (2), KERN_OSRELEASE (2), KERN_OSPRODUCTVERSION (202)
-    if (name[0] == CTL_KERN) {
-        if (namelen >= 2) {
-            if (name[1] == KERN_OSVERSION && g_fakeBuild[0]) {
-                size_t fakeLen = strlen(g_fakeBuild) + 1;
-                if (oldlenp) {
-                    if (oldp) {
-                        if (*oldlenp >= fakeLen) {
-                            memcpy(oldp, g_fakeBuild, fakeLen);
-                            *oldlenp = fakeLen;
-                            return 0;
-                        } else {
-                            *oldlenp = fakeLen;
-                            return ENOMEM;
-                        }
-                    } else {
-                        *oldlenp = fakeLen;
-                        return 0;
-                    }
-                }
-                return 0;
-            }
-            if (name[1] == KERN_OSRELEASE && g_fakeDarwinRel[0]) {
-                size_t fakeLen = strlen(g_fakeDarwinRel) + 1;
-                if (oldlenp) {
-                    if (oldp) {
-                        if (*oldlenp >= fakeLen) {
-                            memcpy(oldp, g_fakeDarwinRel, fakeLen);
-                            *oldlenp = fakeLen;
-                            return 0;
-                        } else {
-                            *oldlenp = fakeLen;
-                            return ENOMEM;
-                        }
-                    } else {
-                        *oldlenp = fakeLen;
-                        return 0;
-                    }
-                }
-                return 0;
-            }
-        }
-    }
-
-fallback:
-    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-}
-
-// ============================================================
-// v57: uname hook — 纯 C 实现
+// uname hook — 纯 C 实现
 // ============================================================
 static int hook_uname(struct utsname *name) {
     // v58b: NULL 保护
@@ -896,68 +791,13 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. v58: UIScreen hooks (分辨率伪装) ----
-        @try {
-            Class sc = objc_getClass("UIScreen");
-            if (sc && g_fakeScreenWidth > 0) {
-                // bounds
-                Method boundsM = class_getInstanceMethod(sc, @selector(bounds));
-                if (boundsM) {
-                    IMP origBounds = method_getImplementation(boundsM);
-                    CGFloat fw = g_fakeScreenWidth, fh = g_fakeScreenHeight;
-                    IMP newBounds = imp_implementationWithBlock(^CGRect(id s) {
-                        CGRect r = ((CGRect (*)(id, SEL))origBounds)(s, @selector(bounds));
-                        r.size.width = fw;
-                        r.size.height = fh;
-                        return r;
-                    });
-                    class_replaceMethod(sc, @selector(bounds), newBounds, method_getTypeEncoding(boundsM));
-                }
-                // nativeBounds
-                Method nbM = class_getInstanceMethod(sc, @selector(nativeBounds));
-                if (nbM) {
-                    IMP origNB = method_getImplementation(nbM);
-                    CGFloat fw = g_fakeScreenWidth * g_fakeScreenScale;
-                    CGFloat fh = g_fakeScreenHeight * g_fakeScreenScale;
-                    IMP newNB = imp_implementationWithBlock(^CGRect(id s) {
-                        CGRect r = ((CGRect (*)(id, SEL))origNB)(s, @selector(nativeBounds));
-                        r.size.width = fw;
-                        r.size.height = fh;
-                        return r;
-                    });
-                    class_replaceMethod(sc, @selector(nativeBounds), newNB, method_getTypeEncoding(nbM));
-                }
-                // scale
-                Method scaleM = class_getInstanceMethod(sc, @selector(scale));
-                if (scaleM) {
-                    IMP origScale = method_getImplementation(scaleM);
-                    CGFloat fs = g_fakeScreenScale;
-                    IMP newScale = imp_implementationWithBlock(^CGFloat(id s) {
-                        return fs;
-                    });
-                    class_replaceMethod(sc, @selector(scale), newScale, method_getTypeEncoding(scaleM));
-                }
-                // nativeScale
-                Method nsM = class_getInstanceMethod(sc, @selector(nativeScale));
-                if (nsM) {
-                    IMP origNS = method_getImplementation(nsM);
-                    CGFloat fs = g_fakeScreenScale;
-                    IMP newNS = imp_implementationWithBlock(^CGFloat(id s) {
-                        return fs;
-                    });
-                    class_replaceMethod(sc, @selector(nativeScale), newNS, method_getTypeEncoding(nsM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 10. v58b: fishhook — 只 hook 非系统镜像 ----
+        // ---- 9. v58c: fishhook — 只 hook 非系统镜像 ----
         // v58 问题：rebind_symbols hook 了系统框架，dyld 早期阶段 orig_* 为 NULL → 闪退
         // v58b 修复：遍历所有镜像，跳过 /usr/lib/ 和 /System/ 路径
         //   只 hook 主程序 + 百度动态框架
         @try {
             struct rebinding rebindings[] = {
                 {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
                 {"uname",        (void *)hook_uname,        (void **)&orig_uname},
             };
             uint32_t imgCount = _dyld_image_count();
@@ -972,7 +812,7 @@ static void initPrivacyHook(void) {
                 const struct mach_header *hdr = _dyld_get_image_header(i);
                 intptr_t slide = _dyld_get_image_vmaddr_slide(i);
                 if (hdr) {
-                    rebind_symbols_image((void *)hdr, slide, rebindings, 3);
+                    rebind_symbols_image((void *)hdr, slide, rebindings, 2);
                 }
             }
             g_hookInstalled = YES;
