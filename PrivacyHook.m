@@ -123,10 +123,12 @@ static NSString *genTcuid(void) {
     return s;
 }
 
+// v55: 前向声明，因为 genFakeCookie 中 BAIDUID_BFESS 需要复用 BAIDUID 的持久化值
+static NSString *getFakeID(NSString *name);
+
 static NSString *genFakeCookie(NSString *name) {
     NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
     NSString *hexCS = @"0123456789abcdef";
-    NSString *upperHexCS = @"0123456789ABCDEF";
 
     if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
         return genCUID();
