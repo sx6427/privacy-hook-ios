@@ -438,9 +438,10 @@ static void initPrivacyHook(void) {
 
         // 同步 RAM 大小到硬件型号
         NSString *persistedMachine = fakeMachine;
-        uint64_t fakeMem = getPersistent(@"Bd57.mem", ^{
-            return @(machineToMemSize(persistedMachine));
-        }).unsignedLongLongValue;
+        NSString *memStr = getPersistent(@"Bd57.mem", ^{
+            return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
+        });
+        uint64_t fakeMem = [memStr longLongValue];
 
         // 填充 C 字符串缓冲区
         strlcpy(g_fakeMachine, [fakeMachine UTF8String], sizeof(g_fakeMachine));
