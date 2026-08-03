@@ -1,19 +1,21 @@
 //
-// PrivacyHook.m — v58: 全镜像 fishhook + sysctl() + UIScreen 伪装
+// PrivacyHook.m — v59: rebind_symbols + Bd59 前缀强制清理
 //
-// v57 问题（用户反馈"一样的问题"）：
-//   v57 用 rebind_symbols_image 只 hook 主程序，但百度的 sysctlbyname 调用
-//   在动态框架 (BaiduBoxSys.dylib 等) 中，完全没被 hook 到！
-//   → 内核层仍返回真实 16.4/iPhone14,7 → 交叉比对矛盾 → 风控拦截
+// v58c 问题（用户反馈“没用，并且是登录状态，关闭再打开就不能付款了”）：
+//   1. 登录状态共享：v58c 用 Bd59 前缀，和 v58 相同，Bd59.reset 已存在 → 不清理
+//      → 残留被风控的 Cookie/Keychain → 直接是登录状态 → 第二次风控拦截
+//   2. fishhook 没生效：v58c 用遍历方式只 hook 当前已加载镜像
+//      但百度框架可能是启动后动态加载 (dlopen) 的 → 漏掉
+//      → sysctlbyname 仍返回真实值 → 交叉比对矛盾
 //
-// v58 修复：
-//   1. rebind_symbols (ALL images) 替代 rebind_symbols_image (main only)
-//      安全性：hook 函数纯 C，无 ObjC 调用，系统框架调用也安全
-//   2. 添加 sysctl() 旧 API hook (CTL_HW/HW_MACHINE 等)
-//      有些代码用 sysctl() 而非 sysctlbyname()
-//   3. 添加 UIScreen 分辨率 hook (bounds/nativeBounds/scale/nativeScale)
-//   4. 添加初始化守卫：g_fakeMachine 为空时 fallthrough 到原始函数
-//   5. 新前缀 Bd58.
+// v59 修复：
+//   1. 换前缀 Bd59. → 强制首次清理 Cookie/Keychain
+//   2. 用 rebind_symbols (ALL + future images) 替代遍历方式
+//      rebind_symbols 会注册 _dyld_register_func_for_add_image 回调
+//      → 未来动态加载的百度框架也会被 hook
+//   3. 只 hook sysctlbyname + uname (不 hook sysctl, 不 hook UIScreen)
+//   4. NULL 指针保护 (orig_* 为 NULL 时 fallthrough)
+//   5. v58 闪退原因已确认是 UIScreen + sysctl() hook，不是 rebind_symbols
 //
 
 #import <Foundation/Foundation.h>
@@ -60,7 +62,8 @@ static int (*orig_uname)(struct utsname *) = NULL;
 // ============================================================
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     // v58b: 守卫 — 如果还没初始化或 orig 为 NULL，直接 fallthrough
-    if (!g_fishhookReady || !name || !orig_sysctlbyname) goto fallback;
+    if (!g_fishhookReady || !name) goto fallback;
+    if (!orig_sysctlbyname) goto fallback;
 
     const char *fakeStr = NULL;
 
@@ -115,7 +118,9 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
     }
 
 fallback:
-    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    if (orig_sysctlbyname) return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    errno = ENOENT;
+    return -1;
 }
 
 // ============================================================
@@ -139,7 +144,7 @@ static int hook_uname(struct utsname *name) {
 }
 
 // ============================================================
-// Persistent fake IDs (Bd58. prefix = new identity)
+// Persistent fake IDs (Bd59. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -186,7 +191,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 统一 iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd58.sv", ^{
+    return getPersistent(@"Bd59.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -385,7 +390,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd58.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd59.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -430,7 +435,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd58"]) return NO;
+    if ([key hasPrefix:@"Bd59"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -450,11 +455,11 @@ static void initPrivacyHook(void) {
         // ---- 0. 预计算内核级伪装值 (C 字符串) ----
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd58.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd59.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd58.mem", ^{
+        NSString *memStr = getPersistent(@"Bd59.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -474,7 +479,7 @@ static void initPrivacyHook(void) {
 
         // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd58.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd59.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 NSArray *cookies = [storage cookies];
@@ -486,7 +491,7 @@ static void initPrivacyHook(void) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd58.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd59.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
@@ -498,14 +503,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd58.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd59.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd58.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd59.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -588,7 +593,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd58.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd59.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -791,30 +796,16 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. v58c: fishhook — 只 hook 非系统镜像 ----
-        // v58 问题：rebind_symbols hook 了系统框架，dyld 早期阶段 orig_* 为 NULL → 闪退
-        // v58b 修复：遍历所有镜像，跳过 /usr/lib/ 和 /System/ 路径
-        //   只 hook 主程序 + 百度动态框架
+        // ---- 9. v59: fishhook — rebind_symbols (ALL + future images) ----
+        // v58c 问题：遍历方式只 hook 当前镜像，漏掉动态加载的百度框架
+        // v58 闪退已确认是 UIScreen + sysctl() hook 导致，不是 rebind_symbols
+        // v59 安全：只 hook sysctlbyname + uname，hook 函数纯 C + NULL 保护
         @try {
             struct rebinding rebindings[] = {
                 {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
                 {"uname",        (void *)hook_uname,        (void **)&orig_uname},
             };
-            uint32_t imgCount = _dyld_image_count();
-            for (uint32_t i = 0; i < imgCount; i++) {
-                const char *path = _dyld_get_image_name(i);
-                if (!path) continue;
-                // 跳过系统框架路径
-                if (strncmp(path, "/usr/lib/", 9) == 0) continue;
-                if (strncmp(path, "/System/", 8) == 0) continue;
-                if (strncmp(path, "/Developer/", 11) == 0) continue;
-                // hook 这个镜像
-                const struct mach_header *hdr = _dyld_get_image_header(i);
-                intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-                if (hdr) {
-                    rebind_symbols_image((void *)hdr, slide, rebindings, 2);
-                }
-            }
+            rebind_symbols(rebindings, 2);
             g_hookInstalled = YES;
         } @catch (id e) {}
     }
