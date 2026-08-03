@@ -1,5 +1,5 @@
 #
-# Makefile — v57: fishhook sysctlbyname + uname hooks
+# Makefile — v58: rebind_symbols (ALL images) + sysctl() + UIScreen
 #
 
 DYLIB = PrivacyHook.dylib
