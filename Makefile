@@ -1,5 +1,5 @@
 #
-# Makefile — v52: v6 minimal (Cookie-only device ID replacement)
+# Makefile — v56: NSProcessInfo + WKWebView + User-Agent hooks
 #
 
 DYLIB = PrivacyHook.dylib
@@ -11,7 +11,7 @@ CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-ar
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
           -dynamiclib -framework Foundation -framework UIKit \
-          -framework AdSupport -framework Security \
+          -framework AdSupport -framework Security -framework WebKit \
           -install_name @executable_path/PrivacyHook.dylib \
           -Xlinker -no_fixup_chains
 
