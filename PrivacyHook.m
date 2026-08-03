@@ -1,18 +1,23 @@
 //
-// PrivacyHook.m — v53c: 去掉 URL/Body 替换（签名错误）+ 保留越狱检测
+// PrivacyHook.m — v54: 补上 BAIDUID + 去掉支付 hook，专注设备伪装
 //
-// v53b 问题：URL/Body 替换发生在签名计算之后
-//   百度支付流程：获取CUID → 计算sign → 拼URL/Body → 发请求
-//   我们替换了 URL/Body 中的 cuid → 但 sign 仍是基于原始 cuid 计算的 → 签名不匹配
+// v52b/v53c 遗漏：isDeviceCookie 没有 baiduid
+//   BAIDUID 是百度最基础设备标识 Cookie（14次出现在二进制中）
+//   Cookie 中 BAIDUID 没被替换 → 百度通过 BAIDUID 识别设备 → "还是检测到本机"
 //
-// v53c 方案：
-//   去掉 URL/Body/initWithURL 替换（签名错误）
-//   保留 Cookie 读写 hook（v6 核心，在源头替换，不影响签名）
-//   保留越狱检测 hook（dxmpay_isJailbreak → NO）
-//   保留 Cookie 头替换（只影响 Cookie 头，不涉及签名）
-//   保留 systemVersion/IDFV/IDFA/UIDevice hook
+// v54 修复：
+//   1. isDeviceCookie 加入 baiduid
+//   2. Cookie 头替换加入 BAIDUID
+//   3. 去掉越狱检测 hook（不搞支付 hook）
+//   4. 去掉 URL/Body 替换（签名错误）
+//   5. 新前缀 Bd54.
 //
-// 前缀：Bd53c.（全新身份）
+// 完整 Hook 清单：
+//   - Cookie 读写 hook（v6 完整方案，读+写都替换，包含 BAIDUID）
+//   - Cookie 头替换（包含 BAIDUID）
+//   - 首次清 Cookie + Keychain
+//   - IDFV / IDFA / UIDevice name/model/systemVersion hook
+//   - NSUserDefaults 设备键 hook
 //
 
 #import <Foundation/Foundation.h>
@@ -26,7 +31,7 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// Persistent fake IDs (Bd53c. prefix = new identity)
+// Persistent fake IDs (Bd54. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -67,11 +72,19 @@ static NSString *genCUID(void) {
     return s;
 }
 
+// BAIDUID 格式: 类似 "EFGRt5qV2F3x4RtN5uYH6rD7s8m-9n0o" 的字符串
+static NSString *genBAIDUID(void) {
+    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    return genRandStr(32, cs);
+}
+
 static NSString *genFakeCookie(NSString *name) {
     NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
     NSString *hexCS = @"0123456789abcdef";
     if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
         return genCUID();
+    if ([name isEqualToString:@"BAIDUID"])
+        return genBAIDUID();
     if ([name isEqualToString:@"DVIF"]) {
         NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)((uint64_t)arc4random() * arc4random() % 9000000000000000ULL + 1000000000000000ULL)];
         NSMutableData *d = [NSMutableData dataWithLength:300];
@@ -81,23 +94,22 @@ static NSString *genFakeCookie(NSString *name) {
     if ([name isEqualToString:@"tcuid"]) return [genRandStr(40, hexCS).uppercaseString stringByAppendingString:genRandStr(4, @"ABCDEFGHIJ")];
     if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
     if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
-    if ([name isEqualToString:@"bdudid"]) return genRandStr(40, hexCS);
-    if ([name isEqualToString:@"device_id"]) return genRandStr(40, hexCS);
     return genRandStr(32, cuidCS);
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd53c.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd54.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
-// Cookie device ID detection
+// Cookie device ID detection (v54: 加入 baiduid)
 // ============================================================
 static BOOL isDeviceCookie(NSString *cookieName) {
     if (!cookieName) return NO;
     NSString *lk = [cookieName lowercaseString];
     NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
-                       @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid"];
+                       @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid",
+                       @"baiduid"];  // v54: 加入 BAIDUID
     for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
@@ -131,7 +143,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd53c"]) return NO;
+    if ([key hasPrefix:@"Bd54"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -150,7 +162,7 @@ static void initPrivacyHook(void) {
 
         // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd53c.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd54.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 // 1a. Clear Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
@@ -164,7 +176,7 @@ static void initPrivacyHook(void) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd53c.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd54.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
@@ -176,14 +188,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd53c.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd54.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53c.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd54.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -200,7 +212,7 @@ static void initPrivacyHook(void) {
                 Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
                 if (svM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd53c.sv", ^{
+                        return getPersistent(@"Bd54.sv", ^{
                             NSArray *versions = @[@"15.5", @"16.0", @"16.5", @"16.7", @"17.0",
                                                   @"17.2", @"17.4", @"17.5", @"17.6", @"18.0"];
                             return versions[arc4random_uniform((uint32_t)versions.count)];
@@ -218,7 +230,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd53c.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd54.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -340,8 +352,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. NSMutableURLRequest Cookie header replacement ----
-        // 只替换 Cookie 头中的设备标识，不碰 URL 和 Body（避免签名错误）
+        // ---- 6. NSMutableURLRequest Cookie header replacement (v54: 加入 BAIDUID) ----
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
@@ -350,8 +361,10 @@ static void initPrivacyHook(void) {
                     IMP origSV = method_getImplementation(svM);
                     IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
                         if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
+                            // v54: 加入 BAIDUID
                             NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
-                                               @"DVIF", @"tcuid", @"__bid_n", @"fuid"];
+                                               @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                                               @"BAIDUID"];
                             NSString *modified = value;
                             for (NSString *name in names) {
                                 NSString *fake = getFakeID(name);
@@ -373,36 +386,6 @@ static void initPrivacyHook(void) {
                         ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
                     });
                     class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 7. 越狱检测 hook (v53b 保留) ----
-        // 逆向发现：dxmpay_isJailbreak (支付SDK) + isJailbroken/isJailbreak
-        // 百度检测路径: /Applications/Cydia.app /usr/sbin/sshd /bin/bash /private/var/lib/apt/
-        // 支付宝SDK检测: MobileSubstrate mobilesubstrate
-        @try {
-            // 7a. dxmpay_isJailbreak — NSString category 方法
-            SEL jbSel = NSSelectorFromString(@"dxmpay_isJailbreak");
-            Class nsStr = objc_getClass("NSString");
-            if (nsStr) {
-                Method jbM = class_getInstanceMethod(nsStr, jbSel);
-                if (jbM) {
-                    IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
-                    class_replaceMethod(nsStr, jbSel, imp, method_getTypeEncoding(jbM));
-                }
-            }
-            // 7b. 通用 isJailbroken / isJailbreak 方法（可能在多个类上）
-            for (NSString *clsName in @[@"UIDevice", @"NSBundle", @"NSString"]) {
-                Class cls = objc_getClass([clsName UTF8String]);
-                if (!cls) continue;
-                for (NSString *selName in @[@"isJailbroken", @"isJailbreak", @"isJailBroken"]) {
-                    SEL sel = NSSelectorFromString(selName);
-                    Method m = class_getInstanceMethod(cls, sel);
-                    if (m) {
-                        IMP imp = imp_implementationWithBlock(^BOOL(id s) { return NO; });
-                        class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
-                    }
                 }
             }
         } @catch (id e) {}
