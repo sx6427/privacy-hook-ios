@@ -21,7 +21,7 @@
 //   2. 所有伪装值在 init 阶段预计算为 C 字符串，hook 函数中只用 C 函数
 //   3. iOS 版本 → 硬件型号映射（保证一致性）
 //   4. Hook NSProcessInfo.physicalMemory (RAM 大小)
-//   5. 新前缀 Bd61.
+//   5. 新前缀 Bd60.
 //
 // 安全设计：
 //   - hook 函数中 ZERO ObjC 调用（避免 v48 闪退问题）
@@ -60,8 +60,10 @@ static uint64_t g_fakeMemSize = 0;       // 6442450944 (6GB)
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
 
+// v57c: fishhook rebindings (全局，供 dyld 回调使用)
 static struct rebinding g_rebindings[2];
 
+// v57c: dyld 回调 — 动态加载的非系统镜像也 hook
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
     if (!header) return;
     Dl_info info;
@@ -154,7 +156,7 @@ static int hook_uname(struct utsname *name) {
 }
 
 // ============================================================
-// Persistent fake IDs (Bd61. prefix = new identity)
+// Persistent fake IDs (Bd60. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -202,7 +204,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 统一 iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd61.sv", ^{
+    return getPersistent(@"Bd60.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -382,7 +384,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd61.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd60.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -427,7 +429,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd61"]) return NO;
+    if ([key hasPrefix:@"Bd60"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -448,12 +450,12 @@ static void initPrivacyHook(void) {
         // 必须在安装 fishhook 之前完成，hook 函数中不能调用 ObjC
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd61.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd60.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         // 同步 RAM 大小到硬件型号
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd61.mem", ^{
+        NSString *memStr = getPersistent(@"Bd60.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -465,24 +467,64 @@ static void initPrivacyHook(void) {
         strlcpy(g_fakeDarwinRel, [fakeDarwin UTF8String], sizeof(g_fakeDarwinRel));
         g_fakeMemSize = fakeMem;
 
-        // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
+        // ---- 1. v57c: 首次启动清理（直接删文件 + 清 NSUserDefaults）----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd61.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd60.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
-                NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-                NSArray *cookies = [storage cookies];
-                for (NSHTTPCookie *cookie in cookies) { [storage deleteCookie:cookie]; }
+                // 1a. 直接删除 Cookie 文件目录（不依赖 NSHTTPCookieStorage API，太早返回空）
+                NSString *cookieDir = [NSHomeDirectory()
+                    stringByAppendingPathComponent:@"Library/Cookies"];
+                [[NSFileManager defaultManager] removeItemAtPath:cookieDir error:nil];
 
+                // 1b. 清除 Cookie storage API（双保险）
+                NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+                for (NSHTTPCookie *cookie in [storage cookies]) {
+                    [storage deleteCookie:cookie];
+                }
+
+                // 1c. 清除 Keychain（所有类别）
                 NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
                                      (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
                 for (id cls in classes) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd61.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                // 1d. 清除 URLCache
+                [[NSURLCache sharedURLCache] removeAllCachedResponses];
+
+                // 1e. 清除 NSUserDefaults（保留 Bd60.* 设备身份，删百度存的设备指纹）
+                NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+                if (bid) {
+                    NSDictionary *appDefaults = [[NSUserDefaults standardUserDefaults] persistentDomainForName:bid];
+                    if (appDefaults) {
+                        for (NSString *key in appDefaults.allKeys) {
+                            if (![key hasPrefix:@"Bd60"]) {
+                                [[NSUserDefaults standardUserDefaults] removeObjectForKey:key];
+                            }
+                        }
+                        [[NSUserDefaults standardUserDefaults] synchronize];
+                    }
+                }
+
+                // 1f. 立即设标记
+                CFPreferencesSetAppValue(CFSTR("Bd60.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+
+                // 1g. 异步清理 WKWebsiteDataStore（不阻塞）
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try {
+                        WKWebsiteDataStore *store = [WKWebsiteDataStore defaultDataStore];
+                        NSSet *types = [WKWebsiteDataStore allWebsiteDataTypes];
+                        NSDate *past = [NSDate dateWithTimeIntervalSince1970:0];
+                        [store removeDataOfTypes:types modifiedSince:past completionHandler:^{}];
+                    } @catch (id e) {}
+                });
             } else { CFRelease(cleared); }
-        } @catch (id e) {}
+        } @catch (id e) {
+            // 出错也设标记，避免每次启动都清理
+            CFPreferencesSetAppValue(CFSTR("Bd60.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+        }
 
         // ---- 2. UIDevice hooks (name + IDFV + model + systemVersion) ----
         @try {
@@ -491,14 +533,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd61.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd60.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd61.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd60.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -587,7 +629,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd61.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd60.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -790,19 +832,28 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 9. v57c NEW: fishhook — sysctlbyname + uname ----
-        // 只 hook 主程序，不影响系统框架
-        // 所有伪装值已在 step 0 预计算为 C 字符串
+        // ---- 9. v57c: fishhook — sysctlbyname + uname (ALL non-system images) ----
+        // v57 只 hook 主程序 → 百度 SDK 框架内部的 sysctlbyname 绕过 hook
+        // v57c: hook 所有非系统镜像 + dyld 回调（动态加载的框架也覆盖）
         @try {
-            const struct mach_header *mainHeader = _dyld_get_image_header(0);
-            intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
-            if (mainHeader) {
-                struct rebinding rebindings[] = {
-                    {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
-                    {"uname",        (void *)hook_uname,        (void **)&orig_uname},
-                };
-                rebind_symbols_image((void *)mainHeader, mainSlide, rebindings, 2);
+            g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
+            g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
+
+            // 9a. hook 所有已加载的非系统镜像
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const struct mach_header *header = _dyld_get_image_header(i);
+                intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+                const char *path = _dyld_get_image_name(i);
+                if (!header || !path) continue;
+                if (strncmp(path, "/usr/lib/", 9) == 0) continue;
+                if (strncmp(path, "/System/", 8) == 0) continue;
+                if (strncmp(path, "/Developer/", 11) == 0) continue;
+                rebind_symbols_image((void *)header, slide, g_rebindings, 2);
             }
+
+            // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook
+            _dyld_register_func_for_add_image(hook_new_image);
         } @catch (id e) {}
     }
 }
