@@ -21,7 +21,7 @@
 //   2. 所有伪装值在 init 阶段预计算为 C 字符串，hook 函数中只用 C 函数
 //   3. iOS 版本 → 硬件型号映射（保证一致性）
 //   4. Hook NSProcessInfo.physicalMemory (RAM 大小)
-//   5. 新前缀 Bd60.
+//   5. 新前缀 Bd61.
 //
 // 安全设计：
 //   - hook 函数中 ZERO ObjC 调用（避免 v48 闪退问题）
@@ -154,7 +154,7 @@ static int hook_uname(struct utsname *name) {
 }
 
 // ============================================================
-// Persistent fake IDs (Bd60. prefix = new identity)
+// Persistent fake IDs (Bd61. prefix = new identity)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -202,7 +202,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 统一 iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd60.sv", ^{
+    return getPersistent(@"Bd61.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -382,7 +382,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd60.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd61.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -427,7 +427,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd60"]) return NO;
+    if ([key hasPrefix:@"Bd61"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -448,12 +448,12 @@ static void initPrivacyHook(void) {
         // 必须在安装 fishhook 之前完成，hook 函数中不能调用 ObjC
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd60.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd61.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         // 同步 RAM 大小到硬件型号
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd60.mem", ^{
+        NSString *memStr = getPersistent(@"Bd61.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -467,7 +467,7 @@ static void initPrivacyHook(void) {
 
         // ---- 1. Clear Cookie + Keychain (FIRST LAUNCH ONLY) ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd60.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd61.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 NSArray *cookies = [storage cookies];
@@ -479,7 +479,7 @@ static void initPrivacyHook(void) {
                     SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
 
-                CFPreferencesSetAppValue(CFSTR("Bd60.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd61.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {}
@@ -491,14 +491,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd60.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd61.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd60.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd61.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -587,7 +587,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd60.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd61.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
