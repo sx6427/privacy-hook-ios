@@ -62,7 +62,7 @@ static int (*orig_uname)(struct utsname *) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 // v57c: fishhook rebindings (全局，供 dyld 回调使用)
-static struct rebinding g_rebindings[3];
+static struct rebinding g_rebindings[2];
 
 // v57c: dyld 回调 — 动态加载的非系统镜像也 hook
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
@@ -73,7 +73,7 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/usr/lib/", 9) == 0) return;
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
-        rebind_symbols_image((void *)header, slide, g_rebindings, 3);
+        rebind_symbols_image((void *)header, slide, g_rebindings, 2);
     }
 }
 
@@ -1011,9 +1011,9 @@ static void initPrivacyHook(void) {
         // v57 只 hook 主程序 → 百度 SDK 框架内部的 sysctlbyname 绕过 hook
         // v57c: hook 所有非系统镜像 + dyld 回调（动态加载的框架也覆盖）
         @try {
+            // NOTE: sysctl old API hook removed — causes crash on some devices
             g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
             g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
-            g_rebindings[2] = (struct rebinding){"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl};
 
             // 9a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
@@ -1025,7 +1025,7 @@ static void initPrivacyHook(void) {
                 if (strncmp(path, "/usr/lib/", 9) == 0) continue;
                 if (strncmp(path, "/System/", 8) == 0) continue;
                 if (strncmp(path, "/Developer/", 11) == 0) continue;
-                rebind_symbols_image((void *)header, slide, g_rebindings, 3);
+                rebind_symbols_image((void *)header, slide, g_rebindings, 2);
             }
 
             // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook
