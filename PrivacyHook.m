@@ -62,7 +62,7 @@ static int (*orig_uname)(struct utsname *) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
 // v57c: fishhook rebindings (全局，供 dyld 回调使用)
-static struct rebinding g_rebindings[2];
+static struct rebinding g_rebindings[3];
 
 // v57c: dyld 回调 — 动态加载的非系统镜像也 hook
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
@@ -73,7 +73,7 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/usr/lib/", 9) == 0) return;
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
-        rebind_symbols_image((void *)header, slide, g_rebindings, 2);
+        rebind_symbols_image((void *)header, slide, g_rebindings, 3);
     }
 }
 
@@ -265,7 +265,9 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, vo
     }
 
 sysctl_fallback:
-    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    if (orig_sysctl) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    errno = ENOENT;
+    return -1;
 }
 
 // ============================================================
@@ -904,6 +906,222 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
+        // ---- 7b. v57d: URL 查询参数 + POST Body 拦截 ----
+        // 百度 SDK 在 URL query 和 POST body 中发送真实设备信息
+        @try {
+            Class reqClass = objc_getClass("NSMutableURLRequest");
+            if (reqClass) {
+                // 辅助：修改 URL 中的设备参数
+                NSURL *(*origSetURL)(id, SEL, NSURL *);
+                Method setURLM = class_getInstanceMethod(reqClass, @selector(setURL:));
+                if (setURLM) {
+                    IMP origSetURLImp = method_getImplementation(setURLM);
+                    IMP newSetURL = imp_implementationWithBlock(^void(id s, NSURL *url) {
+                        if (url) {
+                            @try {
+                                NSString *urlStr = url.absoluteString;
+                                if (urlStr && urlStr.length > 0) {
+                                    // 需要替换的设备参数列表
+                                    NSDictionary *paramMap = @{
+                                        @"cuid": getFakeID(@"cuid"),
+                                        @"CUID": getFakeID(@"cuid"),
+                                        @"BAIDUCUID": getFakeID(@"BAIDUCUID"),
+                                        @"BAIDUCUID_BFESS": getFakeID(@"BAIDUCUID_BFESS"),
+                                        @"MAWEBCUID": getFakeID(@"MAWEBCUID"),
+                                        @"idfa": [getPersistent(@"Bd67.ai", ^{ return genUUIDStr(); }) lowercaseString],
+                                        @"IDFA": getPersistent(@"Bd67.ai", ^{ return genUUIDStr(); }),
+                                        @"idfv": [getPersistent(@"Bd67.iv", ^{ return genUUIDStr(); }) lowercaseString],
+                                        @"IDFV": getPersistent(@"Bd67.iv", ^{ return genUUIDStr(); }),
+                                        @"bdudid": getFakeID(@"bdudid"),
+                                        @"bdid": getFakeID(@"bdid"),
+                                        @"tcuid": getFakeID(@"tcuid"),
+                                        @"DVIF": getFakeID(@"DVIF"),
+                                        @"__bid_n": getFakeID(@"__bid_n"),
+                                        @"fuid": getFakeID(@"fuid"),
+                                    };
+                                    NSString *modified = urlStr;
+                                    for (NSString *param in paramMap) {
+                                        NSString *fake = paramMap[param];
+                                        // 替换 URL query 中的参数值: param=xxx&  或  param=xxx#  或  param=xxx$
+                                        NSRegularExpression *regex = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"([?&]%@=)[^&#\\s]*", param]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fake]];
+                                    }
+                                    // 替换 model/硬件型号参数
+                                    NSString *fakeMachine = getPersistent(@"Bd67.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
+                                    NSArray *modelParams = @[@"model", "hwmodel", "hw_model", "devicemodel", "device_model", "hwmachine", "hw.machine"];
+                                    for (NSString *mp in modelParams) {
+                                        NSRegularExpression *regex = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"([?&]%@=)[^&#\\s]*", mp]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeMachine]];
+                                    }
+                                    // 替换 os version 参数
+                                    NSString *fakeSV = getFakeSystemVersion();
+                                    NSArray *osParams = @[@"osver", "os_ver", "osversion", "os_version", "systemversion", "system_version", "iosversion", "ios_version", "ver", "os"];
+                                    for (NSString *op in osParams) {
+                                        NSRegularExpression *regex = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"([?&]%@=)[^&#\\s]*", op]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeSV]];
+                                    }
+                                    if (![modified isEqualToString:urlStr]) {
+                                        url = [NSURL URLWithString:modified];
+                                    }
+                                }
+                            } @catch (id e) {}
+                        }
+                        ((void (*)(id, SEL, NSURL *))origSetURLImp)(s, @selector(setURL:), url);
+                    });
+                    class_replaceMethod(reqClass, @selector(setURL:), newSetURL, method_getTypeEncoding(setURLM));
+                }
+
+                // Hook setHTTPBody: — 修改 POST body 中的设备参数
+                Method setBodyM = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
+                if (setBodyM) {
+                    IMP origSetBody = method_getImplementation(setBodyM);
+                    IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
+                        if (body && body.length > 0 && body.length < 100000) {
+                            @try {
+                                NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                                if (bodyStr && bodyStr.length > 0) {
+                                    NSString *modified = bodyStr;
+                                    // 替换 form-urlencoded 格式的设备参数
+                                    NSDictionary *paramMap = @{
+                                        @"cuid": getFakeID(@"cuid"),
+                                        @"CUID": getFakeID(@"cuid"),
+                                        @"BAIDUCUID": getFakeID(@"BAIDUCUID"),
+                                        @"BAIDUCUID_BFESS": getFakeID(@"BAIDUCUID_BFESS"),
+                                        @"MAWEBCUID": getFakeID(@"MAWEBCUID"),
+                                        @"idfa": [getPersistent(@"Bd67.ai", ^{ return genUUIDStr(); }) lowercaseString],
+                                        @"IDFA": getPersistent(@"Bd67.ai", ^{ return genUUIDStr(); }),
+                                        @"idfv": [getPersistent(@"Bd67.iv", ^{ return genUUIDStr(); }) lowercaseString],
+                                        @"IDFV": getPersistent(@"Bd67.iv", ^{ return genUUIDStr(); }),
+                                        @"bdudid": getFakeID(@"bdudid"),
+                                        @"bdid": getFakeID(@"bdid"),
+                                        @"tcuid": getFakeID(@"tcuid"),
+                                        @"DVIF": getFakeID(@"DVIF"),
+                                        @"__bid_n": getFakeID(@"__bid_n"),
+                                        @"fuid": getFakeID(@"fuid"),
+                                    };
+                                    for (NSString *param in paramMap) {
+                                        NSString *fake = paramMap[param];
+                                        // form-urlencoded: param=value&  或  "param":"value"
+                                        NSRegularExpression *regex1 = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"([\"&?]%@=)[^&\"\\s]*", param]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex1 stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fake]];
+                                        // JSON 格式: "param":"value"
+                                        NSRegularExpression *regex2 = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"(\"%@\"\\s*:\\s*\")[^\"]*", param]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex2 stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fake]];
+                                    }
+                                    // 替换 model/硬件型号
+                                    NSString *fakeMachine = getPersistent(@"Bd67.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
+                                    NSArray *modelParams = @[@"model", "hwmodel", "hw_model", "devicemodel", "device_model", "hwmachine"];
+                                    for (NSString *mp in modelParams) {
+                                        NSRegularExpression *regex1 = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"([\"&?]%@=)[^&\"\\s]*", mp]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex1 stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeMachine]];
+                                        NSRegularExpression *regex2 = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"(\"%@\"\\s*:\\s*\")[^\"]*", mp]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex2 stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeMachine]];
+                                    }
+                                    // 替换 os version
+                                    NSString *fakeSV = getFakeSystemVersion();
+                                    NSArray *osParams = @[@"osver", "os_ver", "osversion", "os_version", "systemversion", "system_version", "iosversion", "ios_version"];
+                                    for (NSString *op in osParams) {
+                                        NSRegularExpression *regex1 = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"([\"&?]%@=)[^&\"\\s]*", op]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex1 stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeSV]];
+                                        NSRegularExpression *regex2 = [NSRegularExpression
+                                            regularExpressionWithPattern:
+                                                [NSString stringWithFormat:@"(\"%@\"\\s*:\\s*\")[^\"]*", op]
+                                            options:NSRegularExpressionCaseInsensitive error:nil];
+                                        modified = [regex2 stringByReplacingMatchesInString:modified options:0
+                                            range:NSMakeRange(0, modified.length)
+                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeSV]];
+                                    }
+                                    if (![modified isEqualToString:bodyStr]) {
+                                        NSData *newBody = [modified dataUsingEncoding:NSUTF8StringEncoding];
+                                        if (newBody) {
+                                            ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), newBody);
+                                            return;
+                                        }
+                                    }
+                                }
+                            } @catch (id e) {}
+                        }
+                        ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), body);
+                    });
+                    class_replaceMethod(reqClass, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(setBodyM));
+                }
+
+                // Hook addValue:forHTTPHeaderField: (另一个设置 header 的方式)
+                Method addValM = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
+                if (addValM) {
+                    IMP origAddVal = method_getImplementation(addValM);
+                    IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (value && field) {
+                            if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
+                                NSString *modified = modifyUserAgentVersion(value);
+                                ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modified, field);
+                                return;
+                            }
+                            if ([field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
+                                NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                                                   @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                                                   @"BAIDUID", @"BAIDUID_BFESS"];
+                                NSString *modified = value;
+                                for (NSString *name in names) {
+                                    NSString *fake = getFakeID(name);
+                                    NSRegularExpression *regex = [NSRegularExpression
+                                        regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
+                                        options:NSRegularExpressionCaseInsensitive error:nil];
+                                    modified = [regex stringByReplacingMatchesInString:modified options:0
+                                        range:NSMakeRange(0, modified.length)
+                                        withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
+                                }
+                                ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modified, field);
+                                return;
+                            }
+                        }
+                        ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), value, field);
+                    });
+                    class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
+                }
+            }
+        } @catch (id e) {}
+
         // ---- 8. WKWebView hooks (customUserAgent) ----
         @try {
             Class wkClass = objc_getClass("WKWebView");
@@ -1011,9 +1229,9 @@ static void initPrivacyHook(void) {
         // v57 只 hook 主程序 → 百度 SDK 框架内部的 sysctlbyname 绕过 hook
         // v57c: hook 所有非系统镜像 + dyld 回调（动态加载的框架也覆盖）
         @try {
-            // NOTE: sysctl old API hook removed — causes crash on some devices
             g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
             g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
+            g_rebindings[2] = (struct rebinding){"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl};
 
             // 9a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
@@ -1025,7 +1243,7 @@ static void initPrivacyHook(void) {
                 if (strncmp(path, "/usr/lib/", 9) == 0) continue;
                 if (strncmp(path, "/System/", 8) == 0) continue;
                 if (strncmp(path, "/Developer/", 11) == 0) continue;
-                rebind_symbols_image((void *)header, slide, g_rebindings, 2);
+                rebind_symbols_image((void *)header, slide, g_rebindings, 3);
             }
 
             // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook
