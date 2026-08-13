@@ -37,6 +37,8 @@ static uint64_t g_fakeMemSize = 0;
 
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static __thread int g_inSysctlHook = 0;
 
 // MGCopyAnswer — MobileGestalt 私有 API，百度通过它获取真实硬件信息
 static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef key, CFDictionaryRef options) = NULL;
@@ -54,7 +56,7 @@ static NSString *genUUIDStr(void);
 static NSString *genDeviceName(void);
 
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获局部变量）
-static struct rebinding g_rebindings[4];
+static struct rebinding g_rebindings[5];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
@@ -65,7 +67,7 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/usr/lib/", 9) == 0) return;
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
-        rebind_symbols_image((void *)header, slide, g_rebindings, 4);
+        rebind_symbols_image((void *)header, slide, g_rebindings, 5);
     }
 }
 
@@ -229,6 +231,72 @@ static int hook_uname(struct utsname *name) {
     }
     return ret;
 }
+
+// ============================================================
+// sysctl() old API hook — 纯 C 实现
+// CTL_HW=6 HW_MACHINE=1 HW_MODEL=2 HW_MEMSIZE=24
+// CTL_KERN=1 KERN_OSVERSION=2 KERN_OSRELEASE=3
+// ============================================================
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (!orig_sysctl) return -1;
+    if (g_inSysctlHook) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    if (!name || namelen < 2) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+
+    int n0 = name[0];
+    int n1 = name[1];
+    const char *fakeStr = NULL;
+
+    // CTL_HW (6)
+    if (n0 == 6) {
+        if (n1 == 1 || n1 == 2) {  // HW_MACHINE, HW_MODEL
+            fakeStr = g_fakeMachine;
+        } else if (n1 == 24) {  // HW_MEMSIZE
+            if (oldlenp) {
+                if (oldp && *oldlenp >= sizeof(uint64_t)) {
+                    *(uint64_t *)oldp = g_fakeMemSize;
+                    *oldlenp = sizeof(uint64_t);
+                    return 0;
+                }
+                if (!oldp) { *oldlenp = sizeof(uint64_t); return 0; }
+            }
+            return 0;
+        }
+    }
+
+    // CTL_KERN (1)
+    if (n0 == 1) {
+        if (n1 == 2) {  // KERN_OSVERSION
+            fakeStr = g_fakeBuild;
+        } else if (n1 == 3) {  // KERN_OSRELEASE
+            fakeStr = g_fakeDarwinRel;
+        }
+    }
+
+    if (fakeStr) {
+        size_t fakeLen = strlen(fakeStr) + 1;
+        if (oldlenp) {
+            if (oldp) {
+                if (*oldlenp >= fakeLen) {
+                    memcpy(oldp, fakeStr, fakeLen);
+                    *oldlenp = fakeLen;
+                    return 0;
+                }
+                *oldlenp = fakeLen;
+                return ENOMEM;
+            }
+            *oldlenp = fakeLen;
+            return 0;
+        }
+        return 0;
+    }
+
+    // All other sysctl calls — pass through immediately
+    g_inSysctlHook = 1;
+    int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    g_inSysctlHook = 0;
+    return ret;
+}
+
 
 // ============================================================
 // Persistent fake IDs (Bd71. prefix)
@@ -811,203 +879,6 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7b. URL 查询参数 + POST Body 拦截 ----
-        // 百度 SDK 在 URL query 和 POST body 中发送真实设备信息
-        @try {
-            Class reqClass2 = objc_getClass("NSMutableURLRequest");
-            if (reqClass2) {
-                // Hook setURL: — 修改 URL 中的设备参数
-                Method setURLM = class_getInstanceMethod(reqClass2, @selector(setURL:));
-                if (setURLM) {
-                    IMP origSetURL = method_getImplementation(setURLM);
-                    IMP newSetURL = imp_implementationWithBlock(^void(id s, NSURL *url) {
-                        if (url) {
-                            @try {
-                                NSString *urlStr = url.absoluteString;
-                                if (urlStr && urlStr.length > 0) {
-                                    NSDictionary *paramMap = @{
-                                        @"cuid": getFakeID(@"cuid"),
-                                        @"BAIDUCUID": getFakeID(@"BAIDUCUID"),
-                                        @"BAIDUCUID_BFESS": getFakeID(@"BAIDUCUID_BFESS"),
-                                        @"MAWEBCUID": getFakeID(@"MAWEBCUID"),
-                                        @"idfa": [getPersistent(@"Bd71.ai", ^{ return genUUIDStr(); }) lowercaseString],
-                                        @"idfv": [getPersistent(@"Bd71.iv", ^{ return genUUIDStr(); }) lowercaseString],
-                                        @"bdudid": getFakeID(@"bdudid"),
-                                        @"bdid": getFakeID(@"bdid"),
-                                        @"tcuid": getFakeID(@"tcuid"),
-                                        @"DVIF": getFakeID(@"DVIF"),
-                                        @"__bid_n": getFakeID(@"__bid_n"),
-                                        @"fuid": getFakeID(@"fuid"),
-                                    };
-                                    NSString *modified = urlStr;
-                                    for (NSString *param in paramMap) {
-                                        NSString *fake = paramMap[param];
-                                        NSRegularExpression *regex = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"([?&]%@=)[^&#\\s]*", param]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [regex stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fake]];
-                                    }
-                                    NSString *fakeMachine = getPersistent(@"Bd71.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
-                                    for (NSString *mp in @[@"model", @"hwmodel", @"hw_model", @"devicemodel", @"device_model", @"hwmachine"]) {
-                                        NSRegularExpression *regex = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"([?&]%@=)[^&#\\s]*", mp]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [regex stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeMachine]];
-                                    }
-                                    NSString *fakeSV = getFakeSystemVersion();
-                                    for (NSString *op in @[@"osver", @"os_ver", @"osversion", @"os_version", @"systemversion", @"system_version", @"iosversion", @"ios_version"]) {
-                                        NSRegularExpression *regex = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"([?&]%@=)[^&#\\s]*", op]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [regex stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeSV]];
-                                    }
-                                    if (![modified isEqualToString:urlStr]) {
-                                        url = [NSURL URLWithString:modified];
-                                    }
-                                }
-                            } @catch (id e) {}
-                        }
-                        ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), url);
-                    });
-                    class_replaceMethod(reqClass2, @selector(setURL:), newSetURL, method_getTypeEncoding(setURLM));
-                }
-
-                // Hook setHTTPBody: — 修改 POST body 中的设备参数
-                Method setBodyM = class_getInstanceMethod(reqClass2, @selector(setHTTPBody:));
-                if (setBodyM) {
-                    IMP origSetBody = method_getImplementation(setBodyM);
-                    IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
-                        if (body && body.length > 0 && body.length < 100000) {
-                            @try {
-                                NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-                                if (bodyStr && bodyStr.length > 0) {
-                                    NSString *modified = bodyStr;
-                                    NSDictionary *paramMap = @{
-                                        @"cuid": getFakeID(@"cuid"),
-                                        @"BAIDUCUID": getFakeID(@"BAIDUCUID"),
-                                        @"BAIDUCUID_BFESS": getFakeID(@"BAIDUCUID_BFESS"),
-                                        @"MAWEBCUID": getFakeID(@"MAWEBCUID"),
-                                        @"idfa": [getPersistent(@"Bd71.ai", ^{ return genUUIDStr(); }) lowercaseString],
-                                        @"idfv": [getPersistent(@"Bd71.iv", ^{ return genUUIDStr(); }) lowercaseString],
-                                        @"bdudid": getFakeID(@"bdudid"),
-                                        @"bdid": getFakeID(@"bdid"),
-                                        @"tcuid": getFakeID(@"tcuid"),
-                                        @"DVIF": getFakeID(@"DVIF"),
-                                        @"__bid_n": getFakeID(@"__bid_n"),
-                                        @"fuid": getFakeID(@"fuid"),
-                                    };
-                                    for (NSString *param in paramMap) {
-                                        NSString *fake = paramMap[param];
-                                        // form-urlencoded
-                                        NSRegularExpression *r1 = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"([\"&?]%@=)[^&\"\\s]*", param]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [r1 stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fake]];
-                                        // JSON
-                                        NSRegularExpression *r2 = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"(\"%@\"\\s*:\\s*\")[^\"]*", param]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [r2 stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fake]];
-                                    }
-                                    // model
-                                    NSString *fakeMachine = getPersistent(@"Bd71.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
-                                    for (NSString *mp in @[@"model", @"hwmodel", @"hw_model", @"devicemodel", @"device_model", @"hwmachine"]) {
-                                        NSRegularExpression *r1 = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"([\"&?]%@=)[^&\"\\s]*", mp]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [r1 stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeMachine]];
-                                        NSRegularExpression *r2 = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"(\"%@\"\\s*:\\s*\")[^\"]*", mp]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [r2 stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeMachine]];
-                                    }
-                                    // os version
-                                    NSString *fakeSV = getFakeSystemVersion();
-                                    for (NSString *op in @[@"osver", @"os_ver", @"osversion", @"os_version", @"systemversion", @"system_version", @"iosversion", @"ios_version"]) {
-                                        NSRegularExpression *r1 = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"([\"&?]%@=)[^&\"\\s]*", op]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [r1 stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeSV]];
-                                        NSRegularExpression *r2 = [NSRegularExpression
-                                            regularExpressionWithPattern:
-                                                [NSString stringWithFormat:@"(\"%@\"\\s*:\\s*\")[^\"]*", op]
-                                            options:NSRegularExpressionCaseInsensitive error:nil];
-                                        modified = [r2 stringByReplacingMatchesInString:modified options:0
-                                            range:NSMakeRange(0, modified.length)
-                                            withTemplate:[NSString stringWithFormat:@"$1%@", fakeSV]];
-                                    }
-                                    if (![modified isEqualToString:bodyStr]) {
-                                        NSData *newBody = [modified dataUsingEncoding:NSUTF8StringEncoding];
-                                        if (newBody) {
-                                            ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), newBody);
-                                            return;
-                                        }
-                                    }
-                                }
-                            } @catch (id e) {}
-                        }
-                        ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), body);
-                    });
-                    class_replaceMethod(reqClass2, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(setBodyM));
-                }
-
-                // Hook addValue:forHTTPHeaderField:
-                Method addValM = class_getInstanceMethod(reqClass2, @selector(addValue:forHTTPHeaderField:));
-                if (addValM) {
-                    IMP origAddVal = method_getImplementation(addValM);
-                    IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
-                        if (value && field) {
-                            if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
-                                ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modifyUserAgentVersion(value), field);
-                                return;
-                            }
-                            if ([field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
-                                NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID", @"DVIF", @"tcuid", @"__bid_n", @"fuid", @"BAIDUID", @"BAIDUID_BFESS"];
-                                NSString *modified = value;
-                                for (NSString *name in names) {
-                                    NSString *fake = getFakeID(name);
-                                    NSRegularExpression *regex = [NSRegularExpression
-                                        regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
-                                        options:NSRegularExpressionCaseInsensitive error:nil];
-                                    modified = [regex stringByReplacingMatchesInString:modified options:0
-                                        range:NSMakeRange(0, modified.length)
-                                        withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
-                                }
-                                ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modified, field);
-                                return;
-                            }
-                        }
-                        ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), value, field);
-                    });
-                    class_replaceMethod(reqClass2, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
-                }
-            }
-        } @catch (id e) {}
-
         // ---- 8. WKWebView hooks (customUserAgent) ----
         @try {
             Class wkClass = objc_getClass("WKWebView");
@@ -1058,6 +929,7 @@ static void initPrivacyHook(void) {
             g_rebindings[1] = (struct rebinding){"uname",         (void *)hook_uname,         (void **)&orig_uname};
             g_rebindings[2] = (struct rebinding){"MGCopyAnswer",  (void *)hook_MGCopyAnswer,  (void **)&orig_MGCopyAnswer};
             g_rebindings[3] = (struct rebinding){"IORegistryEntryCreateCFProperty", (void *)hook_IORegistryEntryCreateCFProperty, (void **)&orig_IORegistryEntryCreateCFProperty};
+            g_rebindings[4] = (struct rebinding){"sysctl", (void *)hook_sysctl, (void **)&orig_sysctl};
 
             // 9a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
@@ -1069,7 +941,7 @@ static void initPrivacyHook(void) {
                 if (strncmp(path, "/usr/lib/", 9) == 0) continue;
                 if (strncmp(path, "/System/", 8) == 0) continue;
                 if (strncmp(path, "/Developer/", 11) == 0) continue;
-                rebind_symbols_image((void *)header, slide, g_rebindings, 4);
+                rebind_symbols_image((void *)header, slide, g_rebindings, 5);
             }
 
             // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook（用 C 函数，不用 block）
