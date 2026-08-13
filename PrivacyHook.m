@@ -42,6 +42,13 @@ static int (*orig_uname)(struct utsname *) = NULL;
 static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef key, CFDictionaryRef options) = NULL;
 static __thread BOOL g_inMGHook = NO;
 
+// 前向声明（MGCopyAnswer hook 中使用，但函数定义在后面）
+static NSString *getPersistent(NSString *key, NSString *(^gen)(void));
+static NSString *getFakeSystemVersion(void);
+static NSString *versionToMachine(NSString *version);
+static NSString *genUUIDStr(void);
+static NSString *genDeviceName(void);
+
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获局部变量）
 static struct rebinding g_rebindings[3];
 
