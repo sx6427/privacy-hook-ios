@@ -38,8 +38,12 @@ static uint64_t g_fakeMemSize = 0;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
 
+// MGCopyAnswer — MobileGestalt 私有 API，百度通过它获取真实硬件信息
+static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef key, CFDictionaryRef options) = NULL;
+static __thread BOOL g_inMGHook = NO;
+
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获局部变量）
-static struct rebinding g_rebindings[2];
+static struct rebinding g_rebindings[3];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
@@ -50,8 +54,62 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/usr/lib/", 9) == 0) return;
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
-        rebind_symbols_image((void *)header, slide, g_rebindings, 2);
+        rebind_symbols_image((void *)header, slide, g_rebindings, 3);
     }
+}
+
+// ============================================================
+// MGCopyAnswer hook — MobileGestalt 私有 API
+// 百度通过 MGCopyAnswer 获取真实硬件型号/序列号/UDID，完全绕过 sysctlbyname
+// ============================================================
+static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef options) {
+    if (!key || g_inMGHook) return orig_MGCopyAnswer(key, options);
+    g_inMGHook = YES;
+    @try {
+        // hw-machine / HardwarePlatform
+        if (CFStringCompare(key, CFSTR("6vURR2UAg"), 0) == 0) {
+            NSString *m = getPersistent(@"Bd74.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)m;
+        }
+        // SerialNumber
+        if (CFStringCompare(key, CFSTR("h9jDsbgj7xIugkIB2RVp1cKoVBOyBj8r"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR(""));
+        }
+        // UniqueDeviceID (UDID)
+        if (CFStringCompare(key, CFSTR("J1WLa1FfC0Dowb1A"), 0) == 0) {
+            NSString *u = getPersistent(@"Bd74.udid", ^{ return genUUIDStr(); });
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)u;
+        }
+        // ProductVersion
+        if (CFStringCompare(key, CFSTR("zX0ileCcSq0X3IPgUgR8hA"), 0) == 0) {
+            NSString *v = getFakeSystemVersion();
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)v;
+        }
+        // DeviceName
+        if (CFStringCompare(key, CFSTR("wfiZJ9aJbL5A3hMOznwq7A"), 0) == 0) {
+            NSString *n = getPersistent(@"Bd74.dn", ^{ return genDeviceName(); });
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)n;
+        }
+        // ModelNumber (e.g., A2884)
+        if (CFStringCompare(key, CFSTR("0CfCGGUZY"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR(""));
+        }
+        // RegionCode
+        if (CFStringCompare(key, CFSTR("WVkJNUjyaF4p2rfOaZ5kdg"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR("CH/A"));
+        }
+        g_inMGHook = NO;
+    } @catch (id e) {
+        g_inMGHook = NO;
+    }
+    return orig_MGCopyAnswer(key, options);
 }
 
 // ============================================================
@@ -142,7 +200,7 @@ static int hook_uname(struct utsname *name) {
 }
 
 // ============================================================
-// Persistent fake IDs (Bd83. prefix)
+// Persistent fake IDs (Bd74. prefix)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -189,7 +247,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"Bd83.sv", ^{
+    return getPersistent(@"Bd74.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -357,7 +415,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"Bd83.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"Bd74.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -402,7 +460,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"Bd83"]) return NO;
+    if ([key hasPrefix:@"Bd74"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -422,11 +480,11 @@ static void initPrivacyHook(void) {
         // ---- 0. 预计算内核级伪装值 (C 字符串) ----
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"Bd83.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"Bd74.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"Bd83.mem", ^{
+        NSString *memStr = getPersistent(@"Bd74.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -439,7 +497,7 @@ static void initPrivacyHook(void) {
 
         // ---- 1. v57 简单清理：Cookie storage + Keychain ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd83.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("Bd74.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 // 1a. 清除 Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
@@ -455,11 +513,11 @@ static void initPrivacyHook(void) {
                 }
 
                 // 1c. 设标记
-                CFPreferencesSetAppValue(CFSTR("Bd83.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("Bd74.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {
-            CFPreferencesSetAppValue(CFSTR("Bd83.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+            CFPreferencesSetAppValue(CFSTR("Bd74.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         }
 
@@ -470,14 +528,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"Bd83.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"Bd74.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd83.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd74.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -560,7 +618,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd83.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"Bd74.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
@@ -768,8 +826,9 @@ static void initPrivacyHook(void) {
         // v57c: hook 所有非系统镜像 + dyld 回调（动态加载的框架也覆盖）
         // 注意：v57c 没有闪退，闪退是 v57d 新加的 sysctl旧API/URL body/SystemVersion.plist 导致的
         @try {
-            g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
-            g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
+            g_rebindings[0] = (struct rebinding){"sysctlbyname",  (void *)hook_sysctlbyname,  (void **)&orig_sysctlbyname};
+            g_rebindings[1] = (struct rebinding){"uname",         (void *)hook_uname,         (void **)&orig_uname};
+            g_rebindings[2] = (struct rebinding){"MGCopyAnswer",  (void *)hook_MGCopyAnswer,  (void **)&orig_MGCopyAnswer};
 
             // 9a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
@@ -781,7 +840,7 @@ static void initPrivacyHook(void) {
                 if (strncmp(path, "/usr/lib/", 9) == 0) continue;
                 if (strncmp(path, "/System/", 8) == 0) continue;
                 if (strncmp(path, "/Developer/", 11) == 0) continue;
-                rebind_symbols_image((void *)header, slide, g_rebindings, 2);
+                rebind_symbols_image((void *)header, slide, g_rebindings, 3);
             }
 
             // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook（用 C 函数，不用 block）
