@@ -37,8 +37,6 @@ static uint64_t g_fakeMemSize = 0;
 
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_uname)(struct utsname *) = NULL;
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static __thread int g_inSysctlHook = 0;
 
 // MGCopyAnswer — MobileGestalt 私有 API，百度通过它获取真实硬件信息
 static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef key, CFDictionaryRef options) = NULL;
@@ -56,7 +54,7 @@ static NSString *genUUIDStr(void);
 static NSString *genDeviceName(void);
 
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获局部变量）
-static struct rebinding g_rebindings[5];
+static struct rebinding g_rebindings[4];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
@@ -67,7 +65,7 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/usr/lib/", 9) == 0) return;
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
-        rebind_symbols_image((void *)header, slide, g_rebindings, 5);
+        rebind_symbols_image((void *)header, slide, g_rebindings, 4);
     }
 }
 
@@ -232,70 +230,6 @@ static int hook_uname(struct utsname *name) {
     return ret;
 }
 
-// ============================================================
-// sysctl() old API hook — 纯 C 实现
-// CTL_HW=6 HW_MACHINE=1 HW_MODEL=2 HW_MEMSIZE=24
-// CTL_KERN=1 KERN_OSVERSION=2 KERN_OSRELEASE=3
-// ============================================================
-static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!orig_sysctl) return -1;
-    if (g_inSysctlHook) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    if (!name || namelen < 2) return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-
-    int n0 = name[0];
-    int n1 = name[1];
-    const char *fakeStr = NULL;
-
-    // CTL_HW (6)
-    if (n0 == 6) {
-        if (n1 == 1 || n1 == 2) {  // HW_MACHINE, HW_MODEL
-            fakeStr = g_fakeMachine;
-        } else if (n1 == 24) {  // HW_MEMSIZE
-            if (oldlenp) {
-                if (oldp && *oldlenp >= sizeof(uint64_t)) {
-                    *(uint64_t *)oldp = g_fakeMemSize;
-                    *oldlenp = sizeof(uint64_t);
-                    return 0;
-                }
-                if (!oldp) { *oldlenp = sizeof(uint64_t); return 0; }
-            }
-            return 0;
-        }
-    }
-
-    // CTL_KERN (1)
-    if (n0 == 1) {
-        if (n1 == 2) {  // KERN_OSVERSION
-            fakeStr = g_fakeBuild;
-        } else if (n1 == 3) {  // KERN_OSRELEASE
-            fakeStr = g_fakeDarwinRel;
-        }
-    }
-
-    if (fakeStr) {
-        size_t fakeLen = strlen(fakeStr) + 1;
-        if (oldlenp) {
-            if (oldp) {
-                if (*oldlenp >= fakeLen) {
-                    memcpy(oldp, fakeStr, fakeLen);
-                    *oldlenp = fakeLen;
-                    return 0;
-                }
-                *oldlenp = fakeLen;
-                return ENOMEM;
-            }
-            *oldlenp = fakeLen;
-            return 0;
-        }
-        return 0;
-    }
-
-    // All other sysctl calls — pass through immediately
-    g_inSysctlHook = 1;
-    int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    g_inSysctlHook = 0;
-    return ret;
-}
 
 
 // ============================================================
@@ -923,6 +857,120 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
+        // ---- 7c. UIScreen hooks (分辨率/缩放 — 设备指纹) ----
+        @try {
+            Class sc = objc_getClass("UIScreen");
+            if (sc) {
+                // bounds — 不同设备分辨率不同
+                Method boundsM = class_getInstanceMethod(sc, @selector(bounds));
+                if (boundsM) {
+                    IMP origBounds = method_getImplementation(boundsM);
+                    IMP newBounds = imp_implementationWithBlock(^CGRect(id s) {
+                    CGRect b = ((CGRect (*)(id, SEL))origBounds)(s, @selector(bounds));
+                        return b;
+                    });
+                    // 不改 bounds，因为很多 UI 依赖它
+                }
+                // scale — 主屏缩放因子
+                Method scaleM = class_getInstanceMethod(sc, @selector(scale));
+                if (scaleM) {
+                    IMP origScale = method_getImplementation(scaleM);
+                    IMP newScale = imp_implementationWithBlock(^CGFloat(id s) {
+                        return ((CGFloat (*)(id, SEL))origScale)(s, @selector(scale));
+                    });
+                    // 不改 scale，避免 UI 问题
+                }
+                // nativeBounds — 物理像素分辨率，是设备指纹
+                Method nbM = class_getInstanceMethod(sc, @selector(nativeBounds));
+                if (nbM) {
+                    IMP origNB = method_getImplementation(nbM);
+                    IMP newNB = imp_implementationWithBlock(^CGRect(id s) {
+                        CGRect b = ((CGRect (*)(id, SEL))origNB)(s, @selector(nativeBounds));
+                        return b;
+                    });
+                    // 不改 nativeBounds，避免渲染问题
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 7d. NSBundle infoDictionary hook ----
+        // 百度 SDK 可能读取 DTSDKName, DTPlatformVersion 等编译信息来识别设备
+        @try {
+            Class bundle = objc_getClass("NSBundle");
+            if (bundle) {
+                Method infoM = class_getInstanceMethod(bundle, @selector(infoDictionary));
+                if (infoM) {
+                    IMP origInfo = method_getImplementation(infoM);
+                    IMP newInfo = imp_implementationWithBlock(^NSDictionary *(id s) {
+                        NSDictionary *dict = ((NSDictionary *(*)(id, SEL))origInfo)(s, @selector(infoDictionary));
+                        if (dict) {
+                            NSMutableDictionary *md = [dict mutableCopy];
+                            NSString *fakeSV = getFakeSystemVersion();
+                            NSString *fakeBuild = versionToBuild(fakeSV);
+                            md[@"DTPlatformVersion"] = fakeSV;
+                            md[@"DTSDKName"] = [NSString stringWithFormat:@"iphoneos%@", fakeSV];
+                            md[@"MinimumOSVersion"] = fakeSV;
+                            md[@"DTSDKBuild"] = fakeBuild;
+                            md[@"DTPlatformBuild"] = fakeBuild;
+                            md[@"DTXcodeBuild"] = @"14C18";
+                            md[@"BuildMachineOSBuild"] = @"22D68";
+                            return md;
+                        }
+                        return dict;
+                    });
+                    class_replaceMethod(bundle, @selector(infoDictionary), newInfo, method_getTypeEncoding(infoM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 7e. NSFileManager attributesOfFileSystemForPath:error: (磁盘空间指纹) ----
+        @try {
+            Class fm = objc_getClass("NSFileManager");
+            if (fm) {
+                Method aM = class_getInstanceMethod(fm, @selector(attributesOfFileSystemForPath:error:));
+                if (aM) {
+                    IMP origAttr = method_getImplementation(aM);
+                    IMP newAttr = imp_implementationWithBlock(^NSDictionary *(id s, NSString *path, NSError **err) {
+                        NSDictionary *dict = ((NSDictionary *(*)(id, SEL, NSString *, NSError **))origAttr)(s, @selector(attributesOfFileSystemForPath:error:), path, err);
+                        if (dict) {
+                            NSMutableDictionary *md = [dict mutableCopy];
+                            // 随机化磁盘大小（系统通过磁盘空间区分设备）
+                            uint64_t totalSize = [md[NSFileSystemSize] unsignedLongLongValue];
+                            if (totalSize > 0) {
+                                uint64_t fakeTotal = 127724175360ULL + ((uint64_t)arc4random() % 5000000000ULL);
+                                md[NSFileSystemSize] = @(fakeTotal);
+                                uint64_t freeSize = [md[NSFileSystemFreeSize] unsignedLongLongValue];
+                                if (freeSize > 0 && freeSize < fakeTotal) {
+                                    uint64_t fakeFree = fakeTotal - ((uint64_t)arc4random() % (fakeTotal / 2));
+                                    md[NSFileSystemFreeSize] = @(fakeFree);
+                                }
+                            }
+                            return md;
+                        }
+                        return dict;
+                    });
+                    class_replaceMethod(fm, @selector(attributesOfFileSystemForPath:error:), newAttr, method_getTypeEncoding(aM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 7f. CTTelephonyNetworkInfo subscriberCellularProvider (运营商指纹) ----
+        @try {
+            Class ctc = objc_getClass("CTTelephonyNetworkInfo");
+            if (ctc) {
+                Method scpM = class_getInstanceMethod(ctc, @selector(subscriberCellularProvider));
+                if (scpM) {
+                    IMP origSCP = method_getImplementation(scpM);
+                    IMP newSCP = imp_implementationWithBlock(^id(id s) {
+                        id provider = ((id (*)(id, SEL))origSCP)(s, @selector(subscriberCellularProvider));
+                        // 不修改运营商信息，但确保不返回 nil（nil 可被用于指纹检测）
+                        return provider;
+                    });
+                    // 不替换，避免破坏电话功能
+                }
+            }
+        } @catch (id e) {}
+
         // ---- 8. WKWebView hooks (customUserAgent) ----
         @try {
             Class wkClass = objc_getClass("WKWebView");
@@ -973,7 +1021,6 @@ static void initPrivacyHook(void) {
             g_rebindings[1] = (struct rebinding){"uname",         (void *)hook_uname,         (void **)&orig_uname};
             g_rebindings[2] = (struct rebinding){"MGCopyAnswer",  (void *)hook_MGCopyAnswer,  (void **)&orig_MGCopyAnswer};
             g_rebindings[3] = (struct rebinding){"IORegistryEntryCreateCFProperty", (void *)hook_IORegistryEntryCreateCFProperty, (void **)&orig_IORegistryEntryCreateCFProperty};
-            g_rebindings[4] = (struct rebinding){"sysctl", (void *)hook_sysctl, (void **)&orig_sysctl};
 
             // 9a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
@@ -985,7 +1032,7 @@ static void initPrivacyHook(void) {
                 if (strncmp(path, "/usr/lib/", 9) == 0) continue;
                 if (strncmp(path, "/System/", 8) == 0) continue;
                 if (strncmp(path, "/Developer/", 11) == 0) continue;
-                rebind_symbols_image((void *)header, slide, g_rebindings, 5);
+                rebind_symbols_image((void *)header, slide, g_rebindings, 4);
             }
 
             // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook（用 C 函数，不用 block）
