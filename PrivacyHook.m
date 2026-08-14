@@ -79,7 +79,7 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
     @try {
         // hw-machine / HardwarePlatform
         if (CFStringCompare(key, CFSTR("6vURR2UAg"), 0) == 0) {
-            NSString *m = getPersistent(@"BdC8.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
+            NSString *m = getPersistent(@"BdC9.hw", ^{ return versionToMachine(getFakeSystemVersion()); });
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)m;
         }
@@ -90,7 +90,7 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
         }
         // UniqueDeviceID (UDID)
         if (CFStringCompare(key, CFSTR("J1WLa1FfC0Dowb1A"), 0) == 0) {
-            NSString *u = getPersistent(@"BdC8.udid", ^{ return genUUIDStr(); });
+            NSString *u = getPersistent(@"BdC9.udid", ^{ return genUUIDStr(); });
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)u;
         }
@@ -102,7 +102,7 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
         }
         // DeviceName
         if (CFStringCompare(key, CFSTR("wfiZJ9aJbL5A3hMOznwq7A"), 0) == 0) {
-            NSString *n = getPersistent(@"BdC8.dn", ^{ return genDeviceName(); });
+            NSString *n = getPersistent(@"BdC9.dn", ^{ return genDeviceName(); });
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)n;
         }
@@ -131,7 +131,7 @@ static CFTypeRef hook_IORegistryEntryCreateCFProperty(io_registry_entry_t entry,
     if (key) {
         // IOPlatformUUID — 硬件 UUID，与 sysctl hw.uuid 不同
         if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == 0) {
-            NSString *u = getPersistent(@"BdC8.iouuid", ^{ return genUUIDStr(); });
+            NSString *u = getPersistent(@"BdC9.iouuid", ^{ return genUUIDStr(); });
             return (__bridge_retained CFTypeRef)u;
         }
         // IOPlatformSerialNumber — 硬件序列号
@@ -233,7 +233,7 @@ static int hook_uname(struct utsname *name) {
 
 
 // ============================================================
-// Persistent fake IDs (BdC8. prefix)
+// Persistent fake IDs (BdC9. prefix)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -280,7 +280,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // iOS 版本管理
 // ============================================================
 static NSString *getFakeSystemVersion(void) {
-    return getPersistent(@"BdC8.sv", ^{
+    return getPersistent(@"BdC9.sv", ^{
         NSArray *versions = @[
             @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
             @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
@@ -448,7 +448,7 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"BdC8.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"BdC9.ck.%@", name], ^{ return genFakeCookie(name); });
 }
 
 // ============================================================
@@ -493,7 +493,7 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:@"BdC8"]) return NO;
+    if ([key hasPrefix:@"BdC9"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -513,11 +513,11 @@ static void initPrivacyHook(void) {
         // ---- 0. 预计算内核级伪装值 (C 字符串) ----
         NSString *fakeSV = getFakeSystemVersion();
         NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(@"BdC8.hw", ^{ return versionToMachine(fakeSV); });
+        NSString *fakeMachine = getPersistent(@"BdC9.hw", ^{ return versionToMachine(fakeSV); });
         NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
 
         NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(@"BdC8.mem", ^{
+        NSString *memStr = getPersistent(@"BdC9.mem", ^{
             return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
         });
         uint64_t fakeMem = [memStr longLongValue];
@@ -530,7 +530,7 @@ static void initPrivacyHook(void) {
 
         // ---- 1. v57 简单清理：Cookie storage + Keychain ----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("BdC8.reset"), kCFPreferencesCurrentApplication);
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("BdC9.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 // 1a. 清除 Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
@@ -546,11 +546,11 @@ static void initPrivacyHook(void) {
                 }
 
                 // 1c. 设标记
-                CFPreferencesSetAppValue(CFSTR("BdC8.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("BdC9.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {
-            CFPreferencesSetAppValue(CFSTR("BdC8.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+            CFPreferencesSetAppValue(CFSTR("BdC9.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         }
 
@@ -561,14 +561,14 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"BdC8.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"BdC9.dn", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdC8.iv", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdC9.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
@@ -651,7 +651,7 @@ static void initPrivacyHook(void) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdC8.ai", ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdC9.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
