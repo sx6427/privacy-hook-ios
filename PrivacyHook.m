@@ -879,6 +879,50 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
+        // ---- 7b. addValue:forHTTPHeaderField: hook ----
+        // 只拦截 Cookie 和 User-Agent header（不参与 API 签名，安全）
+        @try {
+            Class reqClass2 = objc_getClass("NSMutableURLRequest");
+            if (reqClass2) {
+                Method addValM = class_getInstanceMethod(reqClass2, @selector(addValue:forHTTPHeaderField:));
+                if (addValM) {
+                    IMP origAddVal = method_getImplementation(addValM);
+                    IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (value && field) {
+                            if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
+                                ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modifyUserAgentVersion(value), field);
+                                return;
+                            }
+                            if ([field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
+                                NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                                                   @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                                                   @"BAIDUID", @"BAIDUID_BFESS"];
+                                NSString *modified = value;
+                                for (NSString *name in names) {
+                                    NSString *fake = getFakeID(name);
+                                    NSRegularExpression *regex = [NSRegularExpression
+                                        regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
+                                        options:NSRegularExpressionCaseInsensitive error:nil];
+                                    modified = [regex stringByReplacingMatchesInString:modified options:0
+                                        range:NSMakeRange(0, modified.length)
+                                        withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
+                                }
+                                NSRegularExpression *cuidRegex = [NSRegularExpression
+                                    regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
+                                modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
+                                    range:NSMakeRange(0, modified.length)
+                                    withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
+                                ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modified, field);
+                                return;
+                            }
+                        }
+                        ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), value, field);
+                    });
+                    class_replaceMethod(reqClass2, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
+                }
+            }
+        } @catch (id e) {}
+
         // ---- 8. WKWebView hooks (customUserAgent) ----
         @try {
             Class wkClass = objc_getClass("WKWebView");
