@@ -461,8 +461,8 @@ static BOOL isDeviceCookie(NSString *cookieName) {
                        @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid",
                        @"baiduid", @"baiduid_bfess",
                        @"shshshfpb", @"shshshfpa", @"shshshfp", @"unionwsws",
-                       @"jcap_dvzw_fp", @"wlfso_s", @"TrackID",
-                       @"jdv", @"pt_key", @"pt_pin", @"thor", @"wskey"];
+                       @"jcap_dvzw_fp", @"wlfso_s", @"TrackID", @"jdv",
+                       @"pt_key", @"pt_pin", @"thor", @"wskey"];
     for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
