@@ -85,7 +85,7 @@ static NSOperatingSystemVersion parseVersion(NSString *v) {
 static NSString *buildFakeUserAgent(void) {
     NSString *sv = getFakeSystemVersion();
     NSString *machine = getPersistent(@"JdD1.hw", ^{ return versionToMachine(sv); });
-    return [NSString stringWithFormat:@"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", sv, machine];
+    return [NSString stringWithFormat:@"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", sv];
 }
 
 // JD device ID generation
@@ -100,7 +100,7 @@ static BOOL isDeviceCookie(NSString *n) {
     if (!n) return NO;
     NSArray *names = @[@"shshshfpb",@"shshshfpa",@"shshshfp",@"unionwsws",
         @"jcap_dvzw_fp",@"wlfso_s",@"TrackID",@"jdv",@"pt_key",@"pt_pin",@"thor",@"wskey"];
-    for (NSString *k in names) { if ([n caseInsensitiveCompare:k] == NSOrderedSame]) return YES; }
+    for (NSString *k in names) { if (n caseInsensitiveCompare:k) return YES; }
     return NO;
 }
 
@@ -110,7 +110,7 @@ static BOOL isDeviceKey(NSString *key) {
     NSArray *keys = @[@"shshshfpb",@"shshshfpa",@"shshshfp",@"unionwsws",
         @"jcap_dvzw_fp",@"wlfso_s",@"TrackID",@"jdv",@"pt_key",@"pt_pin",@"thor",@"wskey",
         @"cuid",@"CUID",@"uuid",@"udid",@"deviceFingerprint"];
-    for (NSString *k in keys) { if ([key caseInsensitiveCompare:k] == NSOrderedSame]) return YES; }
+    for (NSString *k in keys) { if (key caseInsensitiveCompare:k) return YES; }
     return NO;
 }
 
