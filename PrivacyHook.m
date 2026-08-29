@@ -691,18 +691,16 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(uc, @selector(stringForKey:), imp, method_getTypeEncoding(sfkM));
                 }
-                // boolForKey: hook — 拦截更新检测
+                // boolForKey: — 拦截更新检测 key
                 Method bfkM = class_getInstanceMethod(uc, @selector(boolForKey:));
                 if (bfkM) {
                     IMP origBFK = method_getImplementation(bfkM);
                     IMP newBFK = imp_implementationWithBlock(^BOOL(id s, NSString *key) {
                         if (key) {
                             NSString *lk = key.lowercaseString;
-                            // 拦截更新/强制更新相关 key
                             if ([lk containsString:@"update"] || [lk containsString:@"upgrade"] ||
                                 [lk containsString:@"force"] || [lk containsString:@"needupdate"] ||
-                                [lk containsString:@"mustupdate"] || [lk containsString:@"versioncheck"] ||
-                                [lk containsString:@"newversion"]) {
+                                [lk containsString:@"mustupdate"] || [lk containsString:@"newversion"]) {
                                 return NO;
                             }
                         }
@@ -713,7 +711,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5b. UIAlertController hook — 阻止更新弹窗 ----
+        // ---- 5b. UIAlertController — 阻止更新弹窗 ----
         @try {
             Class ac = objc_getClass("UIAlertController");
             if (ac) {
@@ -731,8 +729,7 @@ static void initPrivacyHook(void) {
                                 if ([lower containsString:@"更新"] || [lower containsString:@"升级"] ||
                                     [lower containsString:@"版本"] || [lower containsString:@"update"] ||
                                     [lower containsString:@"upgrade"] || [lower containsString:@"version"]) {
-                                    // 自动点击"暂不"或"取消"按钮
-                                    double delayInSeconds = 0.1;
+                                    double delayInSeconds = 0.15;
                                     dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
                                     dispatch_after(popTime, dispatch_get_main_queue(), ^(void) {
                                         @try {
@@ -745,14 +742,18 @@ static void initPrivacyHook(void) {
                                                         [bl containsString:@"取消"] || [bl containsString:@"关闭"] ||
                                                         [bl containsString:@"cancel"] || [bl containsString:@"later"] ||
                                                         [bl containsString:@"skip"] || [bl containsString:@"close"]) {
-                                                        id block = [action valueForKey:@"__handler"];
-                                                        if (block) ((void(*)(id,id))block)(action, action);
+                                                        #pragma clang diagnostic push
+                                                        #pragma clang diagnostic ignored "-Warc-performSelector-leak"
+                                                        SEL sel = NSSelectorFromString(@"__handler");
+                                                        if ([action respondsToSelector:sel]) {
+                                                            [action performSelector:sel withObject:nil];
+                                                        }
+                                                        #pragma clang diagnostic pop
                                                         [s dismissViewControllerAnimated:YES completion:nil];
                                                         return;
                                                     }
                                                 }
                                             }
-                                            // 如果没有找到取消按钮，直接关闭
                                             [s dismissViewControllerAnimated:YES completion:nil];
                                         } @catch (id e2) {}
                                     });
@@ -765,41 +766,8 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 5c. NSURLSession 响应拦截 — 修改服务器返回的更新指令 ----
+        // ---- 5c. NSJSONSerialization — 修改更新指令 ----
         @try {
-            Class tvc = objc_getClass("NSURLSessionTask");
-            if (tvc) {
-                // hook resume 来拦截完成后的回调
-                Method resumeM = class_getInstanceMethod(tvc, @selector(resume));
-                if (resumeM) {
-                    IMP origResume = method_getImplementation(resumeM);
-                    IMP newResume = imp_implementationWithBlock(^void(id s) {
-                        // 在 task 完成后检查响应
-                        __block id task = s;
-                        // 使用 KVC 获取 task 的 response
-                        @try {
-                            id resp = [task valueForKey:@"response"];
-                            if (resp && [resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
-                                NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)resp;
-                                NSDictionary *headers = [httpResp allHeaderFields];
-                                // 检查是否有更新指令的标记
-                                NSString *contentType = headers[@"Content-Type"];
-                                if (contentType && [contentType containsString:@"json"]) {
-                                    // 标记这个 task 需要检查 data
-                                }
-                            }
-                        } @catch (id e2) {}
-                        ((void (*)(id, SEL))origResume)(s, @selector(resume));
-                    });
-                    // 不替换 resume，避免引起问题
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 5d. NSDictionary objectForKey: — 拦截更新指令 ----
-        @try {
-            // 京东通过 API 返回 JSON 中包含 "code": 3 或 "needUpdate": true 等字段
-            // 直接 hook NSJSONSerialization 来修改解析结果
             Class jsonClass = objc_getClass("NSJSONSerialization");
             if (jsonClass) {
                 Method jwomM = class_getClassMethod(jsonClass, @selector(JSONObjectWithData:options:error:));
@@ -810,23 +778,18 @@ static void initPrivacyHook(void) {
                         if (result && [result isKindOfClass:objc_getClass("NSDictionary")]) {
                             NSMutableDictionary *md = [(NSDictionary *)result mutableCopy];
                             BOOL modified = NO;
-                            // 清除更新标记
                             NSArray *updateKeys = @[@"needUpdate", @"forceUpdate", @"mustUpdate",
                                 @"need_update", @"force_update", @"hasUpdate",
-                @"hasNewVersion", @"isForceUpdate", @"code", @"status", @"updateType"];
+                                @"hasNewVersion", @"isForceUpdate", @"updateType"];
                             for (NSString *key in updateKeys) {
-                                if (md[key]) {
-                                    if ([key isEqualToString:@"code"] || [key isEqualToString:@"status"]) {
-                                        // code/status == 3 或 "1" 通常表示需要更新
-                                        id val = md[key];
-                                        if ([val isKindOfClass:objc_getClass("NSString")] && [val isEqualToString:@"3"]) {
-                                            md[key] = @"0"; modified = YES;
-                                        } else if ([val isKindOfClass:objc_getClass("NSNumber")] && [val intValue] == 3) {
-                                            md[key] = @0; modified = YES;
-                                        }
-                                    } else {
-                                        md[key] = @NO; modified = YES;
-                                    }
+                                if (md[key]) { md[key] = @NO; modified = YES; }
+                            }
+                            for (NSString *key in @[@"code", @"status"]) {
+                                id val = md[key];
+                                if ([val isKindOfClass:objc_getClass("NSString")] && [val isEqualToString:@"3"]) {
+                                    md[key] = @"0"; modified = YES;
+                                } else if ([val isKindOfClass:objc_getClass("NSNumber")] && [val intValue] == 3) {
+                                    md[key] = @0; modified = YES;
                                 }
                             }
                             if (modified) return md;
