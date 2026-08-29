@@ -469,127 +469,82 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // 11. NSURLSession — 网络层拦截更新 API 响应
+        // 11. UIWindow notification — 轻量级弹窗拦截
+        // 监听 window 变化，检测并自动关闭更新弹窗
         @try {
-            Class sessionClass = objc_getClass("NSURLSession");
-            if (sessionClass) {
-                Method dtwM = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:));
-                if (dtwM) {
-                    IMP orig = method_getImplementation(dtwM);
-                    IMP imp = imp_implementationWithBlock(^id(id s, NSURLRequest *req, void (^completion)(NSData *, NSURLResponse *, NSError *)) {
-                        // 包装 completion handler 来修改响应数据
-                        void (^wrappedCompletion)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-                            if (data && response && !error) {
-                                // 检查是否是更新相关的 API
-                                NSURL *url = req.URL;
-                                NSString *urlStr = url ? url.absoluteString : @"";
-                                NSString *lowerUrl = urlStr.lowercaseString;
-                                BOOL isUpdateAPI = ([lowerUrl containsString:@"upgrade"] ||
-                                                    [lowerUrl containsString:@"update"] ||
-                                                    [lowerUrl containsString:@"version"] ||
-                                                    [lowerUrl containsString:@"bounce"] ||
-                                                    [lowerUrl containsString:@"check"] ||
-                                                    [lowerUrl containsString:@"config"] ||
-                                                    [lowerUrl containsString:@"init"]);
-                                if (isUpdateAPI) {
-                                    // 尝试修改 JSON 响应
-                                    @try {
-                                        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                                        if (json && [json isKindOfClass:[NSDictionary class]]) {
-                                            NSMutableDictionary *md = [(NSDictionary *)json mutableCopy];
-                                            NSArray *updateKeys = @[@"needUpdate", @"forceUpdate", @"mustUpdate",
-                                                @"hasUpdate", @"hasNewVersion", @"isForceUpdate",
-                                                @"shouldUpdate", @"requireUpdate", @"isNewVersion",
-                                                @"upgrade", @"updateType", @"upgradeType"];
-                                            for (NSString *key in updateKeys) {
-                                                if (md[key]) md[key] = @NO;
-                                            }
-                                            for (NSString *key in @[@"code", @"status", @"resultCode"]) {
-                                                id val = md[key];
-                                                if (val) {
-                                                    int code = [val isKindOfClass:[NSString class]] ? [(NSString *)val intValue] : [val intValue];
-                                                    if (code != 0 && code != 200 && code != 1) {
-                                                        md[key] = @0;
-                                                    }
-                                                }
-                                            }
-                                            if (md[@"downloadUrl"]) md[@"downloadUrl"] = @"";
-                                            if (md[@"updateUrl"]) md[@"updateUrl"] = @"";
-                                            if (md[@"newVersionUrl"]) md[@"newVersionUrl"] = @"";
-                                            if (md[@"latestVersion"]) md[@"latestVersion"] = @"0.0.0";
-                                            if (md[@"newVersion"]) md[@"newVersion"] = @"0.0.0";
-                                            if (md[@"serverVersion"]) md[@"serverVersion"] = @"0.0.0";
-                                            NSData *modifiedData = [NSJSONSerialization dataWithJSONObject:md options:0 error:nil];
-                                            if (modifiedData) data = modifiedData;
-                                        }
-                                    } @catch (id e) {}
+            [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
+                object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+                    @try {
+                        UIWindow *window = note.object;
+                        if (!window || ![window isKindOfClass:[UIWindow class]]) return;
+                        // 延迟检查
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            @try {
+                                UIViewController *topVC = nil;
+                                UIViewController *rootVC = window.rootViewController;
+                                while (rootVC.presentedViewController) {
+                                    rootVC = rootVC.presentedViewController;
                                 }
-                            }
-                            if (completion) completion(data, response, error);
-                        };
-                        return ((id (*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))orig)(s, @selector(dataTaskWithRequest:completionHandler:), req, wrappedCompletion);
-                    });
-                    class_replaceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:), imp, method_getTypeEncoding(dtwM));
-                }
-            }
-        } @catch (id e) {}
-
-        // 12. UIViewController — 拦截更新弹窗
-        @try {
-            Method vam = class_getInstanceMethod(objc_getClass("UIViewController"), @selector(viewDidAppear:));
-            if (vam) {
-                IMP orig = method_getImplementation(vam);
-                IMP imp = imp_implementationWithBlock(^void(id s, BOOL animated) {
-                    ((void (*)(id, SEL, BOOL))orig)(s, @selector(viewDidAppear:), animated);
-                    // 检测并关闭更新弹窗
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        @try {
-                            // 检查 view 上的所有子视图，找更新弹窗
-                            UIView *view = [s valueForKey:@"view"];
-                            if (!view) return;
-                            // 递归搜索按钮文字
-                            void (^findButtons)(UIView *) = ^(UIView *v) {
-                                if ([v isKindOfClass:[UIButton class]]) {
-                                    UIButton *btn = (UIButton *)v;
-                                    NSString *title = [btn titleForState:UIControlStateNormal];
-                                    if (title) {
-                                        NSString *lower = title.lowercaseString;
-                                        // 找到"立即更新"按钮，点击"暂不"或关闭弹窗
-                                        if ([lower containsString:@"更新"] || [lower containsString:@"升级"]) {
-                                            // 寻找同级的"暂不"按钮
-                                            UIView *parent = v.superview;
-                                            if (parent) {
-                                                for (UIView *sibling in parent.subviews) {
-                                                    if ([sibling isKindOfClass:[UIButton class]]) {
-                                                        UIButton *sibBtn = (UIButton *)sibling;
-                                                        NSString *sibTitle = [sibBtn titleForState:UIControlStateNormal];
-                                                        if (sibTitle) {
-                                                            NSString *sl = sibTitle.lowercaseString;
-                                                            if ([sl containsString:@"暂不"] || [sl containsString:@"以后"] ||
-                                                                [sl containsString:@"取消"] || [sl containsString:@"关闭"] ||
-                                                                [sl containsString:@"cancel"]) {
-                                                                [sibBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
-                                                                return;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // 没找到取消按钮，直接 dismiss
-                                            [s dismissViewControllerAnimated:YES completion:nil];
+                                topVC = rootVC;
+                                if (!topVC) return;
+                                // 检查是否是更新弹窗
+                                NSString *vcClass = NSStringFromClass([topVC class]);
+                                if ([vcClass containsString:@"Update"] || [vcClass containsString:@"Upgrade"] ||
+                                    [vcClass containsString:@"Version"] || [vcClass containsString:@"Alert"]) {
+                                    [topVC dismissViewControllerAnimated:YES completion:nil];
+                                    return;
+                                }
+                                // 检查 view 上的 UILabel 文字
+                                UIView *view = topVC.view;
+                                if (!view) return;
+                                // 搜索所有 UILabel
+                                NSMutableArray *labels = [NSMutableArray array];
+                                NSMutableArray *buttons = [NSMutableArray array];
+                                void (^scanViews)(UIView *) = ^(UIView *v) {
+                                    if ([v isKindOfClass:[UILabel class]]) {
+                                        [labels addObject:v];
+                                    }
+                                    if ([v isKindOfClass:[UIButton class]]) {
+                                        [buttons addObject:v];
+                                    }
+                                    for (UIView *sub in v.subviews) {
+                                        scanViews(sub);
+                                    }
+                                };
+                                scanViews(view);
+                                // 检查 label 文字是否包含更新关键词
+                                BOOL isUpdateDialog = NO;
+                                for (UILabel *label in labels) {
+                                    NSString *text = label.text;
+                                    if (text) {
+                                        if ([text containsString:@"更新"] || [text containsString:@"升级"] ||
+                                            [text containsString:@"新版本"] || [text containsString:@"最新版本"]) {
+                                            isUpdateDialog = YES;
+                                            break;
                                         }
                                     }
                                 }
-                                for (UIView *sub in v.subviews) {
-                                    findButtons(sub);
+                                if (isUpdateDialog) {
+                                    // 寻找"暂不"/"以后"/"取消"按钮
+                                    for (UIButton *btn in buttons) {
+                                        NSString *title = [btn titleForState:UIControlStateNormal];
+                                        if (title) {
+                                            if ([title containsString:@"暂不"] || [title containsString:@"以后"] ||
+                                                [title containsString:@"取消"] || [title containsString:@"关闭"] ||
+                                                [title containsString:@"cancel"]) {
+                                                [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    // 没找到取消按钮，直接 dismiss
+                                    [topVC dismissViewControllerAnimated:YES completion:nil];
                                 }
-                            };
-                            findButtons(view);
-                        } @catch (id e) {}
-                    });
-                });
-                class_replaceMethod(objc_getClass("UIViewController"), @selector(viewDidAppear:), imp, method_getTypeEncoding(vam));
-            }
+                            } @catch (id e) {}
+                        });
+                    } @catch (id e) {}
+                }];
         } @catch (id e) {}
     }
 }
