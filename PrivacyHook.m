@@ -395,106 +395,93 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // 10. JDUpgradeModule router handlers — 直接拦截更新检测逻辑
-        // 遍历所有类，找到包含 routerHandle_JDUpgradeModule_ 前缀方法的类
-        @try {
-            unsigned int classCount = 0;
-            Class *classes = objc_copyClassList(&classCount);
-            if (classes) {
-                // 需要拦截的方法 SEL 前缀列表
-                NSArray *handlerNames = @[
-                    @"routerHandle_JDUpgradeModule_requestUpgrade:callback:",
-                    @"routerHandle_JDUpgradeModule_requestForceUpgrade:callback:",
-                    @"routerHandle_JDUpgradeModule_requestTFUpgrade:callback:",
-                    @"routerHandle_JDUpgradeModule_showCommon:callback:",
-                    @"routerHandle_JDUpgradeModule_showForce:callback:",
-                    @"routerHandle_JDUpgradeModule_showGray:callback:",
-                    @"routerHandle_JDUpgradeModule_showTF:callback:",
-                    @"routerHandle_JDUpgradeModule_showTFReward:callback:",
-                    @"routerHandle_JDUpgradeModule_upgradeInfo:callback:",
-                    @"routerHandle_JDUpgradeModule_updateLocalData:callback:",
-                    @"routerHandle_JDUpgradeModule_getTFRequestParam:callback:",
-                    @"routerHandle_JDUpgradeModule_myJdDisAppear:callback:",
-                ];
-                for (unsigned int i = 0; i < classCount; i++) {
-                    Class cls = classes[i];
-                    if (!cls) continue;
-                    for (NSString *methodName in handlerNames) {
-                        SEL sel = NSSelectorFromString(methodName);
-                        Method m = class_getInstanceMethod(cls, sel);
-                        if (m) {
-                            // 找到了！替换为直接调用 callback(nil)
-                            IMP imp = imp_implementationWithBlock(^void(id self, id params, void (^callback)(id)) {
-                                if (callback) callback(nil);
-                            });
-                            class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
+        // 10. JDUpgradeModule router handlers — 延迟到 main 后执行，避免 constructor 阶段闪退
+        // 用 dispatch_async 到 main queue，等 App 启动完成后再 hook
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // 10a. 遍历所有类，找到包含 routerHandle_JDUpgradeModule_ 方法的类
+            @try {
+                unsigned int classCount = 0;
+                Class *classes = objc_copyClassList(&classCount);
+                if (classes) {
+                    NSArray *handlerNames = @[
+                        @"routerHandle_JDUpgradeModule_requestUpgrade:callback:",
+                        @"routerHandle_JDUpgradeModule_requestForceUpgrade:callback:",
+                        @"routerHandle_JDUpgradeModule_requestTFUpgrade:callback:",
+                        @"routerHandle_JDUpgradeModule_showCommon:callback:",
+                        @"routerHandle_JDUpgradeModule_showForce:callback:",
+                        @"routerHandle_JDUpgradeModule_showGray:callback:",
+                        @"routerHandle_JDUpgradeModule_showTF:callback:",
+                        @"routerHandle_JDUpgradeModule_showTFReward:callback:",
+                        @"routerHandle_JDUpgradeModule_upgradeInfo:callback:",
+                        @"routerHandle_JDUpgradeModule_updateLocalData:callback:",
+                        @"routerHandle_JDUpgradeModule_getTFRequestParam:callback:",
+                        @"routerHandle_JDUpgradeModule_myJdDisAppear:callback:",
+                    ];
+                    for (unsigned int i = 0; i < classCount; i++) {
+                        Class cls = classes[i];
+                        if (!cls) continue;
+                        // 快速检查：类名是否包含 Upgrade
+                        const char *clsName = class_getName(cls);
+                        if (!clsName) continue;
+                        // 只检查名称中包含 Upgrade 的类，大幅减少遍历量
+                        BOOL nameMatch = NO;
+                        for (const char *p = clsName; *p; p++) {
+                            if (p[0]=='U' && p[1]=='p' && p[2]=='g' && p[3]=='r' && p[4]=='a' && p[5]=='d' && p[6]=='e') {
+                                nameMatch = YES;
+                                break;
+                            }
+                        }
+                        if (!nameMatch) continue;
+                        for (NSString *methodName in handlerNames) {
+                            SEL sel = NSSelectorFromString(methodName);
+                            Method m = class_getInstanceMethod(cls, sel);
+                            if (m) {
+                                IMP imp = imp_implementationWithBlock(^void(id self, id params, void (^callback)(id)) {
+                                    if (callback) callback(nil);
+                                });
+                                class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
+                            }
                         }
                     }
+                    free(classes);
                 }
-                free(classes);
-            }
-        } @catch (id e) {}
+            } @catch (id e) {}
 
-        // 11. JDUpgradeManager — 拦截单例方法，返回 nil
-        @try {
-            Class upgradeMgr = objc_getClass("JDUpgradeManager");
-            if (upgradeMgr) {
-                // 拦截 sharedJDUpgradeManager
-                Method sharedM = class_getClassMethod(upgradeMgr, @selector(sharedJDUpgradeManager));
-                if (sharedM) {
-                    // 不拦截单例本身，但拦截 requestUpgrade:withFinishBlock:
-                }
-                // 拦截 requestUpgrade:withFinishBlock:
-                Method reqM = class_getInstanceMethod(upgradeMgr, @selector(requestUpgrade:withFinishBlock:));
-                if (reqM) {
-                    IMP imp = imp_implementationWithBlock(^void(id self, id params, void (^finishBlock)(id)) {
-                        if (finishBlock) finishBlock(nil);
-                    });
-                    class_replaceMethod(upgradeMgr, @selector(requestUpgrade:withFinishBlock:), imp, method_getTypeEncoding(reqM));
-                }
-                // 拦截 requestForceUpgrade
-                Method forceM = class_getInstanceMethod(upgradeMgr, @selector(requestForceUpgrade:));
-                if (forceM) {
-                    IMP imp = imp_implementationWithBlock(^void(id self, id params) {});
-                    class_replaceMethod(upgradeMgr, @selector(requestForceUpgrade:), imp, method_getTypeEncoding(forceM));
-                }
-                // 拦截 requestUpgradeWithParam:completion:
-                Method reqParamM = class_getInstanceMethod(upgradeMgr, @selector(requestUpgradeWithParam:completion:));
-                if (reqParamM) {
-                    IMP imp = imp_implementationWithBlock(^void(id self, id params, void (^completion)(id)) {
-                        if (completion) completion(nil);
-                    });
-                    class_replaceMethod(upgradeMgr, @selector(requestUpgradeWithParam:completion:), imp, method_getTypeEncoding(reqParamM));
-                }
-                // 拦截 showForceUpgrade:
-                Method showForceM = class_getInstanceMethod(upgradeMgr, @selector(showForceUpgrade:));
-                if (showForceM) {
-                    IMP imp = imp_implementationWithBlock(^void(id self, id params) {});
-                    class_replaceMethod(upgradeMgr, @selector(showForceUpgrade:), imp, method_getTypeEncoding(showForceM));
-                }
-            }
-        } @catch (id e) {}
-
-        // 12. JDUpgradeTool — 拦截所有方法
-        @try {
-            Class upgradeTool = objc_getClass("JDUpgradeTool");
-            if (upgradeTool) {
-                unsigned int methodCount = 0;
-                Method *methods = class_copyMethodList(upgradeTool, &methodCount);
-                if (methods) {
-                    for (unsigned int i = 0; i < methodCount; i++) {
-                        SEL sel = method_getName(methods[i]);
-                        NSString *name = NSStringFromSelector(sel);
-                        // 拦截所有以 request/show/check 开头的方法
-                        if ([name hasPrefix:@"request"] || [name hasPrefix:@"show"] || [name hasPrefix:@"check"]) {
-                            IMP imp = imp_implementationWithBlock(^void(id self, id param1, id param2) {});
-                            class_replaceMethod(upgradeTool, sel, imp, method_getTypeEncoding(methods[i]));
-                        }
+            // 10b. JDUpgradeManager — 拦截已知方法
+            @try {
+                Class upgradeMgr = objc_getClass("JDUpgradeManager");
+                if (upgradeMgr) {
+                    // requestUpgrade:withFinishBlock: — 2个参数(params, finishBlock)
+                    Method reqM = class_getInstanceMethod(upgradeMgr, @selector(requestUpgrade:withFinishBlock:));
+                    if (reqM) {
+                        IMP imp = imp_implementationWithBlock(^void(id self, id params, void (^finishBlock)(id)) {
+                            if (finishBlock) finishBlock(nil);
+                        });
+                        class_replaceMethod(upgradeMgr, @selector(requestUpgrade:withFinishBlock:), imp, method_getTypeEncoding(reqM));
                     }
-                    free(methods);
+                    // requestForceUpgrade: — 1个参数
+                    Method forceM = class_getInstanceMethod(upgradeMgr, @selector(requestForceUpgrade:));
+                    if (forceM) {
+                        IMP imp = imp_implementationWithBlock(^void(id self, id params) {});
+                        class_replaceMethod(upgradeMgr, @selector(requestForceUpgrade:), imp, method_getTypeEncoding(forceM));
+                    }
+                    // requestUpgradeWithParam:completion: — 2个参数
+                    Method reqParamM = class_getInstanceMethod(upgradeMgr, @selector(requestUpgradeWithParam:completion:));
+                    if (reqParamM) {
+                        IMP imp = imp_implementationWithBlock(^void(id self, id params, void (^completion)(id)) {
+                            if (completion) completion(nil);
+                        });
+                        class_replaceMethod(upgradeMgr, @selector(requestUpgradeWithParam:completion:), imp, method_getTypeEncoding(reqParamM));
+                    }
+                    // showForceUpgrade: — 1个参数
+                    Method showForceM = class_getInstanceMethod(upgradeMgr, @selector(showForceUpgrade:));
+                    if (showForceM) {
+                        IMP imp = imp_implementationWithBlock(^void(id self, id params) {});
+                        class_replaceMethod(upgradeMgr, @selector(showForceUpgrade:), imp, method_getTypeEncoding(showForceM));
+                    }
                 }
-            }
-        } @catch (id e) {}
+            } @catch (id e) {}
+        });
 
     }
 }
