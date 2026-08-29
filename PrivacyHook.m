@@ -394,5 +394,79 @@ static void initPrivacyHook(void) {
                 }
             }
         } @catch (id e) {}
+
+        // 10. NSJSONSerialization — 拦截服务器返回的更新指令
+        @try {
+            Class jsonClass = objc_getClass("NSJSONSerialization");
+            if (jsonClass) {
+                Method jwomM = class_getClassMethod(jsonClass, @selector(JSONObjectWithData:options:error:));
+                if (jwomM) {
+                    IMP orig = method_getImplementation(jwomM);
+                    IMP imp = imp_implementationWithBlock(^id(id cls, NSData *data, NSJSONReadingOptions opts, NSError **err) {
+                        id result = ((id (*)(id, SEL, NSData *, NSJSONReadingOptions, NSError **))orig)(cls, @selector(JSONObjectWithData:options:error:), data, opts, err);
+                        if (result && [result isKindOfClass:[NSDictionary class]]) {
+                            @try {
+                                NSMutableDictionary *md = [(NSDictionary *)result mutableCopy];
+                                BOOL modified = NO;
+                                // 清除更新标记
+                                NSArray *updateKeys = @[@"needUpdate", @"forceUpdate", @"mustUpdate",
+                                    @"need_update", @"force_update", @"hasUpdate",
+                                    @"hasNewVersion", @"isForceUpdate", @"updateType",
+                                    @"isNewVersion", @"shouldUpdate", @"requireUpdate",
+                                    @"hasLatestVersion", @"upgradeType"];
+                                for (NSString *key in updateKeys) {
+                                    if (md[key]) {
+                                        id val = md[key];
+                                        if ([val isKindOfClass:[NSNumber class]] && [val boolValue]) {
+                                            md[key] = @NO; modified = YES;
+                                        } else if ([val isKindOfClass:[NSString class]] && ![val isEqualToString:@"0"] && ![val isEqualToString:@"false"] && ![val isEqualToString:@"no"]) {
+                                            md[key] = @"false"; modified = YES;
+                                        }
+                                    }
+                                }
+                                // code/status == 特定值表示需要更新
+                                for (NSString *key in @[@"code", @"status", @"resultCode"]) {
+                                    id val = md[key];
+                                    if (val) {
+                                        if ([val isKindOfClass:[NSString class]]) {
+                                            int code = [val intValue];
+                                            if (code == 3 || code == 1001 || code == 1002 || code == 2001) {
+                                                md[key] = @"0"; modified = YES;
+                                            }
+                                        } else if ([val isKindOfClass:[NSNumber class]]) {
+                                            int code = [val intValue];
+                                            if (code == 3 || code == 1001 || code == 1002 || code == 2001) {
+                                                md[key] = @0; modified = YES;
+                                            }
+                                        }
+                                    }
+                                }
+                                // 修改 URL 字段（下载链接）
+                                if (md[@"downloadUrl"]) { md[@"downloadUrl"] = @""; modified = YES; }
+                                if (md[@"updateUrl"]) { md[@"updateUrl"] = @""; modified = YES; }
+                                if (md[@"newVersionUrl"]) { md[@"newVersionUrl"] = @""; modified = YES; }
+                                // 修改版本号字段
+                                if (md[@"latestVersion"]) { md[@"latestVersion"] = @"0.0.0"; modified = YES; }
+                                if (md[@"newVersion"]) { md[@"newVersion"] = @"0.0.0"; modified = YES; }
+                                if (md[@"serverVersion"]) { md[@"serverVersion"] = @"0.0.0"; modified = YES; }
+                                if (md[@"minVersion"]) { md[@"minVersion"] = @"0.0.0"; modified = YES; }
+                                if (md[@"version"]) {
+                                    id val = md[@"version"];
+                                    if ([val isKindOfClass:[NSString class]]) {
+                                        NSString *vs = (NSString *)val;
+                                        if ([vs length] > 0 && ![vs isEqualToString:@"0"] && ![vs hasPrefix:@"0."]) {
+                                            md[@"version"] = @"0"; modified = YES;
+                                        }
+                                    }
+                                }
+                                if (modified) return md;
+                            } @catch (id e) {}
+                        }
+                        return result;
+                    });
+                    class_replaceMethod(jsonClass, @selector(JSONObjectWithData:options:error:), imp, method_getTypeEncoding(jwomM));
+                }
+            }
+        } @catch (id e) {}
     }
 }
