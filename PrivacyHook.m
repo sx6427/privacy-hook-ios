@@ -77,7 +77,9 @@ static uint64_t machineToMemSize(NSString *m) {
 
 static NSString *versionToDarwinRelease(NSString *v) {
     NSArray *p = [v componentsSeparatedByString:@"."];
-    return [NSString stringWithFormat:@"%ld.%ld.0", (long)([p[0] integerValue]+6), (long)([p.count>1?[p[1] integerValue]:0])];
+    NSInteger minor = 0;
+    if (p.count > 1) minor = [p[1] integerValue];
+    return [NSString stringWithFormat:@"%ld.%ld.0", (long)([p[0] integerValue]+6), (long)minor];
 }
 
 static void hook_new_image(const struct mach_header *header, intptr_t slide) {
