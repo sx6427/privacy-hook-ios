@@ -698,105 +698,15 @@ static void initPrivacyHook(void) {
                     IMP newBFK = imp_implementationWithBlock(^BOOL(id s, NSString *key) {
                         if (key) {
                             NSString *lk = key.lowercaseString;
-                            if ([lk containsString:@"update"] || [lk containsString:@"upgrade"] ||
-                                [lk containsString:@"force"] || [lk containsString:@"needupdate"] ||
-                                [lk containsString:@"mustupdate"] || [lk containsString:@"newversion"]) {
+                            if ([lk containsString:@"needupdate"] || [lk containsString:@"forceupdate"] ||
+                                [lk containsString:@"mustupdate"] || [lk containsString:@"hasupdate"] ||
+                                [lk containsString:@"isforceupdate"] || [lk containsString:@"newversion"]) {
                                 return NO;
                             }
                         }
                         return ((BOOL (*)(id, SEL, NSString *))origBFK)(s, @selector(boolForKey:), key);
                     });
                     class_replaceMethod(uc, @selector(boolForKey:), newBFK, method_getTypeEncoding(bfkM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 5b. UIAlertController — 阻止更新弹窗 ----
-        @try {
-            Class ac = objc_getClass("UIAlertController");
-            if (ac) {
-                Method vmM = class_getInstanceMethod(ac, @selector(viewDidLoad));
-                if (vmM) {
-                    IMP origVM = method_getImplementation(vmM);
-                    IMP newVM = imp_implementationWithBlock(^void(id s) {
-                        ((void (*)(id, SEL))origVM)(s, @selector(viewDidLoad));
-                        @try {
-                            NSString *title = [s valueForKey:@"title"];
-                            NSString *message = [s valueForKey:@"message"];
-                            if (title || message) {
-                                NSString *combined = [NSString stringWithFormat:@"%@ %@", title ?: @"", message ?: @""];
-                                NSString *lower = combined.lowercaseString;
-                                if ([lower containsString:@"更新"] || [lower containsString:@"升级"] ||
-                                    [lower containsString:@"版本"] || [lower containsString:@"update"] ||
-                                    [lower containsString:@"upgrade"] || [lower containsString:@"version"]) {
-                                    double delayInSeconds = 0.15;
-                                    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-                                    dispatch_after(popTime, dispatch_get_main_queue(), ^(void) {
-                                        @try {
-                                            NSArray *actions = [s valueForKey:@"actions"];
-                                            for (id action in actions) {
-                                                NSString *btnTitle = [action valueForKey:@"title"];
-                                                if (btnTitle) {
-                                                    NSString *bl = btnTitle.lowercaseString;
-                                                    if ([bl containsString:@"暂不"] || [bl containsString:@"以后"] ||
-                                                        [bl containsString:@"取消"] || [bl containsString:@"关闭"] ||
-                                                        [bl containsString:@"cancel"] || [bl containsString:@"later"] ||
-                                                        [bl containsString:@"skip"] || [bl containsString:@"close"]) {
-                                                        #pragma clang diagnostic push
-                                                        #pragma clang diagnostic ignored "-Warc-performSelector-leak"
-                                                        SEL sel = NSSelectorFromString(@"__handler");
-                                                        if ([action respondsToSelector:sel]) {
-                                                            [action performSelector:sel withObject:nil];
-                                                        }
-                                                        #pragma clang diagnostic pop
-                                                        [s dismissViewControllerAnimated:YES completion:nil];
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            [s dismissViewControllerAnimated:YES completion:nil];
-                                        } @catch (id e2) {}
-                                    });
-                                }
-                            }
-                        } @catch (id e2) {}
-                    });
-                    class_replaceMethod(ac, @selector(viewDidLoad), newVM, method_getTypeEncoding(vmM));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 5c. NSJSONSerialization — 修改更新指令 ----
-        @try {
-            Class jsonClass = objc_getClass("NSJSONSerialization");
-            if (jsonClass) {
-                Method jwomM = class_getClassMethod(jsonClass, @selector(JSONObjectWithData:options:error:));
-                if (jwomM) {
-                    IMP origJW = method_getImplementation(jwomM);
-                    IMP newJW = imp_implementationWithBlock(^id(id cls, NSData *data, NSJSONReadingOptions opts, NSError **err) {
-                        id result = ((id (*)(id, SEL, NSData *, NSJSONReadingOptions, NSError **))origJW)(cls, @selector(JSONObjectWithData:options:error:), data, opts, err);
-                        if (result && [result isKindOfClass:objc_getClass("NSDictionary")]) {
-                            NSMutableDictionary *md = [(NSDictionary *)result mutableCopy];
-                            BOOL modified = NO;
-                            NSArray *updateKeys = @[@"needUpdate", @"forceUpdate", @"mustUpdate",
-                                @"need_update", @"force_update", @"hasUpdate",
-                                @"hasNewVersion", @"isForceUpdate", @"updateType"];
-                            for (NSString *key in updateKeys) {
-                                if (md[key]) { md[key] = @NO; modified = YES; }
-                            }
-                            for (NSString *key in @[@"code", @"status"]) {
-                                id val = md[key];
-                                if ([val isKindOfClass:objc_getClass("NSString")] && [val isEqualToString:@"3"]) {
-                                    md[key] = @"0"; modified = YES;
-                                } else if ([val isKindOfClass:objc_getClass("NSNumber")] && [val intValue] == 3) {
-                                    md[key] = @0; modified = YES;
-                                }
-                            }
-                            if (modified) return md;
-                        }
-                        return result;
-                    });
-                    class_replaceMethod(jsonClass, @selector(JSONObjectWithData:options:error:), newJW, method_getTypeEncoding(jwomM));
                 }
             }
         } @catch (id e) {}
