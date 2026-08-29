@@ -459,7 +459,10 @@ static BOOL isDeviceCookie(NSString *cookieName) {
     NSString *lk = [cookieName lowercaseString];
     NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
                        @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid",
-                       @"baiduid", @"baiduid_bfess"];
+                       @"baiduid", @"baiduid_bfess",
+                       @"shshshfpb", @"shshshfpa", @"shshshfp", @"unionwsws",
+                       @"jcap_dvzw_fp", @"wlfso_s", @"TrackID", @"jdv",
+                       @"pt_key", @"pt_pin", @"thor", @"wskey"];
     for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
@@ -687,6 +690,150 @@ static void initPrivacyHook(void) {
                         return ((NSString *(*)(id, SEL, NSString *))orig)(s, @selector(stringForKey:), key);
                     });
                     class_replaceMethod(uc, @selector(stringForKey:), imp, method_getTypeEncoding(sfkM));
+                }
+                // boolForKey: hook — 拦截更新检测
+                Method bfkM = class_getInstanceMethod(uc, @selector(boolForKey:));
+                if (bfkM) {
+                    IMP origBFK = method_getImplementation(bfkM);
+                    IMP newBFK = imp_implementationWithBlock(^BOOL(id s, NSString *key) {
+                        if (key) {
+                            NSString *lk = key.lowercaseString;
+                            // 拦截更新/强制更新相关 key
+                            if ([lk containsString:@"update"] || [lk containsString:@"upgrade"] ||
+                                [lk containsString:@"force"] || [lk containsString:@"needupdate"] ||
+                                [lk containsString:@"mustupdate"] || [lk containsString:@"versioncheck"] ||
+                                [lk containsString:@"newversion"]) {
+                                return NO;
+                            }
+                        }
+                        return ((BOOL (*)(id, SEL, NSString *))origBFK)(s, @selector(boolForKey:), key);
+                    });
+                    class_replaceMethod(uc, @selector(boolForKey:), newBFK, method_getTypeEncoding(bfkM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 5b. UIAlertController hook — 阻止更新弹窗 ----
+        @try {
+            Class ac = objc_getClass("UIAlertController");
+            if (ac) {
+                Method vmM = class_getInstanceMethod(ac, @selector(viewDidLoad));
+                if (vmM) {
+                    IMP origVM = method_getImplementation(vmM);
+                    IMP newVM = imp_implementationWithBlock(^void(id s) {
+                        ((void (*)(id, SEL))origVM)(s, @selector(viewDidLoad));
+                        @try {
+                            NSString *title = [s valueForKey:@"title"];
+                            NSString *message = [s valueForKey:@"message"];
+                            if (title || message) {
+                                NSString *combined = [NSString stringWithFormat:@"%@ %@", title ?: @"", message ?: @""];
+                                NSString *lower = combined.lowercaseString;
+                                if ([lower containsString:@"更新"] || [lower containsString:@"升级"] ||
+                                    [lower containsString:@"版本"] || [lower containsString:@"update"] ||
+                                    [lower containsString:@"upgrade"] || [lower containsString:@"version"]) {
+                                    // 自动点击"暂不"或"取消"按钮
+                                    double delayInSeconds = 0.1;
+                                    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+                                    dispatch_after(popTime, dispatch_get_main_queue(), ^(void) {
+                                        @try {
+                                            NSArray *actions = [s valueForKey:@"actions"];
+                                            for (id action in actions) {
+                                                NSString *btnTitle = [action valueForKey:@"title"];
+                                                if (btnTitle) {
+                                                    NSString *bl = btnTitle.lowercaseString;
+                                                    if ([bl containsString:@"暂不"] || [bl containsString:@"以后"] ||
+                                                        [bl containsString:@"取消"] || [bl containsString:@"关闭"] ||
+                                                        [bl containsString:@"cancel"] || [bl containsString:@"later"] ||
+                                                        [bl containsString:@"skip"] || [bl containsString:@"close"]) {
+                                                        id block = [action valueForKey:@"__handler"];
+                                                        if (block) ((void(*)(id,id))block)(action, action);
+                                                        [s dismissViewControllerAnimated:YES completion:nil];
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            // 如果没有找到取消按钮，直接关闭
+                                            [s dismissViewControllerAnimated:YES completion:nil];
+                                        } @catch (id e2) {}
+                                    });
+                                }
+                            }
+                        } @catch (id e2) {}
+                    });
+                    class_replaceMethod(ac, @selector(viewDidLoad), newVM, method_getTypeEncoding(vmM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 5c. NSURLSession 响应拦截 — 修改服务器返回的更新指令 ----
+        @try {
+            Class tvc = objc_getClass("NSURLSessionTask");
+            if (tvc) {
+                // hook resume 来拦截完成后的回调
+                Method resumeM = class_getInstanceMethod(tvc, @selector(resume));
+                if (resumeM) {
+                    IMP origResume = method_getImplementation(resumeM);
+                    IMP newResume = imp_implementationWithBlock(^void(id s) {
+                        // 在 task 完成后检查响应
+                        __block id task = s;
+                        // 使用 KVC 获取 task 的 response
+                        @try {
+                            id resp = [task valueForKey:@"response"];
+                            if (resp && [resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)resp;
+                                NSDictionary *headers = [httpResp allHeaderFields];
+                                // 检查是否有更新指令的标记
+                                NSString *contentType = headers[@"Content-Type"];
+                                if (contentType && [contentType containsString:@"json"]) {
+                                    // 标记这个 task 需要检查 data
+                                }
+                            }
+                        } @catch (id e2) {}
+                        ((void (*)(id, SEL))origResume)(s, @selector(resume));
+                    });
+                    // 不替换 resume，避免引起问题
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 5d. NSDictionary objectForKey: — 拦截更新指令 ----
+        @try {
+            // 京东通过 API 返回 JSON 中包含 "code": 3 或 "needUpdate": true 等字段
+            // 直接 hook NSJSONSerialization 来修改解析结果
+            Class jsonClass = objc_getClass("NSJSONSerialization");
+            if (jsonClass) {
+                Method jwomM = class_getClassMethod(jsonClass, @selector(JSONObjectWithData:options:error:));
+                if (jwomM) {
+                    IMP origJW = method_getImplementation(jwomM);
+                    IMP newJW = imp_implementationWithBlock(^id(id cls, NSData *data, NSJSONReadingOptions opts, NSError **err) {
+                        id result = ((id (*)(id, SEL, NSData *, NSJSONReadingOptions, NSError **))origJW)(cls, @selector(JSONObjectWithData:options:error:), data, opts, err);
+                        if (result && [result isKindOfClass:objc_getClass("NSDictionary")]) {
+                            NSMutableDictionary *md = [(NSDictionary *)result mutableCopy];
+                            BOOL modified = NO;
+                            // 清除更新标记
+                            NSArray *updateKeys = @[@"needUpdate", @"forceUpdate", @"mustUpdate",
+                                @"need_update", @"force_update", @"hasUpdate",
+                @"hasNewVersion", @"isForceUpdate", @"code", @"status", @"updateType"];
+                            for (NSString *key in updateKeys) {
+                                if (md[key]) {
+                                    if ([key isEqualToString:@"code"] || [key isEqualToString:@"status"]) {
+                                        // code/status == 3 或 "1" 通常表示需要更新
+                                        id val = md[key];
+                                        if ([val isKindOfClass:objc_getClass("NSString")] && [val isEqualToString:@"3"]) {
+                                            md[key] = @"0"; modified = YES;
+                                        } else if ([val isKindOfClass:objc_getClass("NSNumber")] && [val intValue] == 3) {
+                                            md[key] = @0; modified = YES;
+                                        }
+                                    } else {
+                                        md[key] = @NO; modified = YES;
+                                    }
+                                }
+                            }
+                            if (modified) return md;
+                        }
+                        return result;
+                    });
+                    class_replaceMethod(jsonClass, @selector(JSONObjectWithData:options:error:), newJW, method_getTypeEncoding(jwomM));
                 }
             }
         } @catch (id e) {}
