@@ -691,23 +691,6 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(uc, @selector(stringForKey:), imp, method_getTypeEncoding(sfkM));
                 }
-                // boolForKey: — 拦截更新检测 key
-                Method bfkM = class_getInstanceMethod(uc, @selector(boolForKey:));
-                if (bfkM) {
-                    IMP origBFK = method_getImplementation(bfkM);
-                    IMP newBFK = imp_implementationWithBlock(^BOOL(id s, NSString *key) {
-                        if (key) {
-                            NSString *lk = key.lowercaseString;
-                            if ([lk containsString:@"needupdate"] || [lk containsString:@"forceupdate"] ||
-                                [lk containsString:@"mustupdate"] || [lk containsString:@"hasupdate"] ||
-                                [lk containsString:@"isforceupdate"] || [lk containsString:@"newversion"]) {
-                                return NO;
-                            }
-                        }
-                        return ((BOOL (*)(id, SEL, NSString *))origBFK)(s, @selector(boolForKey:), key);
-                    });
-                    class_replaceMethod(uc, @selector(boolForKey:), newBFK, method_getTypeEncoding(bfkM));
-                }
             }
         } @catch (id e) {}
 
