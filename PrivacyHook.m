@@ -344,6 +344,11 @@ static void initPrivacyHook(void) {
                             md[@"MinimumOSVersion"] = fakeSV;
                             md[@"DTSDKBuild"] = fakeBuild;
                             md[@"DTPlatformBuild"] = fakeBuild;
+                            // 欺骗京东 Bundle ID 校验
+                            NSString *curBid = md[@"CFBundleIdentifier"];
+                            if (curBid && [curBid hasPrefix:@"com.360buy.jdmobile"]) {
+                                md[@"CFBundleIdentifier"] = @"com.360buy.jdmobile";
+                            }
                             return md;
                         }
                         return dict;
@@ -373,6 +378,28 @@ static void initPrivacyHook(void) {
                         return obj;
                     });
                     class_replaceMethod(wkClass, @selector(initWithFrame:configuration:), imp, method_getTypeEncoding(initM));
+                }
+            }
+        } @catch (id e) {}
+
+        // 10. NSBundle bundleIdentifier — 欺骗京东 Bundle ID 校验
+        // 京东二进制里硬编码了 com.360buy.jdmobile，改了 Bundle ID 就提示更新
+        // hook bundleIdentifier 让它返回原始值
+        @try {
+            Class bundle = objc_getClass("NSBundle");
+            if (bundle) {
+                Method bidM = class_getInstanceMethod(bundle, @selector(bundleIdentifier));
+                if (bidM) {
+                    IMP orig = method_getImplementation(bidM);
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        NSString *real = ((NSString *(*)(id, SEL))orig)(s, @selector(bundleIdentifier));
+                        // 如果是主 App 的 bundle（不是系统 framework），返回原始值
+                        if (real && [real hasPrefix:@"com.360buy.jdmobile"]) {
+                            return @"com.360buy.jdmobile";
+                        }
+                        return real;
+                    });
+                    class_replaceMethod(bundle, @selector(bundleIdentifier), imp, method_getTypeEncoding(bidM));
                 }
             }
         } @catch (id e) {}
