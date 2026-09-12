@@ -660,7 +660,7 @@ static void initPrivacyHook(void) {
                 Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
                 if (svM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return @FAKE_OSVER;
+                        return [NSString stringWithUTF8String:FAKE_OSVER];
                     });
                     class_replaceMethod(dc, @selector(systemVersion), imp, method_getTypeEncoding(svM));
                 }
