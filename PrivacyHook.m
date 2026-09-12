@@ -28,7 +28,6 @@
 #import <AdSupport/AdSupport.h>
 #import <Security/Security.h>
 #import <WebKit/WebKit.h>
-#import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #include <sys/sysctl.h>
 #include <mach-o/dyld.h>
@@ -57,11 +56,32 @@ static __thread BOOL g_inMGHook = NO;
 typedef unsigned int io_registry_entry_t;
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, uint32_t) = NULL;
 
-// C 层 Cookie API（绕过 ObjC 层的百度 SDK 走这里）
+// ============ CFNetwork C 层 Cookie API ============
+// iOS SDK 未公开 CFHTTPCookie 头文件（仅 macOS 公开），手动声明类型，
+// 工具函数用 dlsym 运行时解析，hook 函数的 orig 指针由 fishhook 填充
+typedef struct OpaqueCFHTTPCookie *CFHTTPCookieRef;
+typedef struct OpaqueCFHTTPCookieStorage *CFHTTPCookieStorageRef;
+
+// hook 的原函数（fishhook rebind 后由 fishhook 填充真实地址）
 static void (*orig_CFHTTPCookieStorageSetCookie)(CFHTTPCookieStorageRef, CFHTTPCookieRef) = NULL;
 static void (*orig_CFHTTPCookieStorageSetCookies)(CFHTTPCookieStorageRef, CFArrayRef, CFURLRef) = NULL;
 static CFArrayRef (*orig_CFHTTPCookieStorageCopyCookiesForURL)(CFHTTPCookieStorageRef, CFURLRef, CFURLRef) = NULL;
 static CFArrayRef (*orig_CFHTTPCookieStorageCopyAllCookies)(CFHTTPCookieStorageRef) = NULL;
+
+// 工具函数（dlsym 运行时解析，避免链接依赖）
+static CFStringRef (*p_CFHTTPCookieCopyName)(CFHTTPCookieRef) = NULL;
+static CFDictionaryRef (*p_CFHTTPCookieCopyProperties)(CFHTTPCookieRef) = NULL;
+static CFHTTPCookieRef (*p_CFHTTPCookieCreateWithProperties)(CFAllocatorRef, CFDictionaryRef) = NULL;
+
+static void init_cf_cookie_syms(void) {
+    if (p_CFHTTPCookieCopyName) return;
+    void *h = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_LAZY);
+    if (!h) h = dlopen(NULL, RTLD_LAZY); // 兜底：在已加载镜像中查找
+    if (!h) return;
+    p_CFHTTPCookieCopyName = dlsym(h, "CFHTTPCookieCopyName");
+    p_CFHTTPCookieCopyProperties = dlsym(h, "CFHTTPCookieCopyProperties");
+    p_CFHTTPCookieCreateWithProperties = dlsym(h, "CFHTTPCookieCreateWithProperties");
+}
 
 // CFPreferences suite 域隔离（防 App Group 共享容器泄露设备指纹）
 static CFPropertyListRef (*orig_CFPreferencesCopyAppValue)(CFStringRef, CFStringRef) = NULL;
@@ -184,15 +204,17 @@ static CFTypeRef hook_IORegistryEntryCreateCFProperty(io_registry_entry_t entry,
 // ============================================================
 static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck) {
     if (!ck) return ck;
-    CFStringRef nm = CFHTTPCookieCopyName(ck);
+    init_cf_cookie_syms();
+    if (!p_CFHTTPCookieCopyName || !p_CFHTTPCookieCopyProperties || !p_CFHTTPCookieCreateWithProperties) return ck;
+    CFStringRef nm = p_CFHTTPCookieCopyName(ck);
     if (!nm) return ck;
     NSString *name = (__bridge_transfer NSString *)nm; // +1 transferred
     if (!isDeviceCookie(name)) return ck;              // 返回原引用（调用方判断相同则不 release）
-    CFDictionaryRef props = CFHTTPCookieCopyProperties(ck);
+    CFDictionaryRef props = p_CFHTTPCookieCopyProperties(ck);
     if (!props) return ck;
     NSMutableDictionary *md = [(__bridge_transfer NSDictionary *)props mutableCopy]; // +1 transferred
-    md[(__bridge id)kCFHTTPCookieValue] = getFakeID(name);
-    CFHTTPCookieRef nc = CFHTTPCookieCreateWithProperties(kCFAllocatorDefault, (__bridge CFDictionaryRef)md);
+    md[CFSTR("kCFHTTPCookieValue")] = getFakeID(name);  // kCFHTTPCookieValue 运行时值即该字符串
+    CFHTTPCookieRef nc = p_CFHTTPCookieCreateWithProperties(kCFAllocatorDefault, (__bridge CFDictionaryRef)md);
     return nc; // +1，调用方负责 release（若与原引用不同）
 }
 
