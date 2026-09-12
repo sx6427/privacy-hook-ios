@@ -437,17 +437,33 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 //              SP-engine/3.61.0 light/1.0(WKWebView) them...
 // v57N 目标: iPhone OS 17_6_1（与伪造系统版本一致）
 // ============================================================
+// ★★ v57Q 关键修正：UA 必须保留 baiduboxapp/<版本> 段 ★★
+//
+// 血泪教训：此前 UA 被改成
+//   Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15
+//   (KHTML, like Gecko) Mobile/15E148 SP-engine/3.61.0 light/1.0(WKWebView) themecolor/1.0
+// 里面**没有 baiduboxapp/ 段** —— 这个 UA 看起来是「WKWebView 网页」而非
+// 「百度 App 内请求」。百度活动类接口（含农场 se-act.baidu.com）依赖 UA 中的
+// baiduboxapp/ 识别 App 环境；缺失时服务端判定非 App 环境，返回
+// 「活动太火爆，请稍后再试」这类兜底提示。
+//
+// 真机（农场自动化工具实测）UA 形态：
+//   ... Mobile/15E148 SP-engine/3.58.0 main/1.0 baiduboxapp/15.63.0.10
+// 本 App 版本为 15.69.0.10，故 UA 中 baiduboxapp 版本必须与之一致。
 static NSString *buildFakeUserAgent(void) {
     return @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
-            "SP-engine/3.61.0 light/1.0(WKWebView) themecolor/1.0";
+            "SP-engine/3.61.0 main/1.0 baiduboxapp/15.69.0.10";
 }
 
-// 判断是否 UA（含 iPhone OS 特征）
+// 判定是否为「百度系 UA」——凡是百度 App/WebView 发出的 UA 都要整体替换为
+// 自洽的 App UA，避免只替换一部分造成同会话内 UA 不一致。
 static BOOL isUALike(NSString *s) {
     if (!s || s.length < 20) return NO;
     return [s rangeOfString:@"iPhone OS"].location != NSNotFound ||
-           [s rangeOfString:@"AppleWebKit"].location != NSNotFound;
+           [s rangeOfString:@"AppleWebKit"].location != NSNotFound ||
+           [s rangeOfString:@"baiduboxapp"].location != NSNotFound ||
+           [s rangeOfString:@"baidu"].location != NSNotFound;
 }
 
 // Cookie/设备标识生成（保持与真实格式一致）
@@ -546,11 +562,29 @@ static NSString *genFakeCookie(NSString *name) {
                 [uuid lowercaseString], genRandStr(8, @"abcdefghijklmnopqrstuvwxyz0123456789")];
     }
     // H_WISE_SIDS: 数字下划线串（版本特征，非唯一标识，用固定值即可）
-    // AFD_IP: 真机样本中携带真实公网IP
-    //   ★ 多实例同WiFi = 同出口IP → 百度聚类关联 → "下单人数过多"头号嫌疑
-    if ([name isEqualToString:@"AFD_IP"]) return @"";
-    // BAIDULOCNEW: __<loc>_<citycode>_<ts>_1 定位+时间戳，清空避免位置聚类
-    if ([name isEqualToString:@"BAIDULOCNEW"]) return @"";
+    //
+    // ★★ v57Q 修正：AFD_IP / BAIDULOCNEW 必须「原样放行」，不碰 ★★
+    //
+    // 依据 38 个真机账号 cookie 实测统计：
+    //   AFD_IP      出现 34/38，全部为真实公网 IP
+    //   BAIDULOCNEW 出现 34/38，格式统一 __100000_317_<13位毫秒时间戳>_1
+    //   其中 112.81.241.* 一个网段就有 28 个账号共用，且全部能正常进农场
+    //
+    // 由此确认两件事：
+    //   1) 百度不校验 AFD_IP 与真实出口 IP 是否一致
+    //   2) 百度不在乎多账号共用同一 IP（同 IP 是常态）
+    //
+    // 因此此前"清空 AFD_IP 防聚类"是无根据的，清除后反而让字段变为空值，
+    // 而正常 App 从不写入空值 —— "存在但为空"本身就是篡改特征。
+    // 生成假 IP 同样错误（会与真实出口 IP 矛盾，凭空制造不一致）。
+    //
+    // 正确处理：这两个字段不进入 isDeviceCookie 名单，本函数不会被调用，
+    // 由 App 自行写入真实值。此处保留分支仅为显式文档化该决策。
+    if ([name isEqualToString:@"AFD_IP"] || [name isEqualToString:@"BAIDULOCNEW"]) {
+        // 不应到达此处（不在 isDeviceCookie 名单内）。若到达则原值无法获取，
+        // 返回空串并依赖上层跳过改写。
+        return @"";
+    }
     return genRandStr(32, cuidCS);
 }
 
@@ -971,6 +1005,87 @@ static void initPrivacyHook(void) {
                         ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), value, field);
                     });
                     class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 6b. WKWebView hooks — UA 注入（v57Q 新增，农场关键） ----
+        //
+        // ★★ 这是「活动太火爆，请稍后再试」的真正根因 ★★
+        //
+        // 百度农场（se-act.baidu.com）是**跑在 WKWebView 里的 H5 页面**，
+        // 不是原生 API 调用。WKWebView 发出的网络请求**完全绕过**
+        // NSMutableURLRequest.setValue:forHTTPHeaderField: —— 也就是说
+        // 上面第 6 节写的 UA hook 对农场页面**一次都不会触发**。
+        //
+        // 结果：农场页面带着 WKWebView 默认 UA 访问服务端，该 UA 里没有
+        // baiduboxapp/ 段 → 服务端判定"非百度 App 环境" → 返回兜底文案
+        // 「活动太火爆，请稍后再试」。
+        //
+        // 这正是此前 UA 里出现 light/1.0(WKWebView) 的来源：我们看到的
+        // 就是 WKWebView 的原生 UA，我们的替换根本没生效。
+        //
+        // 正确做法（三条路都要堵）：
+        //   a) WKWebView.customUserAgent          —— iOS 9+
+        //   b) WKWebViewConfiguration.applicationNameForUserAgent —— 追加段
+        //   c) 全局兜底：hook WKWebView 的 initWithFrame:configuration: 与
+        //      setCustomUserAgent:，以及 WKWebViewConfiguration 的
+        //      setApplicationNameForUserAgent:
+        @try {
+            Class wkCfg = objc_getClass("WKWebViewConfiguration");
+            if (wkCfg) {
+                Method setAppNameM = class_getInstanceMethod(wkCfg, @selector(setApplicationNameForUserAgent:));
+                if (setAppNameM) {
+                    IMP origSAN = method_getImplementation(setAppNameM);
+                    IMP newSAN = imp_implementationWithBlock(^void(id s, NSString *name) {
+                        // 只保留 baiduboxapp 段，避免与他人重复叠加
+                        ((void (*)(id, SEL, NSString *))origSAN)(s, @selector(setApplicationNameForUserAgent:), @"baiduboxapp/15.69.0.10");
+                    });
+                    class_replaceMethod(wkCfg, @selector(setApplicationNameForUserAgent:), newSAN, method_getTypeEncoding(setAppNameM));
+                }
+            }
+        } @catch (id e) {}
+
+        @try {
+            Class wkView = objc_getClass("WKWebView");
+            if (wkView) {
+                // c1) 读取侧：getter 永远返回完整 App UA
+                Method getUAM = class_getInstanceMethod(wkView, @selector(customUserAgent));
+                if (getUAM) {
+                    IMP origGUA = method_getImplementation(getUAM);
+                    IMP newGUA = imp_implementationWithBlock(^NSString *(id s) {
+                        return buildFakeUserAgent();
+                    });
+                    class_replaceMethod(wkView, @selector(customUserAgent), newGUA, method_getTypeEncoding(getUAM));
+                }
+                // c2) 写入侧：吞掉任何试图覆盖的 UA，强制为 App UA
+                Method setUAM = class_getInstanceMethod(wkView, @selector(setCustomUserAgent:));
+                if (setUAM) {
+                    IMP origSUA = method_getImplementation(setUAM);
+                    IMP newSUA = imp_implementationWithBlock(^void(id s, NSString *ua) {
+                        ((void (*)(id, SEL, NSString *))origSUA)(s, @selector(setCustomUserAgent:), buildFakeUserAgent());
+                    });
+                    class_replaceMethod(wkView, @selector(setCustomUserAgent:), newSUA, method_getTypeEncoding(setUAM));
+                }
+                // c3) 构造侧：任何新建 WKWebView 都强制带上 App UA
+                Method initM = class_getInstanceMethod(wkView, @selector(initWithFrame:configuration:));
+                if (initM) {
+                    IMP origInit = method_getImplementation(initM);
+                    IMP newInit = imp_implementationWithBlock(^id(id s, CGRect frame, id config) {
+                        @try {
+                            if (config && [config respondsToSelector:@selector(setApplicationNameForUserAgent:)]) {
+                                [config setApplicationNameForUserAgent:@"baiduboxapp/15.69.0.10"];
+                            }
+                        } @catch (id e) {}
+                        id inst = ((id (*)(id, SEL, CGRect, id))origInit)(s, @selector(initWithFrame:configuration:), frame, config);
+                        @try {
+                            if (inst && [inst respondsToSelector:@selector(setCustomUserAgent:)]) {
+                                [inst setCustomUserAgent:buildFakeUserAgent()];
+                            }
+                        } @catch (id e) {}
+                        return inst;
+                    });
+                    class_replaceMethod(wkView, @selector(initWithFrame:configuration:), newInit, method_getTypeEncoding(initM));
                 }
             }
         } @catch (id e) {}
