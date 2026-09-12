@@ -361,47 +361,44 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 
 // ============================================================
 // Cookie/设备标识生成（保持与真实格式一致）
+//
+// ★ v57M 关键修复：CUID 必须是真 base64url(随机50字节) + "mA"
+//   真机样本: giHau0iA-uj6iHilluvqi_uuSigpu2i0giSLi_ucSf_4i2uhji2Pf085HOpukHMuh18mA
+//   = base64url(50字节) 67字符 + "mA" 2字符 = 69字符
+//   v57L 用逐字符随机 → 虽字面像 base64 但解码非法 → 百度校验即识破
 // ============================================================
-static NSString *genCUID(void) {
-    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 61; i++) {
-        uint32_t r = arc4random_uniform(100);
-        if (r < 5) {
-            [s appendString:@"_"];
-        } else if (r < 8) {
-            [s appendString:@"-"];
-        } else {
-            [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-        }
-    }
-    [s appendString:@"mA"];
+static NSString *b64urlEncode(NSData *data) {
+    NSString *s = [data base64EncodedStringWithOptions:0];
+    s = [s stringByReplacingOccurrencesOfString:@"+" withString:@"-"];
+    s = [s stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    // 去掉 padding（真机样本无 '='）
+    while ([s hasSuffix:@"="]) s = [s substringToIndex:s.length - 1];
     return s;
 }
 
+static NSString *genCUID(void) {
+    // 真机结构: base64url(50字节随机) + "mA"
+    NSMutableData *raw = [NSMutableData dataWithLength:50];
+    arc4random_buf([raw mutableBytes], 50);
+    return [NSString stringWithFormat:@"%@mA", b64urlEncode(raw)];
+}
+
 static NSString *genBAIDUID(void) {
+    // 真机: 32位大写HEX + ":FG=1"  (例: 5A258432900A32B53931CFE922A7AF51:FG=1)
     NSString *hexCS = @"0123456789ABCDEF";
     return [genRandStr(32, hexCS) stringByAppendingString:@":FG=1"];
 }
 
 static NSString *genTcuid(void) {
+    // tcuid: 48位大写HEX（保持十六进制）
     NSString *hexCS = @"0123456789ABCDEF";
-    NSString *extraCS = @"ABCDEFGHIJ";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 48; i++) {
-        uint32_t r = arc4random_uniform(100);
-        if (r < 15) {
-            [s appendFormat:@"%C", [extraCS characterAtIndex:arc4random_uniform((uint32_t)extraCS.length)]];
-        } else {
-            [s appendFormat:@"%C", [hexCS characterAtIndex:arc4random_uniform((uint32_t)hexCS.length)]];
-        }
-    }
-    return s;
+    return genRandStr(48, hexCS);
 }
 
 static NSString *genFakeCookie(NSString *name) {
     NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
     NSString *hexCS = @"0123456789abcdef";
+    NSString *upperHexCS = @"0123456789ABCDEF";
 
     if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
         return genCUID();
@@ -417,7 +414,40 @@ static NSString *genFakeCookie(NSString *name) {
     }
     if ([name isEqualToString:@"tcuid"]) return genTcuid();
     if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
-    if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
+
+    // ---- v57M 新增：真机样本中实际存在的设备/环境标识 ----
+    // BDB2BVID: 32位hex 设备ID
+    if ([name isEqualToString:@"BDB2BVID"]) return genRandStr(32, hexCS);
+    // ab_bid: 广告设备ID，40位hex（真机 0a40fcce...4d40 = 40字符）
+    if ([name isEqualToString:@"ab_bid"]) return genRandStr(40, hexCS);
+    // ab_jid / ab_jid_BFESS: 40位hex（真机 bc8e8270...0a40）
+    if ([name hasPrefix:@"ab_jid"]) return getFakeID(@"ab_jid");
+    // BA_HECTOR: 真机 848120240la12g8h810g04242ha1a41l73rr429 (35字符，数字+字母混合)
+    if ([name isEqualToString:@"BA_HECTOR"]) return genRandStr(35, @"abcdefghijklmnopqrstuvwxyz0123456789");
+    // BAIDU_WISE_UID: wapp_<13位时间戳>_<3位随机>
+    if ([name isEqualToString:@"BAIDU_WISE_UID"]) {
+        NSTimeInterval ts = [[NSDate date] timeIntervalSince1970] * 1000;
+        return [NSString stringWithFormat:@"wapp_%.0f_%u", ts, arc4random_uniform(1000)];
+    }
+    // ZFY: 真机 carCl1WCG0JXAY:Bb7F4:AobXjhVWSBtT7AemD91AW0z0:C (段用冒号分隔)
+    if ([name isEqualToString:@"ZFY"]) {
+        NSString *cs2 = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        return [NSString stringWithFormat:@"%@:%@:%@:C",
+                genRandStr(14, cs2), genRandStr(5, cs2), genRandStr(28, cs2)];
+    }
+    // RT: "z=1&dm=baidu.com&si=<uuid>&ss=<8位>&sl=1&tt=um&bcn=..."
+    if ([name isEqualToString:@"RT"]) {
+        NSString *uuid = [[NSUUID UUID] UUIDString];
+        return [NSString stringWithFormat:@"\"z=1&dm=baidu.com&si=%@&ss=%@&sl=1&tt=um\"",
+                [uuid lowercaseString], genRandStr(8, @"abcdefghijklmnopqrstuvwxyz0123456789")];
+    }
+    // H_WISE_SIDS: 数字下划线串（版本特征，非唯一标识，用固定值即可）
+    // AFD_IP: 真机样本中携带真实公网IP（112.81.188.205）
+    //   ★ 多实例同WiFi = 同出口IP → 百度聚类关联 → "下单人数过多"头号嫌疑
+    //   此处清除（交由网络层/代理隔离，见 v57M 部署说明）
+    if ([name isEqualToString:@"AFD_IP"]) return @"";
+    // BAIDULOCNEW: __<loc>_<citycode>_<ts>_1 定位+时间戳，清空避免位置聚类
+    if ([name isEqualToString:@"BAIDULOCNEW"]) return @"";
     return genRandStr(32, cuidCS);
 }
 
@@ -433,7 +463,11 @@ static BOOL isDeviceCookie(NSString *cookieName) {
     NSString *lk = [cookieName lowercaseString];
     NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
                        @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid",
-                       @"baiduid", @"baiduid_bfess"];
+                       @"baiduid", @"baiduid_bfess",
+                       // v57M 新增（真机样本确认存在）
+                       @"bdb2bvid", @"ab_bid", @"ab_jid", @"ab_jid_bfess",
+                       @"ba_hector", @"zfy", @"rt",
+                       @"bdusid", @"bduss_bfess"];
     for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
