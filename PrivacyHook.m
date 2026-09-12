@@ -450,10 +450,30 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 // 真机（农场自动化工具实测）UA 形态：
 //   ... Mobile/15E148 SP-engine/3.58.0 main/1.0 baiduboxapp/15.63.0.10
 // 本 App 版本为 15.69.0.10，故 UA 中 baiduboxapp 版本必须与之一致。
+//
+// ★ 关于 WKWebView 的三种 UA 设置方式与优先级（务必记牢）：
+//
+//   customUserAgent  >  NSUserDefaults["UserAgent"]  >  applicationNameForUserAgent
+//
+//   优先级高的生效时，低的**被完全忽略**（不是拼接）。
+//   其中只有 applicationNameForUserAgent 是「追加到默认 UA 后面」，
+//   另两种是「整体替换」。
+//
+//   因此本 hook 的设计：
+//     - 三条路全部覆盖，且**全部设成同一个完整 UA**（含 baiduboxapp 段）
+//     - 这样无论 App 走哪条路、无论哪个生效，最终 UA 都正确
+//     - 因为生效的只有一条，不存在「两段 baiduboxapp 重复」的问题
+//
+//   注意 applicationNameForUserAgent 是「追加」语义：若只靠它，
+//   它追加到的默认 UA 里没有 baiduboxapp，结果仍缺该段 —— 所以
+//   必须再配合 customUserAgent（优先级更高，整体替换）双保险。
+#define FAKE_APP_UA_FULL  @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) " \
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 " \
+                          "SP-engine/3.61.0 main/1.0 baiduboxapp/15.69.0.10"
+
+// 完整 UA（含 baiduboxapp 段）
 static NSString *buildFakeUserAgent(void) {
-    return @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
-            "SP-engine/3.61.0 main/1.0 baiduboxapp/15.69.0.10";
+    return FAKE_APP_UA_FULL;
 }
 
 // 判定是否为「百度系 UA」——凡是百度 App/WebView 发出的 UA 都要整体替换为
@@ -1025,12 +1045,15 @@ static void initPrivacyHook(void) {
         // 这正是此前 UA 里出现 light/1.0(WKWebView) 的来源：我们看到的
         // 就是 WKWebView 的原生 UA，我们的替换根本没生效。
         //
-        // 正确做法（三条路都要堵）：
-        //   a) WKWebView.customUserAgent          —— iOS 9+
-        //   b) WKWebViewConfiguration.applicationNameForUserAgent —— 追加段
-        //   c) 全局兜底：hook WKWebView 的 initWithFrame:configuration: 与
-        //      setCustomUserAgent:，以及 WKWebViewConfiguration 的
-        //      setApplicationNameForUserAgent:
+        // 正确做法：三条路**全部**设成同一个完整 UA（含 baiduboxapp 段）。
+        //
+        //   优先级：customUserAgent > NSUserDefaults > applicationNameForUserAgent
+        //   生效的只有一条，其余被忽略 —— 所以三条都填同一个完整 UA 是安全的，
+        //   不会产生重复段，同时保证「无论 App 走哪条路」结果都正确。
+        //
+        //   为什么必须带 customUserAgent：applicationNameForUserAgent 是
+        //   「追加到默认 UA」语义，而默认 UA 里没有 baiduboxapp；只设它不够。
+        //   customUserAgent 是「整体替换」语义，优先级最高，才是主力手段。
         @try {
             Class wkCfg = objc_getClass("WKWebViewConfiguration");
             if (wkCfg) {
@@ -1038,8 +1061,7 @@ static void initPrivacyHook(void) {
                 if (setAppNameM) {
                     IMP origSAN = method_getImplementation(setAppNameM);
                     IMP newSAN = imp_implementationWithBlock(^void(id s, NSString *name) {
-                        // 只保留 baiduboxapp 段，避免与他人重复叠加
-                        ((void (*)(id, SEL, NSString *))origSAN)(s, @selector(setApplicationNameForUserAgent:), @"baiduboxapp/15.69.0.10");
+                        ((void (*)(id, SEL, NSString *))origSAN)(s, @selector(setApplicationNameForUserAgent:), FAKE_APP_UA_FULL);
                     });
                     class_replaceMethod(wkCfg, @selector(setApplicationNameForUserAgent:), newSAN, method_getTypeEncoding(setAppNameM));
                 }
@@ -1052,13 +1074,12 @@ static void initPrivacyHook(void) {
                 // c1) 读取侧：getter 永远返回完整 App UA
                 Method getUAM = class_getInstanceMethod(wkView, @selector(customUserAgent));
                 if (getUAM) {
-                    IMP origGUA = method_getImplementation(getUAM);
                     IMP newGUA = imp_implementationWithBlock(^NSString *(id s) {
                         return buildFakeUserAgent();
                     });
                     class_replaceMethod(wkView, @selector(customUserAgent), newGUA, method_getTypeEncoding(getUAM));
                 }
-                // c2) 写入侧：吞掉任何试图覆盖的 UA，强制为 App UA
+                // c2) 写入侧：吞掉任何试图覆盖的 UA，强制为完整 App UA
                 Method setUAM = class_getInstanceMethod(wkView, @selector(setCustomUserAgent:));
                 if (setUAM) {
                     IMP origSUA = method_getImplementation(setUAM);
@@ -1067,14 +1088,14 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(wkView, @selector(setCustomUserAgent:), newSUA, method_getTypeEncoding(setUAM));
                 }
-                // c3) 构造侧：任何新建 WKWebView 都强制带上 App UA
+                // c3) 构造侧：任何新建 WKWebView 都强制带上完整 App UA
                 Method initM = class_getInstanceMethod(wkView, @selector(initWithFrame:configuration:));
                 if (initM) {
                     IMP origInit = method_getImplementation(initM);
                     IMP newInit = imp_implementationWithBlock(^id(id s, CGRect frame, id config) {
                         @try {
                             if (config && [config respondsToSelector:@selector(setApplicationNameForUserAgent:)]) {
-                                [config setApplicationNameForUserAgent:@"baiduboxapp/15.69.0.10"];
+                                [config setApplicationNameForUserAgent:FAKE_APP_UA_FULL];
                             }
                         } @catch (id e) {}
                         id inst = ((id (*)(id, SEL, CGRect, id))origInit)(s, @selector(initWithFrame:configuration:), frame, config);
@@ -1087,6 +1108,10 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(wkView, @selector(initWithFrame:configuration:), newInit, method_getTypeEncoding(initM));
                 }
+
+                // 补充：NSUserDefaults["UserAgent"] 是另一种较低优先级的设置方式，
+                // 优先级低于 customUserAgent。由于我们已将 customUserAgent 全路径
+                // 强制为完整 App UA，该方法即使被调用也不会生效，无需额外 hook。
             }
         } @catch (id e) {}
 
