@@ -1,21 +1,22 @@
 //
-// PrivacyHook.m — v57L: 真实硬件人格 + 只伪装唯一标识符
+// PrivacyHook.m — v57N: 全套伪造硬件人格（内部自洽）
 //
-// ============ v57L 设计原理（检测根因修复） ============
+// ============ v57N 设计原理（v57L 策略修正） ============
 //
-// v57k 被检测的根因不是"伪装得不够多"，而是"伪装人格自相矛盾"：
-//   1. 机型↔屏幕矛盾：随机伪装 iPhone13,2(4.7寸)，但 UIScreen 分辨率是真机 → 交叉比对识破
-//   2. WKWebView 默认 UA 非空 → WebView 请求带真实 iOS 版本，native 请求报假版本
-//   3. MGCopyAnswer 只挡 7 个 obfuscated key，EffectiveProductType/UniqueChipID 等漏真值
-//   4. C 层 CFHTTPCookieStorage 直接调用可绕过 ObjC NSHTTPCookieStorage swizzle
+// v57L 失败教训：
+//   v57L 保留真机真实机型/系统，只伪装唯一标识。
+//   但实测发现：同一台手机上"官方原版百度App下单也被限制"，
+//   证明这台机器的真实指纹本身已在百度黑名单中。
+//   → v57L 等于主动上报被拉黑的身份，必死。
 //
-// v57L 策略反转：
-//   - 硬件人格 = 真机真实值（机型/系统版本/屏幕/内存/运营商全部真实，永不矛盾）
-//   - 只伪装"每台设备唯一"的标识符：
-//       UDID / 序列号 / ECID / IOPlatformUUID / 设备名 / IDFA / IDFV / CUID / Cookie设备ID
-//   - 30 个克隆 = 30 台同型号同系统、ID 各异的 iPhone → 无任何可交叉验证的矛盾点
+// v57N 策略：彻底伪造一套全新且自洽的硬件人格
+//   - 机型/系统版本/屏幕/状态栏/UA 全部指向同一个伪造目标
+//   - 目标机型参照真机流量样本: ua=1284_2778_iphone (Pro Max 灵动岛)
+//   - 关键：所有子系统读到的值必须互相印证，不能有矛盾
+//     (v57k 失败正是因为 假机型4.7寸 ↔ 真屏幕6.7寸 矛盾)
 //
-// 注意：v57L 对"老账号"会造成指纹跳变（旧版本曾上报随机机型），建议用全新实例/新账号测试。
+// ⚠ 前提：本方案假设设备真实指纹已被标记。
+//   长期方案仍是换一台干净设备 + 全新账号。
 //
 // 保留教训（不重蹈覆辙）：
 //   不 hook sysctl() 旧 API（闪退）；不 hook setURL:/setHTTPBody:（签名错误）；
@@ -32,6 +33,7 @@
 #include <sys/sysctl.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
+#include <string.h>
 #include "fishhook.h"
 
 #define NSLog(...)
@@ -40,11 +42,17 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// 真机真实硬件值（constructor 最开始、hook 安装前缓存）
-// v57L: 这些值全部保持真实，绝不伪装 —— 保证人格一致性
+// ★ 伪造硬件人格（v57N 核心）
+// 目标: iPhone 14 Pro Max (iPhone15,3) — 与真机样本 1284x2778 一致
+// 所有值必须自洽：机型 ↔ 屏幕分辨率 ↔ 状态栏高度 ↔ UA
 // ============================================================
-static char g_realMachine[64] = "";
-static char g_realOSVersion[32] = "";
+static const char *FAKE_MACHINE   = "iPhone15,3";        // 14 Pro Max
+static const char *FAKE_OSVER     = "17.6.1";            // 系统版本
+static const char *FAKE_DARWIN    = "23.6.0";            // 对应 Darwin 内核版本
+static const char *FAKE_PRODUCT   = "iPhone15,3";
+static const char *FAKE_MODELNUM  = "MQ9G3CH/A";         // 14 Pro Max 国行型号
+static const char *FAKE_UA_SUFFIX = "iPhone OS 17_6_1";  // UA 中的系统版本
+static const uint64_t FAKE_MEMSIZE = 6ULL * 1024 * 1024 * 1024; // 6GB
 
 // ============================================================
 // fishhook 原函数指针
@@ -115,21 +123,57 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
 }
 
 // ============================================================
-// sysctlbyname hook — v57L 只清空序列号/UUID（应用本来也读不到）
-// 其余全部放行真实值（机型/内存/系统版本真实 → 人格一致）
+// sysctlbyname hook — v57N 返回伪造人格（自洽的 Pro Max）
+// 关键：机型/内存/系统版本全套替换，不混用真值（避免矛盾）
 // 纯 C 实现，ZERO ObjC 调用
 // ============================================================
-static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (name && (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.uuid") == 0)) {
-        if (oldlenp) {
-            if (oldp && *oldlenp >= 1) {
-                ((char *)oldp)[0] = '\0';
-                *oldlenp = 1;
-            } else {
-                *oldlenp = 1;
-            }
+// 辅助：把 C 字符串写入 sysctl 输出缓冲（ZERO ObjC 调用）
+static int hook_return_cstr(const char *val, void *oldp, size_t *oldlenp) {
+    size_t need = strlen(val) + 1;
+    if (oldlenp) {
+        if (oldp && *oldlenp >= need) {
+            memcpy(oldp, val, need);
         }
-        return 0;
+        *oldlenp = need;
+    }
+    return 0;
+}
+
+static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (name) {
+        // 机型标识
+        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0 ||
+            strcmp(name, "hw.product") == 0 || strcmp(name, "hw.target") == 0) {
+            return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
+        }
+        // 系统版本
+        if (strcmp(name, "kern.osproductversion") == 0) {
+            return hook_return_cstr(FAKE_OSVER, oldp, oldlenp);
+        }
+        if (strcmp(name, "kern.osversion") == 0) {
+            return hook_return_cstr("21G93", oldp, oldlenp);   // 17.6.1 build
+        }
+        if (strcmp(name, "kern.osrelease") == 0) {
+            return hook_return_cstr(FAKE_DARWIN, oldp, oldlenp);
+        }
+        // 内存
+        if (strcmp(name, "hw.memsize") == 0) {
+            if (oldp && oldlenp && *oldlenp >= sizeof(uint64_t)) {
+                *(uint64_t *)oldp = FAKE_MEMSIZE;
+                *oldlenp = sizeof(uint64_t);
+            } else if (oldlenp) {
+                *oldlenp = sizeof(uint64_t);
+            }
+            return 0;
+        }
+        // 序列号/UUID 清空（应用本来无权限，返回空不算异常）
+        if (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.uuid") == 0) {
+            return hook_return_cstr("", oldp, oldlenp);
+        }
+        // CPU 型号（A16 对应 t8120, 14 Pro 系列）
+        if (strcmp(name, "hw.cputype") == 0) {
+            // 保持真实（arm64 都一样）
+        }
     }
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
@@ -174,11 +218,35 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)n;
         }
+        // ---- v57N 新增：硬件人格 key 也要伪造，与 sysctl 保持一致 ----
+        // ProductType / hw.machine（"iPhone15,3"）
+        if (CFStringCompare(key, CFSTR("h9jDsbgj7xIugkIB2RVp1cKoVBOyBj8r"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR("iPhone15,3"));
+        }
+        // ModelNumber（"MQ9G3CH/A"）
+        if (CFStringCompare(key, CFSTR("ModelNumber"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR("MQ9G3CH/A"));
+        }
+        // ProductVersion / 系统版本（"17.6.1"）
+        if (CFStringCompare(key, CFSTR("ProductVersion"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("kCFSystemVersionProductVersionKey"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR("17.6.1"));
+        }
+        // BuildVersion（"21G93"）
+        if (CFStringCompare(key, CFSTR("BuildVersion"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("ProductBuildVersion"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR("21G93"));
+        }
+        // 地区码保持 CN（真机国行）
         g_inMGHook = NO;
     } @catch (id e) {
         g_inMGHook = NO;
     }
-    // 其余 key（hw-machine/ProductVersion/ModelNumber/RegionCode 等）→ 真实值放行
     return orig_MGCopyAnswer(key, options);
 }
 
@@ -360,6 +428,26 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 }
 
 // ============================================================
+// ============================================================
+// UA 伪装 — v57N 必须替换（否则 UA 泄露真系统版本，与假机型矛盾）
+// 真机样本 UA: Mozilla/5.0 (iPhone; CPU iPhone OS 16_1 like Mac OS X)
+//              AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148
+//              SP-engine/3.61.0 light/1.0(WKWebView) them...
+// v57N 目标: iPhone OS 17_6_1（与伪造系统版本一致）
+// ============================================================
+static NSString *buildFakeUserAgent(void) {
+    return @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+            "SP-engine/3.61.0 light/1.0(WKWebView) themecolor/1.0";
+}
+
+// 判断是否 UA（含 iPhone OS 特征）
+static BOOL isUALike(NSString *s) {
+    if (!s || s.length < 20) return NO;
+    return [s rangeOfString:@"iPhone OS"].location != NSNotFound ||
+           [s rangeOfString:@"AppleWebKit"].location != NSNotFound;
+}
+
 // Cookie/设备标识生成（保持与真实格式一致）
 //
 // ★ v57M 关键修复：CUID 必须是真 base64url(随机50字节) + "mA"
@@ -512,17 +600,11 @@ static BOOL isDeviceKey(NSString *key) {
 }
 
 // ============================================================
-// Constructor — v57L
+// Constructor — v57N
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
-
-        // ---- 0. 安装 hook 前缓存真机真实值（人格基线） ----
-        size_t sz = sizeof(g_realMachine);
-        sysctlbyname("hw.machine", g_realMachine, &sz, NULL, 0);
-        sz = sizeof(g_realOSVersion);
-        sysctlbyname("kern.osproductversion", g_realOSVersion, &sz, NULL, 0);
 
         // ---- 1. v57 简单清理：Cookie storage + Keychain（仅首次） ----
         @try {
@@ -545,7 +627,7 @@ static void initPrivacyHook(void) {
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         }
 
-        // ---- 2. UIDevice hooks — 只伪装 设备名 + IDFV（型号/系统版本保持真实） ----
+        // ---- 2. UIDevice hooks — v57N 全套人格对齐（Pro Max 自洽） ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
@@ -562,6 +644,58 @@ static void initPrivacyHook(void) {
                         return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdD1.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
+                }
+                // 型号字串 — 必须与 sysctl hw.machine 一致
+                for (NSString *sel in @[@"model", @"localizedModel"]) {
+                    SEL sl = NSSelectorFromString(sel);
+                    Method m = class_getInstanceMethod(dc, sl);
+                    if (m) {
+                        IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                            return @"iPhone";
+                        });
+                        class_replaceMethod(dc, sl, imp, method_getTypeEncoding(m));
+                    }
+                }
+                // 系统版本 — 必须与 sysctl kern.osproductversion 一致
+                Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
+                if (svM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return @FAKE_OSVER;
+                    });
+                    class_replaceMethod(dc, @selector(systemVersion), imp, method_getTypeEncoding(svM));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 2b. UIScreen hooks — 屏幕分辨率对齐 Pro Max (1284x2778@3x) ----
+        // ★ 这是 v57k 失败的根因：假机型 ↔ 真屏幕尺寸矛盾
+        //   改为整套对齐，百度 ua=1284_2778_iphone 参数才能自洽
+        @try {
+            Class sc = objc_getClass("UIScreen");
+            if (sc) {
+                Method bM = class_getInstanceMethod(sc, @selector(bounds));
+                if (bM) {
+                    IMP imp = imp_implementationWithBlock(^CGRect(id s) {
+                        return CGRectMake(0, 0, 430, 932);   // 14 Pro Max 逻辑尺寸
+                    });
+                    class_replaceMethod(sc, @selector(bounds), imp, method_getTypeEncoding(bM));
+                }
+                Method nsM = class_getInstanceMethod(sc, @selector(nativeBounds));
+                if (nsM) {
+                    IMP imp = imp_implementationWithBlock(^CGRect(id s) {
+                        return CGRectMake(0, 0, 1284, 2778); // 14 Pro Max 物理分辨率
+                    });
+                    class_replaceMethod(sc, @selector(nativeBounds), imp, method_getTypeEncoding(nsM));
+                }
+                Method nsS = class_getInstanceMethod(sc, @selector(nativeScale));
+                if (nsS) {
+                    IMP imp = imp_implementationWithBlock(^CGFloat(id s) { return 3.0; });
+                    class_replaceMethod(sc, @selector(nativeScale), imp, method_getTypeEncoding(nsS));
+                }
+                Method sM = class_getInstanceMethod(sc, @selector(scale));
+                if (sM) {
+                    IMP imp = imp_implementationWithBlock(^CGFloat(id s) { return 3.0; });
+                    class_replaceMethod(sc, @selector(scale), imp, method_getTypeEncoding(sM));
                 }
             }
         } @catch (id e) {}
@@ -691,8 +825,8 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 6. NSMutableURLRequest hooks — 只替换 Cookie header ----
-        // v57L: UA 不再替换（真实 UA 与真实系统版本一致，替换反而制造矛盾）
+        // ---- 6. NSMutableURLRequest hooks — Cookie + UA 替换 ----
+        // v57N: UA 必须替换（否则泄露真系统版本，与伪造机型矛盾）
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
@@ -700,6 +834,12 @@ static void initPrivacyHook(void) {
                 if (svM) {
                     IMP origSV = method_getImplementation(svM);
                     IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        // UA 替换
+                        if (value && field && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame
+                            && isUALike(value)) {
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), buildFakeUserAgent(), field);
+                            return;
+                        }
                         if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
                             NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                                                @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -731,6 +871,11 @@ static void initPrivacyHook(void) {
                 if (addValM) {
                     IMP origAddVal = method_getImplementation(addValM);
                     IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (value && field && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame
+                            && isUALike(value)) {
+                            ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), buildFakeUserAgent(), field);
+                            return;
+                        }
                         if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
                             NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                                                @"DVIF", @"tcuid", @"__bid_n", @"fuid",
