@@ -213,7 +213,7 @@ static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck) {
     CFDictionaryRef props = p_CFHTTPCookieCopyProperties(ck);
     if (!props) return ck;
     NSMutableDictionary *md = [(__bridge_transfer NSDictionary *)props mutableCopy]; // +1 transferred
-    md[CFSTR("kCFHTTPCookieValue")] = getFakeID(name);  // kCFHTTPCookieValue 运行时值即该字符串
+    md[@"kCFHTTPCookieValue"] = getFakeID(name);  // kCFHTTPCookieValue 运行时值即该字符串
     CFHTTPCookieRef nc = p_CFHTTPCookieCreateWithProperties(kCFAllocatorDefault, (__bridge CFDictionaryRef)md);
     return nc; // +1，调用方负责 release（若与原引用不同）
 }
