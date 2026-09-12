@@ -102,6 +102,8 @@ static NSString *genUUIDStr(void);
 static NSString *genDeviceName(void);
 static NSString *getFakeID(NSString *name);
 static BOOL isDeviceCookie(NSString *cookieName);
+static NSString *canonicalCookieKey(NSString *name);
+static BOOL isSessionCookie(NSString *cookieName);
 
 // ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
@@ -488,12 +490,30 @@ static NSString *genFakeCookie(NSString *name) {
     NSString *hexCS = @"0123456789abcdef";
     NSString *upperHexCS = @"0123456789ABCDEF";
 
-    if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
+    // ★ v57P：先按「身份族」归一化，保证同族 cookie 拿到同一个值
+    NSString *fam = canonicalCookieKey(name);
+
+    // —— CUID 族：BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid 全部同值 ——
+    if ([fam isEqualToString:@"CUID_FAMILY"])
         return genCUID();
-    if ([name isEqualToString:@"BAIDUID"])
+
+    // —— BAIDUID 族 ——
+    if ([fam isEqualToString:@"BAIDUID_FAMILY"])
         return genBAIDUID();
-    if ([name isEqualToString:@"BAIDUID_BFESS"])
-        return getFakeID(@"BAIDUID");
+
+    // —— fuid 族 ——
+    if ([fam isEqualToString:@"FUID_FAMILY"])
+        return genRandStr(32, hexCS);
+
+    // —— ab_jid 族 ——
+    if ([fam isEqualToString:@"AB_JID_FAMILY"])
+        return genRandStr(40, hexCS);
+
+    // —— ab_bid 族 ——
+    if ([fam isEqualToString:@"AB_BID_FAMILY"])
+        return genRandStr(40, hexCS);
+
+    // —— 以下为各自独立的标识，不共享 ——
     if ([name isEqualToString:@"DVIF"]) {
         NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)((uint64_t)arc4random() * arc4random() % 9000000000000000ULL + 1000000000000000ULL)];
         NSMutableData *d = [NSMutableData dataWithLength:300];
@@ -506,10 +526,6 @@ static NSString *genFakeCookie(NSString *name) {
     // ---- v57M 新增：真机样本中实际存在的设备/环境标识 ----
     // BDB2BVID: 32位hex 设备ID
     if ([name isEqualToString:@"BDB2BVID"]) return genRandStr(32, hexCS);
-    // ab_bid: 广告设备ID，40位hex（真机 0a40fcce...4d40 = 40字符）
-    if ([name isEqualToString:@"ab_bid"]) return genRandStr(40, hexCS);
-    // ab_jid / ab_jid_BFESS: 40位hex（真机 bc8e8270...0a40）
-    if ([name hasPrefix:@"ab_jid"]) return getFakeID(@"ab_jid");
     // BA_HECTOR: 真机 848120240la12g8h810g04242ha1a41l73rr429 (35字符，数字+字母混合)
     if ([name isEqualToString:@"BA_HECTOR"]) return genRandStr(35, @"abcdefghijklmnopqrstuvwxyz0123456789");
     // BAIDU_WISE_UID: wapp_<13位时间戳>_<3位随机>
@@ -530,9 +546,8 @@ static NSString *genFakeCookie(NSString *name) {
                 [uuid lowercaseString], genRandStr(8, @"abcdefghijklmnopqrstuvwxyz0123456789")];
     }
     // H_WISE_SIDS: 数字下划线串（版本特征，非唯一标识，用固定值即可）
-    // AFD_IP: 真机样本中携带真实公网IP（112.81.188.205）
+    // AFD_IP: 真机样本中携带真实公网IP
     //   ★ 多实例同WiFi = 同出口IP → 百度聚类关联 → "下单人数过多"头号嫌疑
-    //   此处清除（交由网络层/代理隔离，见 v57M 部署说明）
     if ([name isEqualToString:@"AFD_IP"]) return @"";
     // BAIDULOCNEW: __<loc>_<citycode>_<ts>_1 定位+时间戳，清空避免位置聚类
     if ([name isEqualToString:@"BAIDULOCNEW"]) return @"";
@@ -540,7 +555,60 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"BdD1.ck.%@", name], ^{ return genFakeCookie(name); });
+    return getPersistent([NSString stringWithFormat:@"BdD1.ck.%@", canonicalCookieKey(name)],
+                         ^{ return genFakeCookie(name); });
+}
+
+// ============================================================
+// ★ v57P 修复：Cookie 身份族归一化
+//
+// 问题：genFakeCookie 按 cookie 原始名生成并缓存，导致同一个「设备身份」
+//       在不同 cookie 名下分裂成多个互不相干的值：
+//         BAIDUCUID        -> BdD1.ck.BAIDUCUID        (值 A)
+//         BAIDUCUID_BFESS  -> BdD1.ck.BAIDUCUID_BFESS  (值 B)  ✗ 应等于 A
+//         MAWEBCUID        -> BdD1.ck.MAWEBCUID        (值 C)  ✗ 应等于 A
+//         cuid             -> BdD1.ck.cuid             (值 D)  ✗ 应等于 A
+//         CUID             -> BdD1.ck.CUID             (值 E)  ✗ 应等于 A
+//       百度农场激活的硬性前置就是 BAIDUCUID，App 后续请求携带的 MAWEBCUID/
+//       cuid 却是另一个值 → 服务端判定「设备身份不一致」→ 拒绝激活。
+//       原版 App 能进农场，正因为它所有 CUID 名都是同一个真值。
+//
+// 方案：把语义等价的 cookie 名映射到同一个规范键，保证同族同值。
+// ============================================================
+static NSString *canonicalCookieKey(NSString *name) {
+    if (!name) return @"";
+    NSString *u = [name uppercaseString];
+
+    // —— CUID 族：全部共用同一个 CUID（农场激活依赖此一致性）——
+    // BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid / CUID / cuid_galaxy2
+    if ([u hasPrefix:@"BAIDUCUID"]) return @"CUID_FAMILY";
+    if ([u isEqualToString:@"MAWEBCUID"]) return @"CUID_FAMILY";
+    if ([u hasPrefix:@"CUID"]) return @"CUID_FAMILY";
+
+    // —— BAIDUID 族（浏览器/账号侧 ID，非设备指纹）——
+    if ([u hasPrefix:@"BAIDUID"]) return @"BAIDUID_FAMILY";
+
+    // —— fuid 族 ——
+    if ([u isEqualToString:@"FUID"]) return @"FUID_FAMILY";
+
+    // —— ab_jid 族 ——
+    if ([u hasPrefix:@"AB_JID"]) return @"AB_JID_FAMILY";
+
+    // —— ab_bid 族 ——
+    if ([u hasPrefix:@"AB_BID"]) return @"AB_BID_FAMILY";
+
+    return name;
+}
+
+// 会话凭证类：绝不伪造（伪造会直接破坏登录态与 CSRF 校验）
+static BOOL isSessionCookie(NSString *cookieName) {
+    if (!cookieName) return NO;
+    NSString *u = [cookieName uppercaseString];
+    // BDUSS / BDUSS_BFESS 是登录会话 + CSRF 镜像，篡改会导致会话失效
+    if ([u hasPrefix:@"BDUSS"]) return YES;
+    if ([u hasPrefix:@"STOKEN"]) return YES;
+    if ([u hasPrefix:@"PTOKEN"]) return YES;
+    return NO;
 }
 
 // ============================================================
@@ -548,14 +616,16 @@ static NSString *getFakeID(NSString *name) {
 // ============================================================
 static BOOL isDeviceCookie(NSString *cookieName) {
     if (!cookieName) return NO;
+    // ★ v57P：会话凭证绝不伪造（BDUSS/BDUSS_BFESS/STOKEN/PTOKEN）
+    //   篡改 BDUSS_BFESS 会破坏 CSRF 镜像 → 会话失效 → 农场/支付认证失败
+    if (isSessionCookie(cookieName)) return NO;
     NSString *lk = [cookieName lowercaseString];
     NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
                        @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid",
                        @"baiduid", @"baiduid_bfess",
                        // v57M 新增（真机样本确认存在）
                        @"bdb2bvid", @"ab_bid", @"ab_jid", @"ab_jid_bfess",
-                       @"ba_hector", @"zfy", @"rt",
-                       @"bdusid", @"bduss_bfess"];
+                       @"ba_hector", @"zfy", @"rt"];
     for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
