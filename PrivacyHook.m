@@ -109,7 +109,12 @@ static BOOL isSessionCookie(NSString *cookieName);
 // ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
 // ============================================================
-#define REBIND_COUNT 12
+// v57T: 回退到 9 条 —— uname/sysctl/gethostname 三条 rebind 与
+// v57R/v57S 启动闪退强相关（二分定位：Q.1 可启动，R/S 均闪退，
+// 剩余可疑增量只有这 3 条 rebind + dlopen）。先保证能启动，
+// 后续逐条加回以精确定位。
+// hook 函数本体保留（未注册不影响体积），随时可恢复。
+#define REBIND_COUNT 9
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -298,8 +303,9 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
         }
         // ---- v57N 新增：硬件人格 key 也要伪造，与 sysctl 保持一致 ----
         // ProductType / hw.machine（"iPhone15,3"）
-        if (CFStringCompare(key, CFSTR("h9jDsbgj7xIugkIB2RVp1cKoVBOyBj8r"), 0) == 0 ||
-            CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
+        // v57T: 修正复制粘贴错误 —— 之前误把序列号的 magic key 也放进了
+        // ProductType 分支（该 key 在上方 SerialNumber 分支已返回，属死代码）
+        if (CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
             g_inMGHook = NO;
             return CFRetain(CFSTR("iPhone15,3"));
         }
@@ -1178,11 +1184,10 @@ static void initPrivacyHook(void) {
         //   「追加到默认 UA」语义，而默认 UA 里没有 baiduboxapp；只设它不够。
         //   customUserAgent 是「整体替换」语义，优先级最高，才是主力手段。
         //
-        //   v57R: 先确保 WebKit 已加载 —— 若 objc_getClass 返回 nil，
-        //   下面整段会静默 no-op（这正是最难查的失效模式）。
-        @try {
-            dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", RTLD_LAZY);
-        } @catch (id e) {}
+        //   v57T: 移除 dlopen(WebKit) —— 已确认 App 主二进制自带
+        //   LC_LOAD_DYLIB WebKit，dyld 在构造函数运行前必然已加载它，
+        //   objc_getClass 不会返回 nil；dlopen 反而是 v57R/v57S 闪退的
+        //   剩余可疑增量之一（二分期间先去掉）。
         @try {
             Class wkCfg = objc_getClass("WKWebViewConfiguration");
             if (wkCfg) {
@@ -1257,10 +1262,10 @@ static void initPrivacyHook(void) {
             g_rebindings[6] = (struct rebinding){"CFHTTPCookieStorageCopyAllCookies",     (void *)hook_CFHTTPCookieStorageCopyAllCookies,     (void **)&orig_CFHTTPCookieStorageCopyAllCookies};
             g_rebindings[7] = (struct rebinding){"CFPreferencesCopyAppValue",             (void *)hook_CFPreferencesCopyAppValue,             (void **)&orig_CFPreferencesCopyAppValue};
             g_rebindings[8] = (struct rebinding){"CFPreferencesCopyValue",                (void *)hook_CFPreferencesCopyValue,                (void **)&orig_CFPreferencesCopyValue};
-            // v57R: 补上 uname / sysctl / gethostname —— 真实机型从这三条通道漏出
-            g_rebindings[9]  = (struct rebinding){"uname",                                (void *)hook_uname,                                 (void **)&orig_uname};
-            g_rebindings[10] = (struct rebinding){"sysctl",                               (void *)hook_sysctl,                                (void **)&orig_sysctl};
-            g_rebindings[11] = (struct rebinding){"gethostname",                          (void *)hook_gethostname,                           (void **)&orig_gethostname};
+            // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
+            // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
+            // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
+            // g_rebindings[11] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
 
             // 7a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
