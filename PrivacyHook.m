@@ -601,7 +601,7 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
                 CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)v);
                 forceCuidInResultDict(md);
                 CFRelease(v);
-                *result = (__bridge_retained CFTypeRef)md;
+                *result = (__bridge_retained CFTypeRef)(CFDictionaryRef)md;
             } else {
                 CFDataRef vd = (CFDataRef)CFDictionaryGetValue(v, kSecValueData);
                 if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
