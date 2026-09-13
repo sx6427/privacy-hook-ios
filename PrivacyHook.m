@@ -31,6 +31,7 @@
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <string.h>
@@ -108,7 +109,7 @@ static BOOL isSessionCookie(NSString *cookieName);
 // ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
 // ============================================================
-#define REBIND_COUNT 9
+#define REBIND_COUNT 12
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -178,6 +179,74 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         }
     }
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// ============================================================
+// ★★ v57R 关键补漏：uname / sysctl / gethostname ★★
+//
+// 二进制扫描确认：App 引用 uname 32 次、sysctl 9 次、gethostname 2 次。
+// 此前只 hook 了 sysctlbyname —— 而 iOS 的 uname().machine 返回的是
+// 真实机型（如 iPhone14,3），sysctl(CTL_HW, HW_MACHINE) 同理。
+// 于是出现：sysctlbyname 说 iPhone15,3，uname 说 iPhone14,3 ——
+// 同一设备两条通道两个答案，是最典型的篡改特征。
+// 伪造人格再自洽，漏了这条通道就等于全盘暴露。
+//
+// 教训（务必遵守）：
+//   1. 三个 hook 全部纯 C、零 ObjC 调用（可能在极早期被调用）
+//   2. sysctl 只拦截明确的 MIB，其余全部透传（此前盲目 hook 闪退）
+//   3. newp != NULL 是写操作，永远透传
+// ============================================================
+static int (*orig_uname)(struct utsname *) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_gethostname)(char *, size_t) = NULL;
+
+static int hook_uname(struct utsname *u) {
+    if (!u) return orig_uname(u);
+    int r = orig_uname(u);          // 先调真实版保证缓冲区有效，再覆盖
+    if (r != 0) return r;
+    strlcpy(u->sysname,  "Darwin",      sizeof(u->sysname));
+    strlcpy(u->nodename, "iPhone",      sizeof(u->nodename));
+    strlcpy(u->release,  FAKE_DARWIN,   sizeof(u->release));
+    strlcpy(u->version,
+            "Darwin Kernel Version 23.6.0: Mon Jul  8 20:36:33 PDT 2024; "
+            "root:xnu-11215.141.2~1/RELEASE_ARM64_T8120",
+            sizeof(u->version));
+    strlcpy(u->machine,  FAKE_MACHINE,  sizeof(u->machine));
+    return 0;
+}
+
+// sysctl() 旧 API —— 只拦这几项，其余透传
+// MIB 常量（Darwin 稳定值，直接用数字避免头文件差异）：
+//   CTL_KERN=1  CTL_HW=6
+//   KERN_OSTYPE=1  KERN_OSRELEASE=2  KERN_HOSTNAME=10
+//   HW_MACHINE=1   HW_MODEL=2
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+                       void *newp, size_t newlen) {
+    if (!name || namelen != 2 || newp != NULL) {
+        return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    }
+    const int a = name[0], b = name[1];
+    if (a == 6 && (b == 1 || b == 2)) {          // HW_MACHINE / HW_MODEL
+        return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
+    }
+    if (a == 1) {                                 // CTL_KERN
+        if (b == 1)  return hook_return_cstr("Darwin",      oldp, oldlenp);
+        if (b == 2)  return hook_return_cstr(FAKE_DARWIN,   oldp, oldlenp);
+        if (b == 10) return hook_return_cstr("iPhone",      oldp, oldlenp);
+    }
+    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+
+static int hook_gethostname(char *name, size_t namelen) {
+    if (!name || namelen == 0) return orig_gethostname(name, namelen);
+    const char *fake = "iPhone";   // 出厂默认主机名，与 uname.nodename 一致
+    size_t need = strlen(fake) + 1;
+    if (namelen < need) {
+        memcpy(name, fake, namelen);   // POSIX：缓冲不足时截断
+        return 0;
+    }
+    memcpy(name, fake, need);
+    return 0;
 }
 
 // ============================================================
@@ -824,6 +893,37 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
+        // ---- 2c. NSProcessInfo hooks — 系统版本/内存自洽（v57R 新增） ----
+        // operatingSystemVersion 返回真实 iOS 版本，会与伪造的 17.6.1 矛盾
+        // （App 二进制引用 NSProcessInfo 6 次）
+        @try {
+            Class piC = objc_getClass("NSProcessInfo");
+            if (piC) {
+                Method ovM = class_getInstanceMethod(piC, @selector(operatingSystemVersion));
+                if (ovM) {
+                    IMP imp = imp_implementationWithBlock(^(id s) {
+                        NSOperatingSystemVersion v = {17, 6, 1};
+                        return v;
+                    });
+                    class_replaceMethod(piC, @selector(operatingSystemVersion), imp, method_getTypeEncoding(ovM));
+                }
+                Method ovsM = class_getInstanceMethod(piC, @selector(operatingSystemVersionString));
+                if (ovsM) {
+                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                        return @"iOS 17.6.1";
+                    });
+                    class_replaceMethod(piC, @selector(operatingSystemVersionString), imp, method_getTypeEncoding(ovsM));
+                }
+                Method pmM = class_getInstanceMethod(piC, @selector(physicalMemory));
+                if (pmM) {
+                    IMP imp = imp_implementationWithBlock(^unsigned long long(id s) {
+                        return FAKE_MEMSIZE;
+                    });
+                    class_replaceMethod(piC, @selector(physicalMemory), imp, method_getTypeEncoding(pmM));
+                }
+            }
+        } @catch (id e) {}
+
         // ---- 3. IDFA hook — 每克隆独立 ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
@@ -1054,6 +1154,12 @@ static void initPrivacyHook(void) {
         //   为什么必须带 customUserAgent：applicationNameForUserAgent 是
         //   「追加到默认 UA」语义，而默认 UA 里没有 baiduboxapp；只设它不够。
         //   customUserAgent 是「整体替换」语义，优先级最高，才是主力手段。
+        //
+        //   v57R: 先确保 WebKit 已加载 —— 若 objc_getClass 返回 nil，
+        //   下面整段会静默 no-op（这正是最难查的失效模式）。
+        @try {
+            dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", RTLD_LAZY);
+        } @catch (id e) {}
         @try {
             Class wkCfg = objc_getClass("WKWebViewConfiguration");
             if (wkCfg) {
@@ -1128,6 +1234,10 @@ static void initPrivacyHook(void) {
             g_rebindings[6] = (struct rebinding){"CFHTTPCookieStorageCopyAllCookies",     (void *)hook_CFHTTPCookieStorageCopyAllCookies,     (void **)&orig_CFHTTPCookieStorageCopyAllCookies};
             g_rebindings[7] = (struct rebinding){"CFPreferencesCopyAppValue",             (void *)hook_CFPreferencesCopyAppValue,             (void **)&orig_CFPreferencesCopyAppValue};
             g_rebindings[8] = (struct rebinding){"CFPreferencesCopyValue",                (void *)hook_CFPreferencesCopyValue,                (void **)&orig_CFPreferencesCopyValue};
+            // v57R: 补上 uname / sysctl / gethostname —— 真实机型从这三条通道漏出
+            g_rebindings[9]  = (struct rebinding){"uname",                                (void *)hook_uname,                                 (void **)&orig_uname};
+            g_rebindings[10] = (struct rebinding){"sysctl",                               (void *)hook_sysctl,                                (void **)&orig_sysctl};
+            g_rebindings[11] = (struct rebinding){"gethostname",                          (void *)hook_gethostname,                           (void **)&orig_gethostname};
 
             // 7a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
