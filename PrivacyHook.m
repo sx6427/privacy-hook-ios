@@ -43,9 +43,13 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// ★ 伪造硬件人格（v57N 核心）
-// 目标: iPhone 14 Pro Max (iPhone15,3) — 与真机样本 1284x2778 一致
-// 所有值必须自洽：机型 ↔ 屏幕分辨率 ↔ 状态栏高度 ↔ UA
+// ★ 硬件人格策略（v58 起变更）
+// v57N-v57V: 全套伪造 iPhone15,3 / iOS 17.6.1 / 6GB / 430x932
+//   → XS 实测「页面变大」（UIScreen 假尺寸是根因）。
+// v58: 硬件全部跟真机（机型/系统/内存/屏幕透传真值，全通道自洽），
+//   只伪造身份（cuid/UDID/IDFV/ECID/设备名/序列号置空）。
+//   实测已证明百度风控认 cuid 不认硬件指纹（D1 与原版同机均可下单）。
+// 下方 FAKE_* 常量仅被未启用的 uname/sysctl hook 引用，保留备查。
 // ============================================================
 static const char *FAKE_MACHINE   = "iPhone15,3";        // 14 Pro Max
 static const char *FAKE_OSVER     = "17.6.1";            // 系统版本
@@ -140,9 +144,9 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
 }
 
 // ============================================================
-// sysctlbyname hook — v57N 返回伪造人格（自洽的 Pro Max）
-// 关键：机型/内存/系统版本全套替换，不混用真值（避免矛盾）
-// 纯 C 实现，ZERO ObjC 调用
+// sysctlbyname hook — v58 只消毒，不再伪造硬件人格
+// 机型/内存/系统版本全部返回真值（跟真机，与 UIScreen/NSProcessInfo 自洽）
+// 仅保留：序列号/UUID 置空（应用本来无权限，返回空不算异常）
 // ============================================================
 // 辅助：把 C 字符串写入 sysctl 输出缓冲（ZERO ObjC 调用）
 static int hook_return_cstr(const char *val, void *oldp, size_t *oldlenp) {
@@ -158,39 +162,12 @@ static int hook_return_cstr(const char *val, void *oldp, size_t *oldlenp) {
 
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name) {
-        // 机型标识
-        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0 ||
-            strcmp(name, "hw.product") == 0 || strcmp(name, "hw.target") == 0) {
-            return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
-        }
-        // 系统版本
-        if (strcmp(name, "kern.osproductversion") == 0) {
-            return hook_return_cstr(FAKE_OSVER, oldp, oldlenp);
-        }
-        if (strcmp(name, "kern.osversion") == 0) {
-            return hook_return_cstr("21G93", oldp, oldlenp);   // 17.6.1 build
-        }
-        if (strcmp(name, "kern.osrelease") == 0) {
-            return hook_return_cstr(FAKE_DARWIN, oldp, oldlenp);
-        }
-        // 内存
-        if (strcmp(name, "hw.memsize") == 0) {
-            if (oldp && oldlenp && *oldlenp >= sizeof(uint64_t)) {
-                *(uint64_t *)oldp = FAKE_MEMSIZE;
-                *oldlenp = sizeof(uint64_t);
-            } else if (oldlenp) {
-                *oldlenp = sizeof(uint64_t);
-            }
-            return 0;
-        }
         // 序列号/UUID 清空（应用本来无权限，返回空不算异常）
         if (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.uuid") == 0) {
             return hook_return_cstr("", oldp, oldlenp);
         }
-        // CPU 型号（A16 对应 t8120, 14 Pro 系列）
-        if (strcmp(name, "hw.cputype") == 0) {
-            // 保持真实（arm64 都一样）
-        }
+        // v58: hw.machine / kern.osproductversion / kern.osversion /
+        //      kern.osrelease / hw.memsize 全部透传真值 —— 硬件人格跟真机
     }
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
@@ -310,31 +287,9 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)n;
         }
-        // ---- v57N 新增：硬件人格 key 也要伪造，与 sysctl 保持一致 ----
-        // ProductType / hw.machine（"iPhone15,3"）
-        // v57T: 修正复制粘贴错误 —— 之前误把序列号的 magic key 也放进了
-        // ProductType 分支（该 key 在上方 SerialNumber 分支已返回，属死代码）
-        if (CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
-            g_inMGHook = NO;
-            return CFRetain(CFSTR("iPhone15,3"));
-        }
-        // ModelNumber（"MQ9G3CH/A"）
-        if (CFStringCompare(key, CFSTR("ModelNumber"), 0) == 0) {
-            g_inMGHook = NO;
-            return CFRetain(CFSTR("MQ9G3CH/A"));
-        }
-        // ProductVersion / 系统版本（"17.6.1"）
-        if (CFStringCompare(key, CFSTR("ProductVersion"), 0) == 0 ||
-            CFStringCompare(key, CFSTR("kCFSystemVersionProductVersionKey"), 0) == 0) {
-            g_inMGHook = NO;
-            return CFRetain(CFSTR("17.6.1"));
-        }
-        // BuildVersion（"21G93"）
-        if (CFStringCompare(key, CFSTR("BuildVersion"), 0) == 0 ||
-            CFStringCompare(key, CFSTR("ProductBuildVersion"), 0) == 0) {
-            g_inMGHook = NO;
-            return CFRetain(CFSTR("21G93"));
-        }
+        // ---- v58: ProductType / ModelNumber / ProductVersion / BuildVersion
+        //      不再伪造 —— 硬件人格跟真机，避免「XS 假报 Pro Max」的矛盾。
+        //      身份类（UDID/Serial/ECID/DeviceName）仍伪造。
         // 地区码保持 CN（真机国行）
         g_inMGHook = NO;
     } @catch (id e) {
@@ -1077,30 +1032,11 @@ static BOOL isDeviceKey(NSString *key) {
 }
 
 // ============================================================
-// v57S: NSProcessInfo 伪造 —— 纯 C 函数 IMP（不用 imp_implementationWithBlock）
-//
-// ★ v57R 闪退教训：
-//   operatingSystemVersion 返回 NSOperatingSystemVersion（3 个 long，
-//   共 24 字节）—— 超过 16 字节走 sret 返回约定。imp_implementationWithBlock
-//   对「结构体返回」的 block 没有 ABI 保证（block invoke 与 IMP 的
-//   sret 布局不保证一致），该方法又在 App 启动早期被 Foundation/UIKit
-//   高频调用 → 启动即崩，@try/@catch 拦不住内存故障。
-//   纯 C 函数做 IMP，返回结构体的 sret 由编译器按 ABI 正确生成 —— 零风险。
-// ============================================================
-static NSOperatingSystemVersion my_osVersion(id self, SEL _cmd) {
-    NSOperatingSystemVersion v;
-    v.majorVersion = 17; v.minorVersion = 6; v.patchVersion = 1;
-    return v;                                   // 与 UA 17_6_1 / uname 23.6.0 一致
-}
-static NSString *my_osVersionString(id self, SEL _cmd) {
-    return @"Version 17.6.1 (Build 21G93)";     // 编译期常量字符串，immortal 无需 retain
-}
-static unsigned long long my_physicalMemory(id self, SEL _cmd) {
-    return FAKE_MEMSIZE;                        // 6GB，与 sysctl hw.memsize 一致
-}
+// v58: NSProcessInfo / UIScreen 硬件伪造已整体移除 —— 硬件人格跟真机，
+// 只保留身份伪造（cuid/UDID/IDFV/ECID/设备名）。历史教训见 git v57S/v57T。
 
 // ============================================================
-// Constructor — v57N
+// Constructor — v58
 // ============================================================
 __attribute__((constructor))
 static void initPrivacyHook(void) {
@@ -1156,73 +1092,19 @@ static void initPrivacyHook(void) {
                         class_replaceMethod(dc, sl, imp, method_getTypeEncoding(m));
                     }
                 }
-                // 系统版本 — 必须与 sysctl kern.osproductversion 一致
-                Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
-                if (svM) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return [NSString stringWithUTF8String:FAKE_OSVER];
-                    });
-                    class_replaceMethod(dc, @selector(systemVersion), imp, method_getTypeEncoding(svM));
-                }
+                // v58: systemVersion 不再伪造 —— 真机系统版本全通道自洽
+                // （教训：XS 上假报 17.6.1 + 假大屏尺寸导致页面渲染异常）
             }
         } @catch (id e) {}
 
-        // ---- 2b. UIScreen hooks — 屏幕分辨率对齐 Pro Max (1284x2778@3x) ----
-        // ★ 这是 v57k 失败的根因：假机型 ↔ 真屏幕尺寸矛盾
-        //   改为整套对齐，百度 ua=1284_2778_iphone 参数才能自洽
-        @try {
-            Class sc = objc_getClass("UIScreen");
-            if (sc) {
-                Method bM = class_getInstanceMethod(sc, @selector(bounds));
-                if (bM) {
-                    IMP imp = imp_implementationWithBlock(^CGRect(id s) {
-                        return CGRectMake(0, 0, 430, 932);   // 14 Pro Max 逻辑尺寸
-                    });
-                    class_replaceMethod(sc, @selector(bounds), imp, method_getTypeEncoding(bM));
-                }
-                Method nsM = class_getInstanceMethod(sc, @selector(nativeBounds));
-                if (nsM) {
-                    IMP imp = imp_implementationWithBlock(^CGRect(id s) {
-                        return CGRectMake(0, 0, 1284, 2778); // 14 Pro Max 物理分辨率
-                    });
-                    class_replaceMethod(sc, @selector(nativeBounds), imp, method_getTypeEncoding(nsM));
-                }
-                Method nsS = class_getInstanceMethod(sc, @selector(nativeScale));
-                if (nsS) {
-                    IMP imp = imp_implementationWithBlock(^CGFloat(id s) { return 3.0; });
-                    class_replaceMethod(sc, @selector(nativeScale), imp, method_getTypeEncoding(nsS));
-                }
-                Method sM = class_getInstanceMethod(sc, @selector(scale));
-                if (sM) {
-                    IMP imp = imp_implementationWithBlock(^CGFloat(id s) { return 3.0; });
-                    class_replaceMethod(sc, @selector(scale), imp, method_getTypeEncoding(sM));
-                }
-            }
-        } @catch (id e) {}
+        // ---- 2b. v58: UIScreen hooks 全部移除 ----
+        // ★ 这是 XS 上「页面变大」的根因：强制所有设备返回 430x932/1284x2778，
+        //   XS 真实 375x812，布局按大屏算 → 内容溢出/过大。
+        //   硬件人格策略改为「跟真机」，屏幕永远真实。
 
-        // ---- 2c. NSProcessInfo hooks — 系统版本/内存自洽 ----
-        // v57S: 一律用纯 C 函数 IMP（见上方 my_osVersion 注释），
-        // 严禁对返回结构体的方法用 imp_implementationWithBlock
-        @try {
-            Class piC = objc_getClass("NSProcessInfo");
-            if (piC) {
-                Method ovM = class_getInstanceMethod(piC, @selector(operatingSystemVersion));
-                if (ovM) {
-                    class_replaceMethod(piC, @selector(operatingSystemVersion),
-                                        (IMP)my_osVersion, method_getTypeEncoding(ovM));
-                }
-                Method ovsM = class_getInstanceMethod(piC, @selector(operatingSystemVersionString));
-                if (ovsM) {
-                    class_replaceMethod(piC, @selector(operatingSystemVersionString),
-                                        (IMP)my_osVersionString, method_getTypeEncoding(ovsM));
-                }
-                Method pmM = class_getInstanceMethod(piC, @selector(physicalMemory));
-                if (pmM) {
-                    class_replaceMethod(piC, @selector(physicalMemory),
-                                        (IMP)my_physicalMemory, method_getTypeEncoding(pmM));
-                }
-            }
-        } @catch (id e) {}
+        // ---- 2c. v58: NSProcessInfo hooks 全部移除 ----
+        // 系统版本/内存返回真值，与 sysctl/UIDevice 全通道自洽。
+        // （v57S 的纯 C IMP 方案保留在历史版本，若需恢复见 git）
 
         // ---- 3. IDFA hook — 每克隆独立 ----
         @try {
