@@ -109,6 +109,7 @@ static NSString *canonicalCookieKey(NSString *name);
 static BOOL isSessionCookie(NSString *cookieName);
 static void captureRealIdentity(NSString *name, NSString *value);
 static NSString *rewriteIdentityString(NSString *s);
+static NSData *rewriteIdentityData(NSData *d);
 
 // ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
