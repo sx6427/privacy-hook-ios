@@ -119,7 +119,7 @@ static NSData *rewriteIdentityData(NSData *d);
 // 剩余可疑增量只有这 3 条 rebind + dlopen）。先保证能启动，
 // 后续逐条加回以精确定位。
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
-#define REBIND_COUNT 10
+#define REBIND_COUNT 12
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -475,23 +475,45 @@ static BOOL isOwnPrefKey(CFStringRef key) {
     return [( __bridge NSString *)key hasPrefix:@"BdD1."];
 }
 
+// v57V: 按键名拦截 —— key 含 "cuid" 且值为短字符串 → 强制返回伪造 cuid
+// （SAPICUIDKit 等也走 CFPreferences/NSUserDefaults 持久化 cuid）
+static CFPropertyListRef sanitizePrefValueForKey(CFStringRef key, CFPropertyListRef v) {
+    if (!v || !key) return v;
+    if (isOwnPrefKey(key)) return v;
+    if (CFGetTypeID(v) != CFStringGetTypeID()) return v;
+    NSString *k = (__bridge NSString *)key;
+    if ([k rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location == NSNotFound) return v;
+    NSString *s = (__bridge NSString *)v;
+    if (s.length < 16 || s.length > 128) return v;      // cuid 合理长度
+    NSString *fake = fakeCUIDValue();
+    if ([s isEqualToString:fake]) return v;             // 已是伪造值
+    captureRealIdentity(@"BAIDUCUID", s);               // 顺带捕获真实值兜底
+    return (__bridge_retained CFPropertyListRef)fake;   // 调用方持有 +1
+}
+
 static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
+    CFPropertyListRef v;
     if (key && appID && isGroupDomain(appID)) {
         NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
-        return orig_CFPreferencesCopyAppValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication);
+        v = orig_CFPreferencesCopyAppValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication);
+    } else {
+        v = orig_CFPreferencesCopyAppValue(key, appID);
     }
-    CFPropertyListRef v = orig_CFPreferencesCopyAppValue(key, appID);
     if (isOwnPrefKey(key)) return v;
+    v = sanitizePrefValueForKey(key, v);
     return sanitizeIdentityPList(v);
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
+    CFPropertyListRef v;
     if (key && appID && isGroupDomain(appID)) {
         NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
-        return orig_CFPreferencesCopyValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication, user, host);
+        v = orig_CFPreferencesCopyValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication, user, host);
+    } else {
+        v = orig_CFPreferencesCopyValue(key, appID, user, host);
     }
-    CFPropertyListRef v = orig_CFPreferencesCopyValue(key, appID, user, host);
     if (isOwnPrefKey(key)) return v;
+    v = sanitizePrefValueForKey(key, v);
     return sanitizeIdentityPList(v);
 }
 
@@ -503,34 +525,129 @@ static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRe
 // 返回的数据/字典里若含真实 CUID/BAIDUID → 替换为伪造值。
 // ============================================================
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result) = NULL;
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) = NULL;
+
+// ---- v57V: keychain 服务名精准拦截 ----
+// 二进制取证发现：
+//   - keychain 共享组/服务名 "B83JBVZ6M5.com.baidu.baidumobile.cuid"
+//   - SAPICUIDKit（百度原生 cuid 生成器）首启从真实硬件算 cuid 存 keychain
+//   - 收银台反欺诈 BDNCashierSDKAntiFraudProcotol（下单环节）
+// v57U 的按值替换依赖捕获，但原生 cuid 走 keychain 不经过 cookie 写路径，
+// 捕获从未发生 → 替换从未生效。
+// v57V 改为按「服务名」拦截：凡 kSecAttrService 含 "cuid" 的 keychain
+// 读写，值一律替换为伪造 cuid（与 cookie 伪造值同源，单一身份）。
+// 不再依赖捕获；同时顺带捕获真实值（若真出现）供按值替换兜底。
+
+// 伪造 cuid（与 cookie CUID_FAMILY 伪造值同源）
+static NSString *fakeCUIDValue(void) {
+    return getFakeID(@"BAIDUCUID");
+}
+
+// 判断 keychain 查询/属性字典是否为 cuid 存储（服务名/账号名含 cuid）
+static BOOL isCuidServiceDict(CFDictionaryRef dict) {
+    if (!dict) return NO;
+    const void *keys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, keys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            if ([s rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        }
+    }
+    return NO;
+}
+
+// 捕获真实值（仅当不是我们自己的伪造值，防自毒）并返回伪造 data
+static NSData *fakeCUIDDataFrom(NSData *realData) {
+    @try {
+        NSString *s = [[NSString alloc] initWithData:realData encoding:NSUTF8StringEncoding];
+        if (s.length >= 16 && ![s isEqualToString:fakeCUIDValue()]) {
+            captureRealIdentity(@"BAIDUCUID", s);
+        }
+    } @catch (id e) {}
+    NSString *fake = fakeCUIDValue();
+    return [fake dataUsingEncoding:NSUTF8StringEncoding] ?: realData;
+}
+
+// 从字典结果里强制替换 cuid 值（kSecValueData / kSecAttrGeneric）
+static void forceCuidInResultDict(CFMutableDictionaryRef md) {
+    const void *valKeys[] = { kSecValueData, kSecAttrGeneric };
+    for (size_t i = 0; i < 2; i++) {
+        CFDataRef vd = (CFDataRef)CFDictionaryGetValue(md, valKeys[i]);
+        if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
+            NSData *nd = fakeCUIDDataFrom((__bridge NSData *)vd);
+            CFDictionarySetValue(md, valKeys[i], (__bridge CFDataRef)nd);
+        }
+    }
+}
+
 static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     OSStatus st = orig_SecItemCopyMatching(query, result);
     if (st != 0 || !result || !*result) return st;   // 0 = errSecSuccess
     @try {
+        BOOL targeted = isCuidServiceDict(query);   // v57V: 按服务名精准拦截
         CFTypeRef v = *result;
         CFTypeID tid = CFGetTypeID(v);
         if (tid == CFDataGetTypeID()) {
             NSData *d = (__bridge NSData *)v;
-            NSData *nd = rewriteIdentityData(d);
+            NSData *nd = targeted ? fakeCUIDDataFrom(d) : rewriteIdentityData(d);
             if (nd != d) {
                 CFRelease(v);                                   // 释放 orig 给的 +1
                 *result = (__bridge_retained CFTypeRef)nd;      // 交给调用方 +1
             }
         } else if (tid == CFDictionaryGetTypeID()) {
-            CFDataRef vd = (CFDataRef)CFDictionaryGetValue(v, kSecValueData);
-            if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
-                NSData *d = (__bridge NSData *)vd;
-                NSData *nd = rewriteIdentityData(d);
-                if (nd != d) {
-                    NSMutableDictionary *md = [(__bridge NSDictionary *)v mutableCopy];
-                    md[(__bridge id)kSecValueData] = nd;
-                    CFRelease(v);
-                    *result = (__bridge_retained CFTypeRef)md;
+            if (targeted) {
+                CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)v);
+                forceCuidInResultDict(md);
+                CFRelease(v);
+                *result = (__bridge_retained CFTypeRef)md;
+            } else {
+                CFDataRef vd = (CFDataRef)CFDictionaryGetValue(v, kSecValueData);
+                if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
+                    NSData *d = (__bridge NSData *)vd;
+                    NSData *nd = rewriteIdentityData(d);
+                    if (nd != d) {
+                        NSMutableDictionary *md = [(__bridge NSDictionary *)v mutableCopy];
+                        md[(__bridge id)kSecValueData] = nd;
+                        CFRelease(v);
+                        *result = (__bridge_retained CFTypeRef)md;
+                    }
                 }
             }
         }
     } @catch (id e) {}
     return st;
+}
+
+// v57V: 写入侧 —— cuid 服务名的 keychain 写入直接落伪造值，
+// 让后续所有读取（含未 hook 的通道）天然拿到伪造值
+static OSStatus hook_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    @try {
+        if (isCuidServiceDict(attributes)) {
+            CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributes);
+            forceCuidInResultDict(md);
+            OSStatus st = orig_SecItemAdd(md, result);
+            CFRelease(md);
+            return st;
+        }
+    } @catch (id e) {}
+    return orig_SecItemAdd(attributes, result);
+}
+
+static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    @try {
+        if (isCuidServiceDict(query) || isCuidServiceDict(attributesToUpdate)) {
+            if (attributesToUpdate && CFDictionaryGetCount(attributesToUpdate) > 0) {
+                CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributesToUpdate);
+                forceCuidInResultDict(md);
+                OSStatus st = orig_SecItemUpdate(query, md);
+                CFRelease(md);
+                return st;
+            }
+        }
+    } @catch (id e) {}
+    return orig_SecItemUpdate(query, attributesToUpdate);
 }
 
 static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
@@ -1483,6 +1600,9 @@ static void initPrivacyHook(void) {
             g_rebindings[8] = (struct rebinding){"CFPreferencesCopyValue",                (void *)hook_CFPreferencesCopyValue,                (void **)&orig_CFPreferencesCopyValue};
             // v57U: keychain 出口消毒（只按值替换返回内容，查询不过滤）
             g_rebindings[9]  = (struct rebinding){"SecItemCopyMatching",                  (void *)hook_SecItemCopyMatching,                   (void **)&orig_SecItemCopyMatching};
+            // v57V: 写入侧也拦截，让 keychain 天然存伪造 cuid
+            g_rebindings[10] = (struct rebinding){"SecItemAdd",                           (void *)hook_SecItemAdd,                            (void **)&orig_SecItemAdd};
+            g_rebindings[11] = (struct rebinding){"SecItemUpdate",                        (void *)hook_SecItemUpdate,                         (void **)&orig_SecItemUpdate};
             // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
