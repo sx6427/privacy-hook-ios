@@ -110,6 +110,10 @@ static BOOL isSessionCookie(NSString *cookieName);
 static void captureRealIdentity(NSString *name, NSString *value);
 static NSString *rewriteIdentityString(NSString *s);
 static NSData *rewriteIdentityData(NSData *d);
+static NSString *fakeCUIDValue(void);
+static BOOL isCuidServiceDict(CFDictionaryRef dict);
+static NSData *fakeCUIDDataFrom(NSData *realData);
+static void forceCuidInResultDict(CFMutableDictionaryRef md);
 
 // ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
@@ -601,7 +605,7 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
                 CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)v);
                 forceCuidInResultDict(md);
                 CFRelease(v);
-                *result = (__bridge_retained CFTypeRef)(CFDictionaryRef)md;
+                *result = (CFTypeRef)md;   // +1 交给调用方（CF→CF 普通 C 转型）
             } else {
                 CFDataRef vd = (CFDataRef)CFDictionaryGetValue(v, kSecValueData);
                 if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
