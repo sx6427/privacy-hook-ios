@@ -79,6 +79,7 @@ static CFArrayRef (*orig_CFHTTPCookieStorageCopyAllCookies)(CFHTTPCookieStorageR
 
 // 工具函数（dlsym 运行时解析，避免链接依赖）
 static CFStringRef (*p_CFHTTPCookieCopyName)(CFHTTPCookieRef) = NULL;
+static CFStringRef (*p_CFHTTPCookieCopyValue)(CFHTTPCookieRef) = NULL;
 static CFDictionaryRef (*p_CFHTTPCookieCopyProperties)(CFHTTPCookieRef) = NULL;
 static CFHTTPCookieRef (*p_CFHTTPCookieCreateWithProperties)(CFAllocatorRef, CFDictionaryRef) = NULL;
 
@@ -88,6 +89,7 @@ static void init_cf_cookie_syms(void) {
     if (!h) h = dlopen(NULL, RTLD_LAZY); // 兜底：在已加载镜像中查找
     if (!h) return;
     p_CFHTTPCookieCopyName = dlsym(h, "CFHTTPCookieCopyName");
+    p_CFHTTPCookieCopyValue = dlsym(h, "CFHTTPCookieCopyValue");
     p_CFHTTPCookieCopyProperties = dlsym(h, "CFHTTPCookieCopyProperties");
     p_CFHTTPCookieCreateWithProperties = dlsym(h, "CFHTTPCookieCreateWithProperties");
 }
@@ -105,6 +107,8 @@ static NSString *getFakeID(NSString *name);
 static BOOL isDeviceCookie(NSString *cookieName);
 static NSString *canonicalCookieKey(NSString *name);
 static BOOL isSessionCookie(NSString *cookieName);
+static void captureRealIdentity(NSString *name, NSString *value);
+static NSString *rewriteIdentityString(NSString *s);
 
 // ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
@@ -114,7 +118,7 @@ static BOOL isSessionCookie(NSString *cookieName);
 // 剩余可疑增量只有这 3 条 rebind + dlopen）。先保证能启动，
 // 后续逐条加回以精确定位。
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
-#define REBIND_COUNT 9
+#define REBIND_COUNT 10
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -353,8 +357,11 @@ static CFTypeRef hook_IORegistryEntryCreateCFProperty(io_registry_entry_t entry,
 
 // ============================================================
 // C 层 Cookie 清洗 — 百度 SDK 绕过 ObjC 直调 CFNetwork 时兜底
+// v57U: capture=YES 时先捕获 SDK 生成的原始值（真实身份）再替换。
+// 只在写入路径（SetCookie/SetCookies）传 YES；读路径（Copy*）存的是
+// 已替换的伪造值，捕获会污染真实值缓存。
 // ============================================================
-static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck) {
+static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck, BOOL capture) {
     if (!ck) return ck;
     init_cf_cookie_syms();
     if (!p_CFHTTPCookieCopyName || !p_CFHTTPCookieCopyProperties || !p_CFHTTPCookieCreateWithProperties) return ck;
@@ -362,6 +369,13 @@ static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck) {
     if (!nm) return ck;
     NSString *name = (__bridge_transfer NSString *)nm; // +1 transferred
     if (!isDeviceCookie(name)) return ck;              // 返回原引用（调用方判断相同则不 release）
+    if (capture && p_CFHTTPCookieCopyValue) {
+        CFStringRef vv = p_CFHTTPCookieCopyValue(ck);
+        if (vv) {
+            NSString *val = (__bridge_transfer NSString *)vv; // +1 transferred
+            captureRealIdentity(name, val);
+        }
+    }
     CFDictionaryRef props = p_CFHTTPCookieCopyProperties(ck);
     if (!props) return ck;
     NSMutableDictionary *md = [(__bridge_transfer NSDictionary *)props mutableCopy]; // +1 transferred
@@ -372,7 +386,7 @@ static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck) {
 
 static void hook_CFHTTPCookieStorageSetCookie(CFHTTPCookieStorageRef storage, CFHTTPCookieRef ck) {
     if (ck) {
-        CFHTTPCookieRef nc = sanitizeCFCookie(ck);
+        CFHTTPCookieRef nc = sanitizeCFCookie(ck, YES);
         orig_CFHTTPCookieStorageSetCookie(storage, nc ? nc : ck);
         if (nc && nc != ck) CFRelease(nc);
         return;
@@ -385,7 +399,7 @@ static void hook_CFHTTPCookieStorageSetCookies(CFHTTPCookieStorageRef storage, C
         CFMutableArrayRef out = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         for (CFIndex i = 0; i < CFArrayGetCount(cookies); i++) {
             CFHTTPCookieRef ck = (CFHTTPCookieRef)CFArrayGetValueAtIndex(cookies, i);
-            CFHTTPCookieRef nc = sanitizeCFCookie(ck);
+            CFHTTPCookieRef nc = sanitizeCFCookie(ck, YES);
             if (nc) {
                 CFArrayAppendValue(out, nc);
                 if (nc != ck) CFRelease(nc);
@@ -404,7 +418,7 @@ static CFArrayRef hook_CFHTTPCookieStorageCopyCookiesForURL(CFHTTPCookieStorageR
     CFMutableArrayRef out = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
     for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
         CFHTTPCookieRef ck = (CFHTTPCookieRef)CFArrayGetValueAtIndex(arr, i);
-        CFHTTPCookieRef nc = sanitizeCFCookie(ck);
+        CFHTTPCookieRef nc = sanitizeCFCookie(ck, NO);
         if (nc) {
             CFArrayAppendValue(out, nc);
             if (nc != ck) CFRelease(nc);
@@ -420,7 +434,7 @@ static CFArrayRef hook_CFHTTPCookieStorageCopyAllCookies(CFHTTPCookieStorageRef 
     CFMutableArrayRef out = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
     for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
         CFHTTPCookieRef ck = (CFHTTPCookieRef)CFArrayGetValueAtIndex(arr, i);
-        CFHTTPCookieRef nc = sanitizeCFCookie(ck);
+        CFHTTPCookieRef nc = sanitizeCFCookie(ck, NO);
         if (nc) {
             CFArrayAppendValue(out, nc);
             if (nc != ck) CFRelease(nc);
@@ -441,12 +455,33 @@ static BOOL isGroupDomain(CFStringRef appID) {
     return [dom hasPrefix:@"group."] || [dom hasPrefix:@"group:"];
 }
 
+// v57U: 出口消毒 —— 返回的字符串若含本机真实身份值则替换
+// （SDK 把真实 cuid 缓存在 NSUserDefaults/CFPreferences 里，读出来
+//   就拼进请求参数。按值替换，不做 key 名猜测。）
+// 注意：我们自己的键（BdD1.*，含真实值缓存）必须排除，否则 rewrite
+// 拿到的"真实值"会被自己换成伪造值，逻辑失效。
+static CFPropertyListRef sanitizeIdentityPList(CFPropertyListRef v) {
+    if (!v) return v;
+    if (CFGetTypeID(v) != CFStringGetTypeID()) return v;
+    NSString *s = (__bridge NSString *)v;
+    NSString *r = rewriteIdentityString(s);
+    if (r == s) return v;
+    return (__bridge_retained CFPropertyListRef)r;   // 调用方持有 +1
+}
+
+static BOOL isOwnPrefKey(CFStringRef key) {
+    if (!key) return NO;
+    return [( __bridge NSString *)key hasPrefix:@"BdD1."];
+}
+
 static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
     if (key && appID && isGroupDomain(appID)) {
         NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
         return orig_CFPreferencesCopyAppValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication);
     }
-    return orig_CFPreferencesCopyAppValue(key, appID);
+    CFPropertyListRef v = orig_CFPreferencesCopyAppValue(key, appID);
+    if (isOwnPrefKey(key)) return v;
+    return sanitizeIdentityPList(v);
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
@@ -454,7 +489,47 @@ static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRe
         NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
         return orig_CFPreferencesCopyValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication, user, host);
     }
-    return orig_CFPreferencesCopyValue(key, appID, user, host);
+    CFPropertyListRef v = orig_CFPreferencesCopyValue(key, appID, user, host);
+    if (isOwnPrefKey(key)) return v;
+    return sanitizeIdentityPList(v);
+}
+
+// ============================================================
+// v57U: keychain 出口消毒 — SecItemCopyMatching
+// 同团队签名的 App 共享 keychain 访问组（百度系 App 全家桶），
+// 克隆版能直接读到原版 App 存的本机真实设备 ID。
+// 不做查询过滤（避免破坏登录凭证），只按「值」消毒：
+// 返回的数据/字典里若含真实 CUID/BAIDUID → 替换为伪造值。
+// ============================================================
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
+static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    OSStatus st = orig_SecItemCopyMatching(query, result);
+    if (st != 0 || !result || !*result) return st;   // 0 = errSecSuccess
+    @try {
+        CFTypeRef v = *result;
+        CFTypeID tid = CFGetTypeID(v);
+        if (tid == CFDataGetTypeID()) {
+            NSData *d = (__bridge NSData *)v;
+            NSData *nd = rewriteIdentityData(d);
+            if (nd != d) {
+                CFRelease(v);                                   // 释放 orig 给的 +1
+                *result = (__bridge_retained CFTypeRef)nd;      // 交给调用方 +1
+            }
+        } else if (tid == CFDictionaryGetTypeID()) {
+            CFDataRef vd = (CFDataRef)CFDictionaryGetValue(v, kSecValueData);
+            if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
+                NSData *d = (__bridge NSData *)vd;
+                NSData *nd = rewriteIdentityData(d);
+                if (nd != d) {
+                    NSMutableDictionary *md = [(__bridge NSDictionary *)v mutableCopy];
+                    md[(__bridge id)kSecValueData] = nd;
+                    CFRelease(v);
+                    *result = (__bridge_retained CFTypeRef)md;
+                }
+            }
+        }
+    } @catch (id e) {}
+    return st;
 }
 
 static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
@@ -482,6 +557,80 @@ static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFPreferencesSetAppValue(cfKey, (__bridge CFStringRef)newVal, kCFPreferencesCurrentApplication);
     CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
     return newVal;
+}
+
+// v57U: 持久写入（捕获本机真实身份值用）
+static void setPersistent(NSString *key, NSString *val) {
+    if (!key || !val || val.length == 0) return;
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)val,
+                             kCFPreferencesCurrentApplication);
+    CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+}
+
+// ============================================================
+// ★★ v57U: 单一身份原则（Identity Coherence）★★
+//
+// 问题：cookie 里的 CUID 我们伪造了，但百度原生 SDK 还会把
+// 「SDK 自己算出来的 cuid」塞进 URL 参数 / POST body
+// （二进制取证：cuid=%@ / &cuid=%@ 拼接大量存在），
+// 以及从 keychain 共享组读原版 App 存的本机真实设备 ID
+// （同团队 App 共享 keychain —— 这正是"更换设备之后就正常了"的原因）。
+// 于是服务端看到：cookie=假，参数=真 → 矛盾 → 按真设备下单名额判限。
+//
+// 解法：捕获真实值，在**所有出口**统一替换为伪造值：
+//   1) 捕获：SDK 写设备 cookie 时，原始值经过我们手上先存下来
+//      （BdD1.real.CUID_FAMILY / BdD1.real.BAIDUID_FAMILY，持久化）
+//   2) keychain 出口：SecItemCopyMatching 返回数据含真实值 → 替换
+//   3) CFPreferences 出口：返回字符串含真实值 → 替换
+//   4) 请求出口：NSMutableURLRequest 的 URL/body、WKWebView loadRequest
+//      中的真实值 → 替换
+// 只按「值」替换（真实值是稳定长字符串，碰撞概率为零），不做 key 名猜测。
+// ============================================================
+
+// 捕获真实身份值（仅 CUID/BAIDUID 两个家族；只在写入路径调用）
+static void captureRealIdentity(NSString *name, NSString *value) {
+    if (!name || !value || value.length < 16) return;
+    @try {
+        NSString *ck = canonicalCookieKey(name);
+        BOOL isCUID = [ck isEqualToString:@"CUID_FAMILY"];
+        BOOL isBID  = [ck isEqualToString:@"BAIDUID_FAMILY"];
+        if (!isCUID && !isBID) return;
+        NSString *k = [NSString stringWithFormat:@"BdD1.real.%@", ck];
+        NSString *old = getPersistent(k, ^{ return @""; });
+        if (old.length == 0) {
+            setPersistent(k, value);   // 首次捕获，落盘
+        }
+        // 之后即使 SDK 换了值也不更新 —— 保持单一稳定真实值，避免
+        // 读路径误捕获伪造值（读路径不捕获，这里只兜底首次）
+    } @catch (id e) {}
+}
+
+// 把字符串里出现的「本机真实身份值」替换为「伪造值」（所有出口共用）
+static NSString *rewriteIdentityString(NSString *s) {
+    if (!s || s.length < 20) return s;
+    @try {
+        NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
+        if (rc.length >= 16 && [s rangeOfString:rc].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:rc withString:getFakeID(@"BAIDUCUID")];
+        }
+        NSString *rb = getPersistent(@"BdD1.real.BAIDUID_FAMILY", ^{ return @""; });
+        if (rb.length >= 16 && [s rangeOfString:rb].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:rb withString:getFakeID(@"BAIDUID")];
+        }
+    } @catch (id e) {}
+    return s;
+}
+
+static NSData *rewriteIdentityData(NSData *d) {
+    if (!d || d.length < 16) return d;
+    @try {
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s) return d;
+        NSString *r = rewriteIdentityString(s);
+        if (r == s) return d;
+        NSData *nd = [r dataUsingEncoding:NSUTF8StringEncoding];
+        return nd ?: d;
+    } @catch (id e) { return d; }
 }
 
 static NSString *genUUIDStr(void) { return [[NSUUID UUID] UUIDString]; }
@@ -1036,6 +1185,7 @@ static void initPrivacyHook(void) {
                 IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
                     if (cookie && isDeviceCookie(cookie.name)) {
                         @try {
+                            captureRealIdentity(cookie.name, cookie.value);   // v57U: 捕获真实值
                             NSString *fakeValue = getFakeID(cookie.name);
                             NSMutableDictionary *props = [NSMutableDictionary dictionary];
                             props[NSHTTPCookieName] = cookie.name;
@@ -1155,6 +1305,50 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
                 }
+
+                // v57U: 请求出口消毒 —— URL 参数 / POST body 里的真实 cuid
+                // 原生 SDK 拼请求时 cuid=%@ 直接进 query/body（不走 cookie），
+                // 按值替换为本克隆伪造值，与 cookie 保持单一身份
+                Method suM = class_getInstanceMethod(reqClass, @selector(setURL:));
+                if (suM) {
+                    IMP origSetURL = method_getImplementation(suM);
+                    IMP newSetURL = imp_implementationWithBlock(^void(id s, NSURL *u) {
+                        NSURL *nu = u;
+                        @try {
+                            if (u.absoluteString.length > 20) {
+                                NSString *r = rewriteIdentityString(u.absoluteString);
+                                if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
+                            }
+                        } @catch (id e) {}
+                        ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), nu);
+                    });
+                    class_replaceMethod(reqClass, @selector(setURL:), newSetURL, method_getTypeEncoding(suM));
+                }
+                Method sbM = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
+                if (sbM) {
+                    IMP origSetBody = method_getImplementation(sbM);
+                    IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
+                        NSData *nb = body;
+                        @try { if (body) nb = rewriteIdentityData(body); } @catch (id e) {}
+                        ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), nb);
+                    });
+                    class_replaceMethod(reqClass, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(sbM));
+                }
+                Method iwM = class_getInstanceMethod(reqClass, @selector(initWithURL:));
+                if (iwM) {
+                    IMP origInitURL = method_getImplementation(iwM);
+                    IMP newInitURL = imp_implementationWithBlock(^id(id s, NSURL *u) {
+                        NSURL *nu = u;
+                        @try {
+                            if (u.absoluteString.length > 20) {
+                                NSString *r = rewriteIdentityString(u.absoluteString);
+                                if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
+                            }
+                        } @catch (id e) {}
+                        return ((id (*)(id, SEL, NSURL *))origInitURL)(s, @selector(initWithURL:), nu);
+                    });
+                    class_replaceMethod(reqClass, @selector(initWithURL:), newInitURL, method_getTypeEncoding(iwM));
+                }
             }
         } @catch (id e) {}
 
@@ -1243,6 +1437,30 @@ static void initPrivacyHook(void) {
                     class_replaceMethod(wkView, @selector(initWithFrame:configuration:), newInit, method_getTypeEncoding(initM));
                 }
 
+                // v57U: loadRequest: 出口消毒 —— App 打开 H5 活动页（含农场）
+                // 时会把 SDK 计算的 cuid 等身份参数拼进 URL query，
+                // 同样按值替换为本克隆伪造值
+                Method lrM = class_getInstanceMethod(wkView, @selector(loadRequest:));
+                if (lrM) {
+                    IMP origLR = method_getImplementation(lrM);
+                    IMP newLR = imp_implementationWithBlock(^void(id s, NSURLRequest *req) {
+                        NSURLRequest *nr = req;
+                        @try {
+                            if (req.URL.absoluteString.length > 20) {
+                                NSString *r = rewriteIdentityString(req.URL.absoluteString);
+                                if (r != req.URL.absoluteString) {
+                                    NSURL *nu = [NSURL URLWithString:r];
+                                    if (nu) {
+                                        nr = [NSURLRequest requestWithURL:nu];
+                                    }
+                                }
+                            }
+                        } @catch (id e) {}
+                        ((void (*)(id, SEL, NSURLRequest *))origLR)(s, @selector(loadRequest:), nr);
+                    });
+                    class_replaceMethod(wkView, @selector(loadRequest:), newLR, method_getTypeEncoding(lrM));
+                }
+
                 // 补充：NSUserDefaults["UserAgent"] 是另一种较低优先级的设置方式，
                 // 优先级低于 customUserAgent。由于我们已将 customUserAgent 全路径
                 // 强制为完整 App UA，该方法即使被调用也不会生效，无需额外 hook。
@@ -1262,6 +1480,8 @@ static void initPrivacyHook(void) {
             g_rebindings[6] = (struct rebinding){"CFHTTPCookieStorageCopyAllCookies",     (void *)hook_CFHTTPCookieStorageCopyAllCookies,     (void **)&orig_CFHTTPCookieStorageCopyAllCookies};
             g_rebindings[7] = (struct rebinding){"CFPreferencesCopyAppValue",             (void *)hook_CFPreferencesCopyAppValue,             (void **)&orig_CFPreferencesCopyAppValue};
             g_rebindings[8] = (struct rebinding){"CFPreferencesCopyValue",                (void *)hook_CFPreferencesCopyValue,                (void **)&orig_CFPreferencesCopyValue};
+            // v57U: keychain 出口消毒（只按值替换返回内容，查询不过滤）
+            g_rebindings[9]  = (struct rebinding){"SecItemCopyMatching",                  (void *)hook_SecItemCopyMatching,                   (void **)&orig_SecItemCopyMatching};
             // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
