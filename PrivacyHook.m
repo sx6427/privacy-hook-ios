@@ -201,6 +201,7 @@ static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL
 static int (*orig_gethostname)(char *, size_t) = NULL;
 
 static int hook_uname(struct utsname *u) {
+    if (!orig_uname) return -1;                 // 防护：未绑定绝不能解引用
     if (!u) return orig_uname(u);
     int r = orig_uname(u);          // 先调真实版保证缓冲区有效，再覆盖
     if (r != 0) return r;
@@ -222,7 +223,12 @@ static int hook_uname(struct utsname *u) {
 //   HW_MACHINE=1   HW_MODEL=2
 static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
                        void *newp, size_t newlen) {
+    if (!orig_sysctl) return -1;                // 防护：未绑定绝不能解引用
     if (!name || namelen != 2 || newp != NULL) {
+        return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    }
+    // 防护：oldp 与 oldlenp 必须成对出现，缺一透传（调用方布局未知，不能猜）
+    if (!oldlenp && oldp) {
         return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     }
     const int a = name[0], b = name[1];
@@ -238,14 +244,15 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 }
 
 static int hook_gethostname(char *name, size_t namelen) {
+    if (!orig_gethostname) return -1;           // 防护：未绑定绝不能解引用
     if (!name || namelen == 0) return orig_gethostname(name, namelen);
     const char *fake = "iPhone";   // 出厂默认主机名，与 uname.nodename 一致
-    size_t need = strlen(fake) + 1;
-    if (namelen < need) {
-        memcpy(name, fake, namelen);   // POSIX：缓冲不足时截断
-        return 0;
-    }
-    memcpy(name, fake, need);
+    // v57S: 任何分支都保证 '\0' 结尾 —— 截断后不留 '\0' 会让调用方
+    // strlen() 越界读（EXC_BAD_ACCESS，且 @try 拦不住内存故障）
+    size_t copy = strlen(fake);
+    if (copy > namelen - 1) copy = namelen - 1;
+    memcpy(name, fake, copy);
+    name[copy] = '\0';
     return 0;
 }
 
@@ -793,6 +800,29 @@ static BOOL isDeviceKey(NSString *key) {
 }
 
 // ============================================================
+// v57S: NSProcessInfo 伪造 —— 纯 C 函数 IMP（不用 imp_implementationWithBlock）
+//
+// ★ v57R 闪退教训：
+//   operatingSystemVersion 返回 NSOperatingSystemVersion（3 个 long，
+//   共 24 字节）—— 超过 16 字节走 sret 返回约定。imp_implementationWithBlock
+//   对「结构体返回」的 block 没有 ABI 保证（block invoke 与 IMP 的
+//   sret 布局不保证一致），该方法又在 App 启动早期被 Foundation/UIKit
+//   高频调用 → 启动即崩，@try/@catch 拦不住内存故障。
+//   纯 C 函数做 IMP，返回结构体的 sret 由编译器按 ABI 正确生成 —— 零风险。
+// ============================================================
+static NSOperatingSystemVersion my_osVersion(id self, SEL _cmd) {
+    NSOperatingSystemVersion v;
+    v.majorVersion = 17; v.minorVersion = 6; v.patchVersion = 1;
+    return v;                                   // 与 UA 17_6_1 / uname 23.6.0 一致
+}
+static NSString *my_osVersionString(id self, SEL _cmd) {
+    return @"Version 17.6.1 (Build 21G93)";     // 编译期常量字符串，immortal 无需 retain
+}
+static unsigned long long my_physicalMemory(id self, SEL _cmd) {
+    return FAKE_MEMSIZE;                        // 6GB，与 sysctl hw.memsize 一致
+}
+
+// ============================================================
 // Constructor — v57N
 // ============================================================
 __attribute__((constructor))
@@ -893,33 +923,26 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 2c. NSProcessInfo hooks — 系统版本/内存自洽（v57R 新增） ----
-        // operatingSystemVersion 返回真实 iOS 版本，会与伪造的 17.6.1 矛盾
-        // （App 二进制引用 NSProcessInfo 6 次）
+        // ---- 2c. NSProcessInfo hooks — 系统版本/内存自洽 ----
+        // v57S: 一律用纯 C 函数 IMP（见上方 my_osVersion 注释），
+        // 严禁对返回结构体的方法用 imp_implementationWithBlock
         @try {
             Class piC = objc_getClass("NSProcessInfo");
             if (piC) {
                 Method ovM = class_getInstanceMethod(piC, @selector(operatingSystemVersion));
                 if (ovM) {
-                    IMP imp = imp_implementationWithBlock(^(id s) {
-                        NSOperatingSystemVersion v = {17, 6, 1};
-                        return v;
-                    });
-                    class_replaceMethod(piC, @selector(operatingSystemVersion), imp, method_getTypeEncoding(ovM));
+                    class_replaceMethod(piC, @selector(operatingSystemVersion),
+                                        (IMP)my_osVersion, method_getTypeEncoding(ovM));
                 }
                 Method ovsM = class_getInstanceMethod(piC, @selector(operatingSystemVersionString));
                 if (ovsM) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return @"iOS 17.6.1";
-                    });
-                    class_replaceMethod(piC, @selector(operatingSystemVersionString), imp, method_getTypeEncoding(ovsM));
+                    class_replaceMethod(piC, @selector(operatingSystemVersionString),
+                                        (IMP)my_osVersionString, method_getTypeEncoding(ovsM));
                 }
                 Method pmM = class_getInstanceMethod(piC, @selector(physicalMemory));
                 if (pmM) {
-                    IMP imp = imp_implementationWithBlock(^unsigned long long(id s) {
-                        return FAKE_MEMSIZE;
-                    });
-                    class_replaceMethod(piC, @selector(physicalMemory), imp, method_getTypeEncoding(pmM));
+                    class_replaceMethod(piC, @selector(physicalMemory),
+                                        (IMP)my_physicalMemory, method_getTypeEncoding(pmM));
                 }
             }
         } @catch (id e) {}
