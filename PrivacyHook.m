@@ -127,7 +127,7 @@ static void forceCuidInResultDict(CFMutableDictionaryRef md);
 // 剩余可疑增量只有这 3 条 rebind + dlopen）。先保证能启动，
 // 后续逐条加回以精确定位。
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
-#define REBIND_COUNT 12
+#define REBIND_COUNT 13
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -486,6 +486,7 @@ static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRe
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result) = NULL;
 static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) = NULL;
+static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query) = NULL;
 
 // ---- v57V: keychain 服务名精准拦截 ----
 // 二进制取证发现：
@@ -541,11 +542,85 @@ static void forceCuidInResultDict(CFMutableDictionaryRef md) {
     }
 }
 
+// ============================================================
+// ★ v59: keychain / App Group 全量命名空间隔离
+//
+// 原始 IPA entitlements（DER 实测）：
+//   com.apple.security.application-groups = group.com.baidu.BaiduMobile
+//   keychain-access-groups = B83JBVZ6M5.com.baidu.{shareLoginAccount,
+//                            baidumobile.cuid, netdisk, lbsmap, mtjgroup}
+// TrollStore 重签后这些字符串不变 → 所有克隆共享同一批 keychain 项
+// 和同一个 App Group 容器目录。
+// v57V 只拦 service 含 "cuid" 的项，其余（尤其 shareLoginAccount 里的
+// 登录票据、mtjgroup 里的统计标识）克隆间互通 → 服务端可据此关联
+// （实测：装/开 D2 后 D1 被判风险）。
+//
+// v59 方案：给所有 keychain 项的 service/account/generic 追加本克隆后缀，
+// 读写两侧一致改写 → 各克隆物理互不可见，App 自身逻辑不受影响。
+// App Group 容器同理：容器 URL 追加克隆专属子目录。
+// ============================================================
+static NSString *cloneTag(void) {
+    static NSString *tag = nil;
+    if (!tag) {
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
+        NSArray *parts = [bid componentsSeparatedByString:@"."];
+        NSString *last = parts.count ? parts.lastObject : @"unknown";
+        tag = [NSString stringWithFormat:@"#%@", last];
+    }
+    return tag;
+}
+
+// 改写 keychain 字典的标识字段（返回 +1；无需改写时返回原字典的 retain）
+static CFDictionaryRef mangleKeychainDict(CFDictionaryRef dict) {
+    if (!dict) return NULL;
+    const void *idKeys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    NSString *tag = cloneTag();
+    BOOL need = NO;
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, idKeys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            if (![(__bridge NSString *)v hasSuffix:tag]) { need = YES; break; }
+        }
+    }
+    if (!need) return CFRetain(dict);
+    CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, dict);
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, idKeys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            if (![s hasSuffix:tag]) {
+                CFDictionarySetValue(md, idKeys[i],
+                    (__bridge CFStringRef)[s stringByAppendingString:tag]);
+            }
+        }
+    }
+    return md;
+}
+
+// 结果字典里隐藏克隆后缀（App 若自检 service 不会看出异常）
+static void stripTagInResultDict(CFMutableDictionaryRef md) {
+    if (!md) return;
+    NSString *tag = cloneTag();
+    const void *idKeys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(md, idKeys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            if ([s hasSuffix:tag] && s.length > tag.length) {
+                NSString *ns = [s substringToIndex:s.length - tag.length];
+                CFDictionarySetValue(md, idKeys[i], (__bridge CFStringRef)ns);
+            }
+        }
+    }
+}
+
 static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    OSStatus st = orig_SecItemCopyMatching(query, result);
+    BOOL targeted = isCuidServiceDict(query);   // v57V: 按服务名精准拦截
+    CFDictionaryRef mq = mangleKeychainDict(query);   // v59: 命名空间隔离
+    OSStatus st = orig_SecItemCopyMatching(mq ? mq : query, result);
+    if (mq) CFRelease(mq);
     if (st != 0 || !result || !*result) return st;   // 0 = errSecSuccess
     @try {
-        BOOL targeted = isCuidServiceDict(query);   // v57V: 按服务名精准拦截
         CFTypeRef v = *result;
         CFTypeID tid = CFGetTypeID(v);
         if (tid == CFDataGetTypeID()) {
@@ -556,24 +631,22 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
                 *result = (__bridge_retained CFTypeRef)nd;      // 交给调用方 +1
             }
         } else if (tid == CFDictionaryGetTypeID()) {
+            CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)v);
+            stripTagInResultDict(md);                  // v59: 对外隐藏克隆后缀
             if (targeted) {
-                CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)v);
                 forceCuidInResultDict(md);
-                CFRelease(v);
-                *result = (CFTypeRef)md;   // +1 交给调用方（CF→CF 普通 C 转型）
             } else {
-                CFDataRef vd = (CFDataRef)CFDictionaryGetValue(v, kSecValueData);
+                CFDataRef vd = (CFDataRef)CFDictionaryGetValue(md, kSecValueData);
                 if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
                     NSData *d = (__bridge NSData *)vd;
                     NSData *nd = rewriteIdentityData(d);
                     if (nd != d) {
-                        NSMutableDictionary *md = [(__bridge NSDictionary *)v mutableCopy];
-                        md[(__bridge id)kSecValueData] = nd;
-                        CFRelease(v);
-                        *result = (__bridge_retained CFTypeRef)md;
+                        CFDictionarySetValue(md, kSecValueData, (__bridge CFDataRef)nd);
                     }
                 }
             }
+            CFRelease(v);
+            *result = (CFTypeRef)md;   // +1 交给调用方（CF→CF 普通 C 转型）
         }
     } @catch (id e) {}
     return st;
@@ -581,32 +654,58 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
 
 // v57V: 写入侧 —— cuid 服务名的 keychain 写入直接落伪造值，
 // 让后续所有读取（含未 hook 的通道）天然拿到伪造值
+// v59: 所有写入统一加克隆后缀（物理隔离）
 static OSStatus hook_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     @try {
+        CFDictionaryRef base = attributes;
+        CFMutableDictionaryRef mut = NULL;
         if (isCuidServiceDict(attributes)) {
-            CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributes);
-            forceCuidInResultDict(md);
-            OSStatus st = orig_SecItemAdd(md, result);
-            CFRelease(md);
-            return st;
+            mut = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributes);
+            forceCuidInResultDict(mut);
+            base = mut;
         }
+        CFDictionaryRef mangled = mangleKeychainDict(base);
+        CFDictionaryRef outDict = mangled ? mangled : base;
+        OSStatus st = orig_SecItemAdd(outDict, result);
+        if (mangled) CFRelease(mangled);
+        if (mut) CFRelease(mut);
+        return st;
     } @catch (id e) {}
     return orig_SecItemAdd(attributes, result);
 }
 
 static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
     @try {
+        CFDictionaryRef base = attributesToUpdate;
+        CFMutableDictionaryRef mut = NULL;
         if (isCuidServiceDict(query) || isCuidServiceDict(attributesToUpdate)) {
             if (attributesToUpdate && CFDictionaryGetCount(attributesToUpdate) > 0) {
-                CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributesToUpdate);
-                forceCuidInResultDict(md);
-                OSStatus st = orig_SecItemUpdate(query, md);
-                CFRelease(md);
-                return st;
+                mut = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributesToUpdate);
+                forceCuidInResultDict(mut);
+                base = mut;
             }
         }
+        CFDictionaryRef mq = mangleKeychainDict(query);
+        CFDictionaryRef ma = mangleKeychainDict(base);
+        OSStatus st = orig_SecItemUpdate(mq ? mq : query, ma ? ma : base);
+        if (mq) CFRelease(mq);
+        if (ma) CFRelease(ma);
+        if (mut) CFRelease(mut);
+        return st;
     } @catch (id e) {}
     return orig_SecItemUpdate(query, attributesToUpdate);
+}
+
+// v59: 删除也要加后缀 —— 否则某克隆的「清空重来」会把共享组里
+// 其他克隆/原版 App 的登录票据一起删掉（正是 D2 一开 D1 即异常的嫌疑路径）
+static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
+    @try {
+        CFDictionaryRef mq = mangleKeychainDict(query);
+        OSStatus st = orig_SecItemDelete(mq ? mq : query);
+        if (mq) CFRelease(mq);
+        return st;
+    } @catch (id e) {}
+    return orig_SecItemDelete(query);
 }
 
 static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
@@ -1035,6 +1134,9 @@ static BOOL isDeviceKey(NSString *key) {
 // v58: NSProcessInfo / UIScreen 硬件伪造已整体移除 —— 硬件人格跟真机，
 // 只保留身份伪造（cuid/UDID/IDFV/ECID/设备名）。历史教训见 git v57S/v57T。
 
+// v59: NSFileManager App Group 容器方法原始实现（容器 URL 隔离用）
+static NSURL *(*orig_containerURL)(id, SEL, NSString *) = NULL;
+
 // ============================================================
 // Constructor — v58
 // ============================================================
@@ -1042,18 +1144,18 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 1. v57 简单清理：Cookie storage + Keychain（仅首次） ----
+        // ---- 1. v59: 首启只清 Cookie ----
+        // ★ 教训：此前这里 SecItemDelete 删「所有类别」的 keychain 项，
+        //   而 keychain 访问组是所有克隆共享的 → 装/开一个克隆会把
+        //   原版 App 和其他克隆的登录票据一起删掉（D2 一开 D1 就异常）。
+        //   v59 起所有 keychain 项都带克隆后缀，历史无后缀项对本克隆
+        //   天然不可见，已无需全量清理。
         @try {
             CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("BdD1.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 for (NSHTTPCookie *cookie in [storage cookies]) {
                     [storage deleteCookie:cookie];
-                }
-                NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword,
-                                     (__bridge id)kSecClassCertificate, (__bridge id)kSecClassKey, (__bridge id)kSecClassIdentity];
-                for (id cls in classes) {
-                    SecItemDelete((__bridge CFDictionaryRef)@{(__bridge id)kSecClass: cls});
                 }
                 CFPreferencesSetAppValue(CFSTR("BdD1.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
@@ -1105,6 +1207,29 @@ static void initPrivacyHook(void) {
         // ---- 2c. v58: NSProcessInfo hooks 全部移除 ----
         // 系统版本/内存返回真值，与 sysctl/UIDevice 全通道自洽。
         // （v57S 的纯 C IMP 方案保留在历史版本，若需恢复见 git）
+
+        // ---- 2d. v59: App Group 容器隔离 ----
+        // entitlement: com.apple.security.application-groups = group.com.baidu.BaiduMobile
+        // → 所有克隆拿到同一个容器目录，文件级数据互相可见。
+        // 给返回 URL 追加克隆专属子目录，读写路径一致改写即实现物理隔离。
+        @try {
+            Class fmc = objc_getClass("NSFileManager");
+            if (fmc) {
+                SEL gsel = NSSelectorFromString(@"containerURLForSecurityApplicationGroupIdentifier:");
+                Method gm = class_getInstanceMethod(fmc, gsel);
+                if (gm) {
+                    orig_containerURL = (void *)method_getImplementation(gm);
+                    IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *gid) {
+                        NSURL *u = orig_containerURL ? orig_containerURL(s, gsel, gid) : nil;
+                        if (!u) return nil;
+                        @try {
+                            return [u URLByAppendingPathComponent:cloneTag() isDirectory:YES];
+                        } @catch (id e) { return u; }
+                    });
+                    class_replaceMethod(fmc, gsel, imp, method_getTypeEncoding(gm));
+                }
+            }
+        } @catch (id e) {}
 
         // ---- 3. IDFA hook — 每克隆独立 ----
         @try {
@@ -1489,6 +1614,8 @@ static void initPrivacyHook(void) {
             // v57V: 写入侧也拦截，让 keychain 天然存伪造 cuid
             g_rebindings[10] = (struct rebinding){"SecItemAdd",                           (void *)hook_SecItemAdd,                            (void **)&orig_SecItemAdd};
             g_rebindings[11] = (struct rebinding){"SecItemUpdate",                        (void *)hook_SecItemUpdate,                         (void **)&orig_SecItemUpdate};
+            // v59: 删除也要隔离（否则清 keychain 会连带删掉共享组里其他克隆的票据）
+            g_rebindings[12] = (struct rebinding){"SecItemDelete",                        (void *)hook_SecItemDelete,                         (void **)&orig_SecItemDelete};
             // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
