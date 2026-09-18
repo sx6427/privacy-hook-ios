@@ -1058,11 +1058,34 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
 //   注意 applicationNameForUserAgent 是「追加」语义：若只靠它，
 //   它追加到的默认 UA 里没有 baiduboxapp，结果仍缺该段 —— 所以
 //   必须再配合 customUserAgent（优先级更高，整体替换）双保险。
+// ★★★ v61 UA 策略修正：从「整体覆盖」改为「只补缺段」 ★★★
+//
+// 血泪复盘：v57Q 起把 UA 硬编码成下面这条，三条通道全部强制覆盖。
+// 当时硬件人格也伪造 17.6.1，看着自洽；但 v58 把硬件改回真机后，
+// UIDevice / sysctl 报出的是**真机系统版本**，而 UA 仍写死 17_6_1
+// —— UA 与设备自身环境对不上。
+// 实测表现：原版 App 农场正常，克隆进去「原本能选榴莲，现在不给选」。
+//
+// 正确做法：不要覆盖 App 自己设好的 UA。百度 App 自己就会给 WKWebView
+// 配置带 baiduboxapp 段的 UA（这正是原版一切正常的原因）。我们只在
+// 某条通道的值**确实缺** baiduboxapp 段时才补上，其余原样透传。
+#define BAIDUBOXAPP_SEGMENT @" baiduboxapp/15.69.0.10"
+
+// 仅作参考，不再用于覆盖
 #define FAKE_APP_UA_FULL  @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) " \
                           "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 " \
                           "SP-engine/3.61.0 main/1.0 baiduboxapp/15.69.0.10"
 
-// 完整 UA（含 baiduboxapp 段）
+// 只在缺 baiduboxapp 段时补一段；已含则原样返回（未做任何修改）
+static NSString *ensureBaiduboxAppUA(NSString *ua) {
+    if (ua.length > 0 && [ua rangeOfString:@"baiduboxapp"].location != NSNotFound) {
+        return ua;                                    // 已带该段 —— 一个字都不改
+    }
+    if (ua.length == 0) return @"baiduboxapp/15.69.0.10";
+    return [ua stringByAppendingString:BAIDUBOXAPP_SEGMENT];
+}
+
+// 兼容旧调用点：返回完整 App UA（仅在完全拿不到原值时兜底）
 static NSString *buildFakeUserAgent(void) {
     return FAKE_APP_UA_FULL;
 }
@@ -1396,6 +1419,18 @@ static void initPrivacyHook(void) {
         // entitlement: com.apple.security.application-groups = group.com.baidu.BaiduMobile
         // → 所有克隆拿到同一个容器目录，文件级数据互相可见。
         // 给返回 URL 追加克隆专属子目录，读写路径一致改写即实现物理隔离。
+        // ---- 2d. v61: App Group 容器隔离 —— 【已回退，重要】 ----
+        // v59 曾把 containerURLForSecurityApplicationGroupIdentifier 的返回值
+        // 追加克隆子目录，想隔离文件级共享数据。两个硬伤：
+        //   1) URLByAppendingPathComponent 只拼路径、**不建目录** —— App 拿到
+        //      之后直接写入会静默失败，共享数据全写不进去；
+        //   2) 就算把目录建出来，App 原本写在共享容器里的历史数据也全部不可见，
+        //      App 会当成全新环境重新初始化。
+        // 实测症状：原版 App 农场正常，克隆进去「原本能选榴莲，现在不给选」。
+        // 结论：App Group 容器是 App 自身读写依赖的目录，**不能整体重定向**；
+        // 设备身份与登录态的隔离交给 keychain 层（service 后缀）就够了。
+        // 原实现保留在 git 历史（v59/v60），需要时再取回。
+#if 0
         @try {
             Class fmc = objc_getClass("NSFileManager");
             if (fmc) {
@@ -1406,14 +1441,17 @@ static void initPrivacyHook(void) {
                     IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *gid) {
                         NSURL *u = orig_containerURL ? orig_containerURL(s, gsel, gid) : nil;
                         if (!u) return nil;
-                        @try {
-                            return [u URLByAppendingPathComponent:cloneTag() isDirectory:YES];
-                        } @catch (id e) { return u; }
+                        NSURL *sub = [u URLByAppendingPathComponent:cloneTag() isDirectory:YES];
+                        [[NSFileManager defaultManager] createDirectoryAtURL:sub
+                                                  withIntermediateDirectories:YES
+                                                                   attributes:nil error:nil];
+                        return sub;
                     });
                     class_replaceMethod(fmc, gsel, imp, method_getTypeEncoding(gm));
                 }
             }
         } @catch (id e) {}
+#endif
 
         // ---- 3. IDFA hook — 每克隆独立 ----
         @try {
@@ -1553,7 +1591,7 @@ static void initPrivacyHook(void) {
                         // UA 替换
                         if (value && field && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame
                             && isUALike(value)) {
-                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), buildFakeUserAgent(), field);
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), ensureBaiduboxAppUA(value), field);
                             return;
                         }
                         if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
@@ -1589,7 +1627,7 @@ static void initPrivacyHook(void) {
                     IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
                         if (value && field && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame
                             && isUALike(value)) {
-                            ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), buildFakeUserAgent(), field);
+                            ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), ensureBaiduboxAppUA(value), field);
                             return;
                         }
                         if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
@@ -1702,7 +1740,8 @@ static void initPrivacyHook(void) {
                 if (setAppNameM) {
                     IMP origSAN = method_getImplementation(setAppNameM);
                     IMP newSAN = imp_implementationWithBlock(^void(id s, NSString *name) {
-                        ((void (*)(id, SEL, NSString *))origSAN)(s, @selector(setApplicationNameForUserAgent:), FAKE_APP_UA_FULL);
+                        // v61: 只补缺段，绝不覆盖 App 自己设的值
+                        ((void (*)(id, SEL, NSString *))origSAN)(s, @selector(setApplicationNameForUserAgent:), ensureBaiduboxAppUA(name));
                     });
                     class_replaceMethod(wkCfg, @selector(setApplicationNameForUserAgent:), newSAN, method_getTypeEncoding(setAppNameM));
                 }
@@ -1715,37 +1754,41 @@ static void initPrivacyHook(void) {
                 // c1) 读取侧：getter 永远返回完整 App UA
                 Method getUAM = class_getInstanceMethod(wkView, @selector(customUserAgent));
                 if (getUAM) {
+                    IMP origGUA = method_getImplementation(getUAM);
                     IMP newGUA = imp_implementationWithBlock(^NSString *(id s) {
-                        return buildFakeUserAgent();
+                        // v61: 读原始值，缺段才补 —— 不再无条件返回硬编码 UA
+                        NSString *cur = ((NSString *(*)(id, SEL))origGUA)(s, @selector(customUserAgent));
+                        return ensureBaiduboxAppUA(cur);
                     });
                     class_replaceMethod(wkView, @selector(customUserAgent), newGUA, method_getTypeEncoding(getUAM));
                 }
-                // c2) 写入侧：吞掉任何试图覆盖的 UA，强制为完整 App UA
+                // c2) 写入侧：透传 App 设的值（缺 baiduboxapp 段才补）
                 Method setUAM = class_getInstanceMethod(wkView, @selector(setCustomUserAgent:));
                 if (setUAM) {
                     IMP origSUA = method_getImplementation(setUAM);
                     IMP newSUA = imp_implementationWithBlock(^void(id s, NSString *ua) {
-                        ((void (*)(id, SEL, NSString *))origSUA)(s, @selector(setCustomUserAgent:), buildFakeUserAgent());
+                        ((void (*)(id, SEL, NSString *))origSUA)(s, @selector(setCustomUserAgent:), ensureBaiduboxAppUA(ua));
                     });
                     class_replaceMethod(wkView, @selector(setCustomUserAgent:), newSUA, method_getTypeEncoding(setUAM));
                 }
-                // c3) 构造侧：任何新建 WKWebView 都强制带上完整 App UA
+                // c3) 构造侧：v61 起不再主动写 UA。只在 config 的
+                //     applicationNameForUserAgent 为空或确实缺 baiduboxapp 段时补一段，
+                //     防止个别页面因没设 UA 退化成「非 App 环境」。
                 Method initM = class_getInstanceMethod(wkView, @selector(initWithFrame:configuration:));
                 if (initM) {
                     IMP origInit = method_getImplementation(initM);
                     IMP newInit = imp_implementationWithBlock(^id(id s, CGRect frame, id config) {
                         @try {
-                            if (config && [config respondsToSelector:@selector(setApplicationNameForUserAgent:)]) {
-                                [config setApplicationNameForUserAgent:FAKE_APP_UA_FULL];
+                            if (config &&
+                                [config respondsToSelector:@selector(applicationNameForUserAgent)] &&
+                                [config respondsToSelector:@selector(setApplicationNameForUserAgent:)]) {
+                                NSString *cur = [config applicationNameForUserAgent];
+                                if (cur.length == 0 || [cur rangeOfString:@"baiduboxapp"].location == NSNotFound) {
+                                    [config setApplicationNameForUserAgent:ensureBaiduboxAppUA(cur)];
+                                }
                             }
                         } @catch (id e) {}
-                        id inst = ((id (*)(id, SEL, CGRect, id))origInit)(s, @selector(initWithFrame:configuration:), frame, config);
-                        @try {
-                            if (inst && [inst respondsToSelector:@selector(setCustomUserAgent:)]) {
-                                [inst setCustomUserAgent:buildFakeUserAgent()];
-                            }
-                        } @catch (id e) {}
-                        return inst;
+                        return ((id (*)(id, SEL, CGRect, id))origInit)(s, @selector(initWithFrame:configuration:), frame, config);
                     });
                     class_replaceMethod(wkView, @selector(initWithFrame:configuration:), newInit, method_getTypeEncoding(initM));
                 }
