@@ -308,7 +308,8 @@ static void installBundleIdentifierHooks(void) {
 // 后续逐条加回以精确定位。
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
 // v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
-#define REBIND_COUNT 15
+// v63: 15 → 14 —— 移除 CFBundleGetIdentifier（v60 包标识伪装同批停用）
+#define REBIND_COUNT 14
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -321,9 +322,10 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
         rebind_symbols_image((void *)header, slide, g_rebindings, REBIND_COUNT);
-        // v60: 动态加载的镜像也装「隐藏」rebind。
-        // g_hide_rebindings 在构造函数 7 段就已填好（早于回调注册），此处必定非空。
-        rebind_symbols_image((void *)header, slide, g_hide_rebindings, HIDE_REBIND_COUNT);
+        // v63: 不再装「隐藏」rebind —— 见构造函数 7d 的说明。
+        // 动态加载的镜像若装了 dyld 枚举 hook，任何在新镜像里发起的
+        // _dyld_image_count 调用都会走 O(n) 重映射，且与系统自身使用
+        // 这些 API 的时序冲突，是启动崩溃的高危来源。
     }
 }
 
@@ -782,16 +784,21 @@ static void forceCuidInResultDict(CFMutableDictionaryRef md) {
 // ============================================================
 static NSString *cloneTag(void) {
     static NSString *tag = nil;
-    if (!tag) {
-        // v60: 必须走 realBundleIdentifier()（原始 IMP）。
-        // installBundleIdentifierHooks() 装好之后，对外 bundleIdentifier
-        // 一律是官方值；若这里直接取，所有克隆算出的后缀都会是同一个，
-        // v59 的全量隔离当场失效。
-        NSString *bid = realBundleIdentifier() ?: @"unknown";
-        NSArray *parts = [bid componentsSeparatedByString:@"."];
-        NSString *last = parts.count ? parts.lastObject : @"unknown";
-        tag = [NSString stringWithFormat:@"#%@", last];
-    }
+    if (tag) return tag;
+    // v63: 重入保护。
+    // 本函数现在会在 initWithSuiteName: / CFPreferences / keychain hook
+    // 内部被调用，可能落在非常早、非常深的调用栈上（例如 Foundation
+    // 初始化 NSUserDefaults 的过程中）。原实现「算完才赋值」，一旦
+    // 计算路径重新回到本函数（tag 仍为 nil）就是无限递归 → 爆栈闪退。
+    // 计算前先立哨兵，重入时直接返回哨兵值而不是再算一遍。
+    static BOOL computing = NO;
+    if (computing) return @"#BdInit";
+    computing = YES;
+    NSString *bid = realBundleIdentifier() ?: @"unknown";
+    NSArray *parts = [bid componentsSeparatedByString:@"."];
+    NSString *last = parts.count ? parts.lastObject : @"unknown";
+    tag = [NSString stringWithFormat:@"#%@", last];
+    computing = NO;
     return tag;
 }
 
@@ -1398,6 +1405,13 @@ __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
+        // ---- 0. v63: 先把克隆标签算好，再装任何 hook ----
+        // cloneTag() 会被 initWithSuiteName / CFPreferences / keychain 各处
+        // 在很深的调用栈上（甚至初始化过程中）触发。此刻尚未安装任何
+        // hook，NSBundle 读取路径最干净，提前固定下来可彻底避免
+        // 「惰性计算 → 重入 → 递归爆栈」这一类风险。
+        (void)cloneTag();
+
         // ---- 1. v59: 首启只清 Cookie ----
         // ★ 教训：此前这里 SecItemDelete 删「所有类别」的 keychain 项，
         //   而 keychain 访问组是所有克隆共享的 → 装/开一个克隆会把
@@ -1913,9 +1927,10 @@ static void initPrivacyHook(void) {
             g_rebindings[11] = (struct rebinding){"SecItemUpdate",                        (void *)hook_SecItemUpdate,                         (void **)&orig_SecItemUpdate};
             // v59: 删除也要隔离（否则清 keychain 会连带删掉共享组里其他克隆的票据）
             g_rebindings[12] = (struct rebinding){"SecItemDelete",                        (void *)hook_SecItemDelete,                         (void **)&orig_SecItemDelete};
-            // v60: 包标识的 C 层读取入口（ObjC 侧由 installBundleIdentifierHooks 处理）
-            g_rebindings[13] = (struct rebinding){"CFBundleGetIdentifier",                (void *)hook_CFBundleGetIdentifier,                 (void **)&orig_CFBundleGetIdentifier};
-            g_rebindings[14] = (struct rebinding){"CFPreferencesSetAppValue",             (void *)hook_CFPreferencesSetAppValue,              (void **)&orig_CFPreferencesSetAppValue};
+            // v63: CFBundleGetIdentifier 的 rebind 已移除 —— 它属于 v60 的
+            // 「包标识伪装」，与 NSBundle 那组 hook 同批停用。保留它会造成
+            // 「C 层报官方值、ObjC 层报真实值」的自相矛盾，反而更容易被察觉。
+            g_rebindings[13] = (struct rebinding){"CFPreferencesSetAppValue",             (void *)hook_CFPreferencesSetAppValue,              (void **)&orig_CFPreferencesSetAppValue};
 
             // v60: 隐藏注入痕迹。这里只「填表」，真正的 rebind 放在 7d ——
             // 这几个 API 自身的 GOT 会被替换，安装前必须先把镜像列表收全。
@@ -1945,15 +1960,33 @@ static void initPrivacyHook(void) {
             // 7b. 注册 dyld 回调（动态加载的框架也覆盖，用全局 C 函数）
             _dyld_register_func_for_add_image(hook_new_image);
 
-            // ---- 7c. v60: 包标识伪装（NSBundle 实例方法替换） ----
+            // ---- 7c/7d. v63: v60 的「包标识伪装 + dyld 枚举隐藏」整体停用 ----
+            //
+            // ★ 启动闪退根因（v59 好用、v62 崩，中间只有这两段是新增）★
+            //
+            // 7c（installBundleIdentifierHooks）把 NSBundle 的
+            //   -bundleIdentifier / -infoDictionary / -objectForInfoDictionaryKey
+            // 全局替换，而这几个 hook 里判断「是不是主 bundle」用的是
+            //   bundle == [NSBundle mainBundle]
+            // 首次调用 [NSBundle mainBundle] 需要读自己的 Info.plist →
+            // 触发 -infoDictionary → 进 hook → 再调 [NSBundle mainBundle]
+            // （此刻尚未缓存）→ 无限递归 → 栈溢出 → 启动即崩。
+            // 且它在启动早期被 Foundation 高频调用，必崩。
+            //
+            // 7d（dyld 枚举隐藏）hook 的是 _dyld_image_count /
+            //   _dyld_get_image_name 等 dyld 自身的 API，系统组件、
+            //   ObjC 运行时、崩溃上报 SDK 在启动早期都会调它们，
+            //   每次调用都要 O(n) 遍历重映射，且与系统用这些 API 的
+            //   时序互相干扰 —— 同为启动期高危。
+            //
+            // 结论：这两项收益本来就低（包名检测百度实际没做；dyld 枚举
+            // 是崩溃 SDK 的常规用法），风险却最高。先用最稳的组合：
+            //   v59 的 keychain 隔离 + v61 的功能回退 + v62 的 suite 域隔离。
+            // 两段实现全部保留在文件里（未删除），后续要恢复需先修掉
+            // isMainBundleObject 的递归（改成缓存 mainBundle 指针一次性比较）。
+#if 0
             installBundleIdentifierHooks();
 
-            // ---- 7d. v60: 隐藏注入痕迹（dyld 枚举过滤，必须放最后） ----
-            // 时序关键：本段会把 _dyld_image_count 等自身的 GOT 也替换掉，
-            // 所以「收集镜像」与「安装替换」必须拆成两步 —— 先用局部数组
-            // 把 (header, slide) 收全，再统一 rebind。否则循环里的
-            // _dyld_get_image_header(i) 会走到自己的 hook，索引重映射后
-            // 错位，导致部分镜像漏 hook（甚至重复 hook）。
             @try {
                 static void *hideHdrs[HIDE_MAX_IMG];
                 static intptr_t hideSlides[HIDE_MAX_IMG];
@@ -1975,6 +2008,7 @@ static void initPrivacyHook(void) {
                                          g_hide_rebindings, HIDE_REBIND_COUNT);
                 }
             } @catch (id e) {}
+#endif
         } @catch (id e) {}
     }
 }
