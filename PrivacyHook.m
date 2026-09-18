@@ -111,6 +111,7 @@ static void init_cf_cookie_syms(void) {
 static CFPropertyListRef (*orig_CFPreferencesCopyAppValue)(CFStringRef, CFStringRef) = NULL;
 static CFPropertyListRef (*orig_CFPreferencesCopyValue)(CFStringRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
 static Boolean (*orig_CFPreferencesSetValue)(CFStringRef, CFPropertyListRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
+static void (*orig_CFPreferencesSetAppValue)(CFStringRef, CFPropertyListRef, CFStringRef) = NULL;
 
 // 前向声明
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void));
@@ -124,6 +125,9 @@ static void captureRealIdentity(NSString *name, NSString *value);
 static NSString *rewriteIdentityString(NSString *s);
 static NSData *rewriteIdentityData(NSData *d);
 static NSString *fakeCUIDValue(void);
+static NSString *cloneTag(void);
+static NSString *mapGroupSuite(NSString *suite);
+static CFStringRef mapGroupAppID(CFStringRef appID);
 static BOOL isCuidServiceDict(CFDictionaryRef dict);
 static NSData *fakeCUIDDataFrom(NSData *realData);
 static void forceCuidInResultDict(CFMutableDictionaryRef md);
@@ -304,7 +308,7 @@ static void installBundleIdentifierHooks(void) {
 // 后续逐条加回以精确定位。
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
 // v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
-#define REBIND_COUNT 14
+#define REBIND_COUNT 15
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -588,11 +592,56 @@ static CFArrayRef hook_CFHTTPCookieStorageCopyAllCookies(CFHTTPCookieStorageRef 
 // CFPreferences suite 域隔离 — App Group 共享容器防泄露
 // 若克隆间共享 App Group（entitlement 泄露），SDK 可通过 group.* 域
 // 读写共享设备指纹 → 全部重定向到本克隆私有域，物理隔离
+//
+// ★★ v62 重写（实测驱动）★★
+// v57U~v61 的方案是「key 加前缀 + 塞进 kCFPreferencesCurrentApplication」，
+// 真机验证结果：**完全没生效**。取证（Filza 直读设备文件）：
+//   共享容器 .../Shared/AppGroup/E2DB4240.../Library/Preferences/
+//        group.com.baidu.BaiduMobile.plist          → 72 键，含
+//        cuid / devuid / idfv / user_id / is_login / SAPI_LOCAL_STTOKEN
+//   克隆沙盒 .../Data/Application/<uuid>/Library/Preferences/
+//        group.com.baidu.BaiduMobile.BdE1.plist     → 6 键，无任何身份键
+// 根因：百度用 NSUserDefaults(suiteName:)，底层走 Foundation 内部的
+//   私有函数 _CFPreferences*WithContainer —— 系统库内部调用，
+//   fishhook 重绑定公开符号根本够不到。
+//
+// v62 改为在 **suiteName 层面** 隔离：把 group 域名字加后缀，
+//   group.com.baidu.BaiduMobile → group.com.baidu.BaiduMobile.BdE1
+// iOS 对「未在 entitlement 声明的 group 名」会当作普通域处理，
+// 文件落在 App 自己的沙盒 Library/Preferences/ 下 —— 天然按克隆隔离，
+// 且目录/机制由系统保证，无 v59「只拼路径不建目录」之虞。
+// 真机已存在 group.com.baidu.BaiduMobile.BdD6.plist 这类文件，
+// 证明该形态 iOS 接受。
 // ============================================================
 static BOOL isGroupDomain(CFStringRef appID) {
     if (!appID) return NO;
     NSString *dom = (__bridge NSString *)appID;
     return [dom hasPrefix:@"group."] || [dom hasPrefix:@"group:"];
+}
+
+// 后缀：cloneTag() 是 "#BdE1"，文件名里去掉 '#'（真机验证过的形态用 '.'）
+static NSString *groupSuffix(void) {
+    NSString *tag = cloneTag();
+    if ([tag hasPrefix:@"#"]) return [tag substringFromIndex:1];
+    return tag;
+}
+
+// 把 group 域映射为「本克隆私有域」；非 group 域返回 nil（表示不改写）
+static NSString *mapGroupSuite(NSString *suite) {
+    if (!suite || suite.length == 0) return nil;
+    if (!isGroupDomain((__bridge CFStringRef)suite)) return nil;
+    NSString *suf = groupSuffix();
+    if (suf.length == 0) return nil;
+    if ([suite hasSuffix:suf]) return nil;          // 已映射，幂等
+    return [suite stringByAppendingFormat:@".%@", suf];
+}
+
+// CFStringRef 版本：需要改写时返回 +1 的映射值，调用方负责 release
+static CFStringRef mapGroupAppID(CFStringRef appID) {
+    if (!appID) return NULL;
+    NSString *mapped = mapGroupSuite((__bridge NSString *)appID);
+    if (!mapped) return NULL;
+    return (__bridge_retained CFStringRef)mapped;
 }
 
 // v57U: 出口消毒 —— 返回的字符串若含本机真实身份值则替换
@@ -631,26 +680,18 @@ static CFPropertyListRef sanitizePrefValueForKey(CFStringRef key, CFPropertyList
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
-    CFPropertyListRef v;
-    if (key && appID && isGroupDomain(appID)) {
-        NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
-        v = orig_CFPreferencesCopyAppValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication);
-    } else {
-        v = orig_CFPreferencesCopyAppValue(key, appID);
-    }
+    CFStringRef mapped = mapGroupAppID(appID);
+    CFPropertyListRef v = orig_CFPreferencesCopyAppValue(key, mapped ? mapped : appID);
+    if (mapped) CFRelease(mapped);
     if (isOwnPrefKey(key)) return v;
     v = sanitizePrefValueForKey(key, v);
     return sanitizeIdentityPList(v);
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
-    CFPropertyListRef v;
-    if (key && appID && isGroupDomain(appID)) {
-        NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
-        v = orig_CFPreferencesCopyValue((__bridge CFStringRef)privKey, kCFPreferencesCurrentApplication, user, host);
-    } else {
-        v = orig_CFPreferencesCopyValue(key, appID, user, host);
-    }
+    CFStringRef mapped = mapGroupAppID(appID);
+    CFPropertyListRef v = orig_CFPreferencesCopyValue(key, mapped ? mapped : appID, user, host);
+    if (mapped) CFRelease(mapped);
     if (isOwnPrefKey(key)) return v;
     v = sanitizePrefValueForKey(key, v);
     return sanitizeIdentityPList(v);
@@ -893,13 +934,19 @@ static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
 }
 
 static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
-    if (key && appID && isGroupDomain(appID)) {
-        NSString *privKey = [NSString stringWithFormat:@"%@/%@", (__bridge NSString *)appID, (__bridge NSString *)key];
-        return orig_CFPreferencesSetValue((__bridge CFStringRef)privKey, value,
-                                          kCFPreferencesCurrentApplication,
-                                          kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    }
-    return orig_CFPreferencesSetValue(key, value, appID, user, host);
+    CFStringRef mapped = mapGroupAppID(appID);
+    Boolean ok = orig_CFPreferencesSetValue(key, value, mapped ? mapped : appID, user, host);
+    if (mapped) CFRelease(mapped);
+    return ok;
+}
+
+// v62: CFPreferencesSetAppValue 是公开 API，v61 之前完全漏了 ——
+// 任何直接调用它的 SDK 都能把设备指纹原样写进共享域。
+static void hook_CFPreferencesSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID) {
+    if (!orig_CFPreferencesSetAppValue) return;
+    CFStringRef mapped = mapGroupAppID(appID);
+    orig_CFPreferencesSetAppValue(key, value, mapped ? mapped : appID);
+    if (mapped) CFRelease(mapped);
 }
 
 // ============================================================
@@ -1467,10 +1514,33 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. NSUserDefaults hooks — 拦截设备 ID 读取 ----
+        // ---- 4. NSUserDefaults hooks — 拦截设备 ID 读取 + v62 suite 域隔离 ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
+                // ★ v62 核心修复 ★ —— group 域隔离必须从 suiteName 这一层做。
+                // 实测证据：CFPreferences 那几个 C 函数的重绑定对百度的
+                // NSUserDefaults(suiteName:) 毫无作用（它走 Foundation 内部
+                // 私有函数 _CFPreferences*WithContainer，fishhook 够不到），
+                // 结果 5 个克隆共享同一份 group.com.baidu.BaiduMobile.plist，
+                // 里面 cuid/devuid/idfv/user_id/登录票据全是同一份值。
+                //
+                // 把 suite 名加克隆后缀后：
+                //   group.com.baidu.BaiduMobile → group.com.baidu.BaiduMobile.BdE1
+                // iOS 对未声明 group 名按普通域处理，文件落在 App 自己沙盒的
+                // Library/Preferences/ 下 —— 天然按克隆隔离，目录与写入机制
+                // 全由系统保证（不存在 v59「拼了路径没建目录」的静默失败）。
+                // App 读写的 key 完全不变，功能不受影响。
+                Method issM = class_getInstanceMethod(uc, @selector(initWithSuiteName:));
+                if (issM) {
+                    IMP origISS = method_getImplementation(issM);
+                    IMP impISS = imp_implementationWithBlock(^id(id s, NSString *suite) {
+                        NSString *mapped = mapGroupSuite(suite);
+                        return ((id (*)(id, SEL, NSString *))origISS)(
+                            s, @selector(initWithSuiteName:), mapped ? mapped : suite);
+                    });
+                    class_replaceMethod(uc, @selector(initWithSuiteName:), impISS, method_getTypeEncoding(issM));
+                }
                 Method ofkM = class_getInstanceMethod(uc, @selector(objectForKey:));
                 if (ofkM) {
                     IMP orig = method_getImplementation(ofkM);
@@ -1845,6 +1915,7 @@ static void initPrivacyHook(void) {
             g_rebindings[12] = (struct rebinding){"SecItemDelete",                        (void *)hook_SecItemDelete,                         (void **)&orig_SecItemDelete};
             // v60: 包标识的 C 层读取入口（ObjC 侧由 installBundleIdentifierHooks 处理）
             g_rebindings[13] = (struct rebinding){"CFBundleGetIdentifier",                (void *)hook_CFBundleGetIdentifier,                 (void **)&orig_CFBundleGetIdentifier};
+            g_rebindings[14] = (struct rebinding){"CFPreferencesSetAppValue",             (void *)hook_CFPreferencesSetAppValue,              (void **)&orig_CFPreferencesSetAppValue};
 
             // v60: 隐藏注入痕迹。这里只「填表」，真正的 rebind 放在 7d ——
             // 这几个 API 自身的 GOT 会被替换，安装前必须先把镜像列表收全。
