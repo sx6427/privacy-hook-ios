@@ -1,27 +1,36 @@
 //
-// PrivacyHook.m — v57N: 全套伪造硬件人格（内部自洽）
+// PrivacyHook.m — v60: 身份伪造 + 全量隔离 + 隐藏注入痕迹
 //
-// ============ v57N 设计原理（v57L 策略修正） ============
+// ============ 版本主线 ============
+//   v57N  伪造全套硬件人格（后被 v58 推翻）
+//   v57Q  WKWebView UA 三路补堵（H5 读不到 baiduboxapp 段 → 农场进不去）
+//   v57V  按 keychain 服务名精准拦截 cuid（修「下单人数多」）
+//   v58   硬件人格一律回真机（假报大屏 → 小屏机页面错乱）
+//   v59   keychain + App Group 全量命名空间隔离（克隆互不串味）
+//   v60   隐藏注入痕迹：dyld 镜像枚举过滤 + 包标识伪装
 //
-// v57L 失败教训：
-//   v57L 保留真机真实机型/系统，只伪装唯一标识。
-//   但实测发现：同一台手机上"官方原版百度App下单也被限制"，
-//   证明这台机器的真实指纹本身已在百度黑名单中。
-//   → v57L 等于主动上报被拉黑的身份，必死。
+// ============ v60 设计（当前） ============
 //
-// v57N 策略：彻底伪造一套全新且自洽的硬件人格
-//   - 机型/系统版本/屏幕/状态栏/UA 全部指向同一个伪造目标
-//   - 目标机型参照真机流量样本: ua=1284_2778_iphone (Pro Max 灵动岛)
-//   - 关键：所有子系统读到的值必须互相印证，不能有矛盾
-//     (v57k 失败正是因为 假机型4.7寸 ↔ 真屏幕6.7寸 矛盾)
+// 堵两条已知暴露面：
+//   1) dyld 枚举 —— 主可执行里有 _dyld_image_count /
+//      _dyld_get_image_name / _dyld_get_image_header /
+//      _dyld_get_image_vmaddr_slide。任何一次完整枚举都能看到
+//      注入的 BaiduBoxSys.dylib（镜像数 +1、多一条陌生路径）。
+//      → 对外 count 减 1，并做「对外索引 → 真实索引」重映射，
+//        跳过隐藏项，遍历结果依旧连续完整。
+//   2) 包标识 —— 多开必须改 bundle id，克隆是
+//      com.baidu.BaiduMobile.BdD1，与官方不同，属重打包特征。
+//      → 读取侧（bundleIdentifier / infoDictionary /
+//        objectForInfoDictionaryKey / CFBundleGetIdentifier）
+//        一律返回官方值；克隆后缀改走 realBundleIdentifier()。
 //
-// ⚠ 前提：本方案假设设备真实指纹已被标记。
-//   长期方案仍是换一台干净设备 + 全新账号。
+// 身份伪造（cuid/UDID/IDFV/ECID/设备名）与 v59 隔离机制维持不变。
 //
 // 保留教训（不重蹈覆辙）：
 //   不 hook sysctl() 旧 API（闪退）；不 hook setURL:/setHTTPBody:（签名错误）；
 //   fishhook 覆盖所有非系统镜像 + dyld 回调；dyld 回调用全局 C 函数；
 //   持久化用 CFPreferences 不用 NSUserDefaults；-Xlinker -no_fixup_chains。
+//   返回结构体的方法严禁用 imp_implementationWithBlock（走 sret，ABI 无保证）。
 //
 
 #import <Foundation/Foundation.h>
@@ -120,6 +129,173 @@ static NSData *fakeCUIDDataFrom(NSData *realData);
 static void forceCuidInResultDict(CFMutableDictionaryRef md);
 
 // ============================================================
+// v60-A: 隐藏注入痕迹 —— dyld 镜像枚举过滤
+//
+// 背景：主可执行里实测存在 _dyld_image_count / _dyld_get_image_name /
+// _dyld_get_image_header / _dyld_get_image_vmaddr_slide（各 2~3 处）。
+// 任何一次完整枚举都会看到注入的 BaiduBoxSys.dylib —— 镜像总数 +1，
+// 且多出一条陌生路径，是最直白的「被注入」证据。
+//
+// 做法：对外把 count 减 1，并把「对外索引」重映射到「真实索引」
+// （跳过隐藏项）。App 遍历 0..count-1 拿到的仍是连续完整的列表。
+//
+// ⚠️ 隐藏判定只能调用 orig_*，否则自我递归 / 索引错位。
+// ⚠️ 这几个 API 自身的 GOT 也会被替换，所以安装 rebind 时必须先用
+//    局部数组把 (header, slide) 收全，再统一替换（见构造函数 7d）。
+// ============================================================
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
+
+#define HIDDEN_IMAGE_COUNT 1
+static const char *g_hiddenImageKeys[HIDDEN_IMAGE_COUNT] = { "BaiduBoxSys.dylib" };
+
+static int isHiddenImageIndex(uint32_t idx) {
+    if (!orig_dyld_get_image_name) return 0;
+    const char *n = orig_dyld_get_image_name(idx);
+    if (!n) return 0;
+    for (int i = 0; i < HIDDEN_IMAGE_COUNT; i++) {
+        if (strstr(n, g_hiddenImageKeys[i])) return 1;
+    }
+    return 0;
+}
+
+static uint32_t hook_dyld_image_count(void) {
+    if (!orig_dyld_image_count) return 0;
+    uint32_t total = orig_dyld_image_count();
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (isHiddenImageIndex(i)) hidden++;
+    }
+    return total - hidden;
+}
+
+static uint32_t mapImageIndex(uint32_t outIdx) {
+    if (!orig_dyld_image_count) return outIdx;
+    uint32_t total = orig_dyld_image_count();
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (isHiddenImageIndex(i)) continue;
+        if (seen == outIdx) return i;
+        seen++;
+    }
+    return outIdx;   // 越界：透传，交给系统自己报错
+}
+
+static const char *hook_dyld_get_image_name(uint32_t idx) {
+    if (!orig_dyld_get_image_name) return NULL;
+    return orig_dyld_get_image_name(mapImageIndex(idx));
+}
+
+static const struct mach_header *hook_dyld_get_image_header(uint32_t idx) {
+    if (!orig_dyld_get_image_header) return NULL;
+    return orig_dyld_get_image_header(mapImageIndex(idx));
+}
+
+static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t idx) {
+    if (!orig_dyld_get_image_vmaddr_slide) return 0;
+    return orig_dyld_get_image_vmaddr_slide(mapImageIndex(idx));
+}
+
+#define HIDE_REBIND_COUNT 4
+#define HIDE_MAX_IMG      512
+static struct rebinding g_hide_rebindings[HIDE_REBIND_COUNT];
+
+// ============================================================
+// v60-B: 包标识伪装 —— 对外一律报告官方 bundle id
+//
+// 背景：多开必须改 bundle id（同 id 无法共存），克隆是
+// "com.baidu.BaiduMobile.BdD1"，官方是 "com.baidu.BaiduMobile"。
+// 主可执行里 bundleIdentifier 选择器 5 处、CFBundleIdentifier 4 处、
+// objectForInfoDictionaryKey 1 处。改包名本就是重打包检测的经典特征。
+//
+// 做法：读取侧全部返回官方值。
+// ⚠️ 克隆后缀（keychain 命名空间）必须改走 realBundleIdentifier()，
+//    绝不能再取被 hook 后的值 —— 否则每个克隆算出的后缀都会变成
+//    "BaiduMobile"，v59 的隔离当场失效（所有克隆挤进同一命名空间）。
+// ============================================================
+#define OFFICIAL_BUNDLE_ID "com.baidu.BaiduMobile"
+
+static NSString *(*orig_bundleIdentifier)(id, SEL) = NULL;
+static NSDictionary *(*orig_infoDictionary)(id, SEL) = NULL;
+static id (*orig_objectForInfoDictionaryKey)(id, SEL, NSString *) = NULL;
+static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef) = NULL;
+
+// 取真实 bundle id（绕过 hook）—— 只给 cloneTag 用
+static NSString *realBundleIdentifier(void) {
+    if (orig_bundleIdentifier) {
+        return orig_bundleIdentifier([NSBundle mainBundle], @selector(bundleIdentifier));
+    }
+    return [[NSBundle mainBundle] bundleIdentifier];
+}
+
+static BOOL isMainBundleObject(id bundle) {
+    return (bundle != nil) && (bundle == [NSBundle mainBundle]);
+}
+
+static NSString *hook_bundleIdentifier(id self, SEL _cmd) {
+    if (isMainBundleObject(self)) return @(OFFICIAL_BUNDLE_ID);
+    if (orig_bundleIdentifier) return orig_bundleIdentifier(self, _cmd);
+    return nil;
+}
+
+static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
+    NSDictionary *d = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
+    if (!d || !isMainBundleObject(self)) return d;
+    static NSDictionary *cached = nil;          // infoDictionary 被高频调用，缓存一份
+    if (!cached) {
+        NSMutableDictionary *md = [d mutableCopy];
+        if (md) {
+            md[@"CFBundleIdentifier"] = @(OFFICIAL_BUNDLE_ID);
+            cached = md;
+        }
+    }
+    return cached ? cached : d;
+}
+
+static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
+    if (isMainBundleObject(self) && key && [key isEqualToString:@"CFBundleIdentifier"]) {
+        return @(OFFICIAL_BUNDLE_ID);
+    }
+    if (orig_objectForInfoDictionaryKey) return orig_objectForInfoDictionaryKey(self, _cmd, key);
+    return nil;
+}
+
+static CFStringRef hook_CFBundleGetIdentifier(CFBundleRef b) {
+    if (b && b == CFBundleGetMainBundle()) return CFSTR(OFFICIAL_BUNDLE_ID);
+    if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(b);
+    return NULL;
+}
+
+// 给实例方法装 IMP，并把原实现存进 outOrig（传 &orig_xxx）
+// class_addMethod 成功 = 本类原本没有该方法（继承自父类），新 IMP 直接生效；
+// 返回 NO = 本类已有实现，走 method_setImplementation 覆盖。
+// 这样绝不会误改父类的实现（NSBundle 的方法若来自父类，直接
+// method_setImplementation 会污染所有子类）。
+static void installInstanceMethod(Class cls, SEL sel, IMP newImp, void *outOrig) {
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    if (outOrig) *(void **)outOrig = (void *)orig;
+    if (!class_addMethod(cls, sel, newImp, method_getTypeEncoding(m))) {
+        method_setImplementation(m, newImp);
+    }
+}
+
+static void installBundleIdentifierHooks(void) {
+    Class nb = objc_getClass("NSBundle");
+    if (!nb) return;
+    installInstanceMethod(nb, @selector(bundleIdentifier),
+                          (IMP)hook_bundleIdentifier, &orig_bundleIdentifier);
+    installInstanceMethod(nb, @selector(infoDictionary),
+                          (IMP)hook_infoDictionary, &orig_infoDictionary);
+    installInstanceMethod(nb, @selector(objectForInfoDictionaryKey:),
+                          (IMP)hook_objectForInfoDictionaryKey, &orig_objectForInfoDictionaryKey);
+}
+
+// ============================================================
 // 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
 // ============================================================
 // v57T: 回退到 9 条 —— uname/sysctl/gethostname 三条 rebind 与
@@ -127,7 +303,8 @@ static void forceCuidInResultDict(CFMutableDictionaryRef md);
 // 剩余可疑增量只有这 3 条 rebind + dlopen）。先保证能启动，
 // 后续逐条加回以精确定位。
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
-#define REBIND_COUNT 13
+// v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
+#define REBIND_COUNT 14
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -140,6 +317,9 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
         rebind_symbols_image((void *)header, slide, g_rebindings, REBIND_COUNT);
+        // v60: 动态加载的镜像也装「隐藏」rebind。
+        // g_hide_rebindings 在构造函数 7 段就已填好（早于回调注册），此处必定非空。
+        rebind_symbols_image((void *)header, slide, g_hide_rebindings, HIDE_REBIND_COUNT);
     }
 }
 
@@ -562,7 +742,11 @@ static void forceCuidInResultDict(CFMutableDictionaryRef md) {
 static NSString *cloneTag(void) {
     static NSString *tag = nil;
     if (!tag) {
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
+        // v60: 必须走 realBundleIdentifier()（原始 IMP）。
+        // installBundleIdentifierHooks() 装好之后，对外 bundleIdentifier
+        // 一律是官方值；若这里直接取，所有克隆算出的后缀都会是同一个，
+        // v59 的全量隔离当场失效。
+        NSString *bid = realBundleIdentifier() ?: @"unknown";
         NSArray *parts = [bid componentsSeparatedByString:@"."];
         NSString *last = parts.count ? parts.lastObject : @"unknown";
         tag = [NSString stringWithFormat:@"#%@", last];
@@ -1616,6 +1800,16 @@ static void initPrivacyHook(void) {
             g_rebindings[11] = (struct rebinding){"SecItemUpdate",                        (void *)hook_SecItemUpdate,                         (void **)&orig_SecItemUpdate};
             // v59: 删除也要隔离（否则清 keychain 会连带删掉共享组里其他克隆的票据）
             g_rebindings[12] = (struct rebinding){"SecItemDelete",                        (void *)hook_SecItemDelete,                         (void **)&orig_SecItemDelete};
+            // v60: 包标识的 C 层读取入口（ObjC 侧由 installBundleIdentifierHooks 处理）
+            g_rebindings[13] = (struct rebinding){"CFBundleGetIdentifier",                (void *)hook_CFBundleGetIdentifier,                 (void **)&orig_CFBundleGetIdentifier};
+
+            // v60: 隐藏注入痕迹。这里只「填表」，真正的 rebind 放在 7d ——
+            // 这几个 API 自身的 GOT 会被替换，安装前必须先把镜像列表收全。
+            // 提前填表是为了让 7b 注册的 dyld 回调里也能安全使用。
+            g_hide_rebindings[0] = (struct rebinding){"_dyld_image_count",            (void *)hook_dyld_image_count,           (void **)&orig_dyld_image_count};
+            g_hide_rebindings[1] = (struct rebinding){"_dyld_get_image_name",         (void *)hook_dyld_get_image_name,        (void **)&orig_dyld_get_image_name};
+            g_hide_rebindings[2] = (struct rebinding){"_dyld_get_image_header",       (void *)hook_dyld_get_image_header,      (void **)&orig_dyld_get_image_header};
+            g_hide_rebindings[3] = (struct rebinding){"_dyld_get_image_vmaddr_slide", (void *)hook_dyld_get_image_vmaddr_slide,(void **)&orig_dyld_get_image_vmaddr_slide};
             // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
@@ -1636,6 +1830,37 @@ static void initPrivacyHook(void) {
 
             // 7b. 注册 dyld 回调（动态加载的框架也覆盖，用全局 C 函数）
             _dyld_register_func_for_add_image(hook_new_image);
+
+            // ---- 7c. v60: 包标识伪装（NSBundle 实例方法替换） ----
+            installBundleIdentifierHooks();
+
+            // ---- 7d. v60: 隐藏注入痕迹（dyld 枚举过滤，必须放最后） ----
+            // 时序关键：本段会把 _dyld_image_count 等自身的 GOT 也替换掉，
+            // 所以「收集镜像」与「安装替换」必须拆成两步 —— 先用局部数组
+            // 把 (header, slide) 收全，再统一 rebind。否则循环里的
+            // _dyld_get_image_header(i) 会走到自己的 hook，索引重映射后
+            // 错位，导致部分镜像漏 hook（甚至重复 hook）。
+            @try {
+                static void *hideHdrs[HIDE_MAX_IMG];
+                static intptr_t hideSlides[HIDE_MAX_IMG];
+                int hideN = 0;
+                uint32_t cnt2 = _dyld_image_count();      // 此刻尚未被替换
+                for (uint32_t i = 0; i < cnt2 && hideN < HIDE_MAX_IMG; i++) {
+                    const struct mach_header *h = _dyld_get_image_header(i);
+                    const char *p = _dyld_get_image_name(i);
+                    if (!h || !p) continue;
+                    if (strncmp(p, "/usr/lib/", 9) == 0) continue;
+                    if (strncmp(p, "/System/", 8) == 0) continue;
+                    if (strncmp(p, "/Developer/", 11) == 0) continue;
+                    hideHdrs[hideN] = (void *)h;
+                    hideSlides[hideN] = _dyld_get_image_vmaddr_slide(i);
+                    hideN++;
+                }
+                for (int k = 0; k < hideN; k++) {
+                    rebind_symbols_image(hideHdrs[k], hideSlides[k],
+                                         g_hide_rebindings, HIDE_REBIND_COUNT);
+                }
+            } @catch (id e) {}
         } @catch (id e) {}
     }
 }
