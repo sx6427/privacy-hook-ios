@@ -1,13 +1,19 @@
 //
-// PrivacyHook.m — v60: 身份伪造 + 全量隔离 + 隐藏注入痕迹
+// PrivacyHook.m — v64: 按键精准隔离（修「果园选不了水果」）
 //
 // ============ 版本主线 ============
 //   v57N  伪造全套硬件人格（后被 v58 推翻）
 //   v57Q  WKWebView UA 三路补堵（H5 读不到 baiduboxapp 段 → 农场进不去）
 //   v57V  按 keychain 服务名精准拦截 cuid（修「下单人数多」）
 //   v58   硬件人格一律回真机（假报大屏 → 小屏机页面错乱）
-//   v59   keychain + App Group 全量命名空间隔离（克隆互不串味）
-//   v60   隐藏注入痕迹：dyld 镜像枚举过滤 + 包标识伪装
+//   v59   keychain 全量命名空间隔离（克隆互不串味）
+//   v60   隐藏注入痕迹：dyld 镜像枚举过滤 + 包标识伪装（v63 停用）
+//   v61   回退 App Group 容器重定向 + UA 补缺（修「选不了榴莲」）
+//   v62   group 域整域隔离（swizzle initWithSuiteName: + CFPreferences 换 appID）
+//   v63   停用 v60 两段（修 v62 启动闪退）+ cloneTag 重入保护
+//   v64   隔离粒度收窄到「身份键」——整域隔离会让共享域 72 键全读不到，
+//         果园这类 H5 活动页拿不到渠道/活动参数 →「能进但选不了水果」。
+//         改为 init 不改域名 + 按 key 分流：身份键走私有域，其余走共享域。
 //
 // ============ v60 设计（当前） ============
 //
@@ -646,6 +652,80 @@ static CFStringRef mapGroupAppID(CFStringRef appID) {
     return (__bridge_retained CFStringRef)mapped;
 }
 
+// ============================================================
+// ★ v64: 按键精准隔离（取代 v62 的 group 域整域隔离）
+//
+// v62 把 group 域整体指到本克隆私有域。真机取证（Filza WebDAV 直读）：
+//   共享域 group.com.baidu.BaiduMobile.plist        72 键
+//   克隆私有域 group.com.baidu.BaiduMobile.BdD6.plist  5~6 键（只有 SAPI 登录态）
+// → channel_prefix / BDPOpenWidgetCommonParams / 成长权益 / 位置历史 /
+//   Widget 数据 等 60 多个 **非身份** 键全部读不到。
+// 果园是跑在 WKWebView 里的 H5 活动页，初始化要读渠道与活动参数，
+// 症状就是「能进果园，但选不了水果」。
+//
+// v64 只把「设备/账号标识」这一类键重定向到私有域，其余键一律继续
+// 读写共享域（等价 v61 的可用行为）：
+//   身份各克隆独立（防关联）+ 功能数据完整（果园可用）。
+// ============================================================
+static BOOL isStrictIdentityKeyStr(NSString *k) {
+    if (k.length == 0) return NO;
+    static NSSet *exact = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        exact = [NSSet setWithArray:@[
+            @"cuid", @"devuid", @"idfv", @"user_id", @"is_login", @"bdpanCookie",
+            @"BNPush_cuid", @"BNPush_cacheCuid", @"BNPush_token", @"BNPush_channelid",
+        ]];
+    });
+    if ([exact containsObject:k]) return YES;
+    if ([k rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    return NO;
+}
+
+static BOOL isStrictIdentityKey(CFStringRef key) {
+    if (!key) return NO;
+    return isStrictIdentityKeyStr((__bridge NSString *)key);
+}
+
+// ---- v64: NSUserDefaults 私有域镜像（按键重定向用）----
+static IMP g_origISS = NULL;              // 原始 -[NSUserDefaults initWithSuiteName:]
+static char kUDGroupSuiteKey;             // 关联对象 key：记录实例的 group 域名
+static BOOL g_inPrivPeer = NO;            // 私有域实例构造重入哨兵
+
+// 用原始 IMP 构造实例，绕过 swizzle（不打标记、不递归）
+static NSUserDefaults *udRaw(NSString *suite) {
+    if (!g_origISS || suite.length == 0) return nil;
+    Class uc = objc_getClass("NSUserDefaults");
+    if (!uc) return nil;
+    id o = [uc alloc];
+    return ((id (*)(id, SEL, NSString *))g_origISS)(o, @selector(initWithSuiteName:), suite);
+}
+
+// 取该 group 域实例对应的「本克隆私有域」实例（惰性建、缓存）
+static NSUserDefaults *privPeerFor(id s) {
+    // 重入保护：udRaw 构造实例时可能再次走到本函数（swizzle 是类级别的），
+    // 不设哨兵会无限递归 → 栈溢出闪退（v62 的 NSBundle 递归是同类教训）。
+    if (!s || g_inPrivPeer) return nil;
+    NSString *suite = objc_getAssociatedObject(s, &kUDGroupSuiteKey);
+    if (suite.length == 0) return nil;
+    NSString *mapped = mapGroupSuite(suite);
+    if (mapped.length == 0) return nil;
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+    @synchronized (cache) {
+        NSUserDefaults *d = cache[mapped];
+        if (d) return d;
+        g_inPrivPeer = YES;
+        @try {
+            d = udRaw(mapped);
+            if (d) cache[mapped] = d;
+        } @catch (id e) {}
+        g_inPrivPeer = NO;
+        return d;
+    }
+}
+
 // v57U: 出口消毒 —— 返回的字符串若含本机真实身份值则替换
 // （SDK 把真实 cuid 缓存在 NSUserDefaults/CFPreferences 里，读出来
 //   就拼进请求参数。按值替换，不做 key 名猜测。）
@@ -682,7 +762,8 @@ static CFPropertyListRef sanitizePrefValueForKey(CFStringRef key, CFPropertyList
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
-    CFStringRef mapped = mapGroupAppID(appID);
+    // v64: 只有身份键才改 appID（读本克隆私有域）；功能键保持原域，功能不受影响。
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
     CFPropertyListRef v = orig_CFPreferencesCopyAppValue(key, mapped ? mapped : appID);
     if (mapped) CFRelease(mapped);
     if (isOwnPrefKey(key)) return v;
@@ -691,7 +772,7 @@ static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStrin
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
-    CFStringRef mapped = mapGroupAppID(appID);
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
     CFPropertyListRef v = orig_CFPreferencesCopyValue(key, mapped ? mapped : appID, user, host);
     if (mapped) CFRelease(mapped);
     if (isOwnPrefKey(key)) return v;
@@ -941,7 +1022,8 @@ static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
 }
 
 static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
-    CFStringRef mapped = mapGroupAppID(appID);
+    // v64: 身份键写私有域；功能键写回原域（否则会把共享配置整体搬进私有域）
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
     Boolean ok = orig_CFPreferencesSetValue(key, value, mapped ? mapped : appID, user, host);
     if (mapped) CFRelease(mapped);
     return ok;
@@ -951,7 +1033,7 @@ static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef val
 // 任何直接调用它的 SDK 都能把设备指纹原样写进共享域。
 static void hook_CFPreferencesSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID) {
     if (!orig_CFPreferencesSetAppValue) return;
-    CFStringRef mapped = mapGroupAppID(appID);
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
     orig_CFPreferencesSetAppValue(key, value, mapped ? mapped : appID);
     if (mapped) CFRelease(mapped);
 }
@@ -1528,30 +1610,35 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 4. NSUserDefaults hooks — 拦截设备 ID 读取 + v62 suite 域隔离 ----
+        // ---- 4. NSUserDefaults hooks — 设备 ID 伪造 + v64 按键精准隔离 ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
-                // ★ v62 核心修复 ★ —— group 域隔离必须从 suiteName 这一层做。
-                // 实测证据：CFPreferences 那几个 C 函数的重绑定对百度的
-                // NSUserDefaults(suiteName:) 毫无作用（它走 Foundation 内部
-                // 私有函数 _CFPreferences*WithContainer，fishhook 够不到），
-                // 结果 5 个克隆共享同一份 group.com.baidu.BaiduMobile.plist，
-                // 里面 cuid/devuid/idfv/user_id/登录票据全是同一份值。
+                // ★ v64: 隔离粒度从「整个 group 域」收窄到「身份键」 ★
                 //
-                // 把 suite 名加克隆后缀后：
-                //   group.com.baidu.BaiduMobile → group.com.baidu.BaiduMobile.BdE1
-                // iOS 对未声明 group 名按普通域处理，文件落在 App 自己沙盒的
-                // Library/Preferences/ 下 —— 天然按克隆隔离，目录与写入机制
-                // 全由系统保证（不存在 v59「拼了路径没建目录」的静默失败）。
-                // App 读写的 key 完全不变，功能不受影响。
+                // v62 曾把 suite 名整体加后缀（group.com.baidu.BaiduMobile →
+                // group.com.baidu.BaiduMobile.BdE1）。key 名虽不变，但整份
+                // 共享数据（真机实测 72 键）都看不见了 —— 果园这类跑在
+                // WKWebView 里的 H5 活动页拿不到渠道/活动参数，症状就是
+                // 「能进果园，但选不了水果」。
+                //
+                // v64 做法：initWithSuiteName: **不再改域名**（实例仍指向共享
+                // 域），只给 group 域实例打个标记；随后在 objectForKey: /
+                // stringForKey: / setObject:forKey: 里按 key 分流 ——
+                // 身份键走本克隆私有域，其余键留在共享域。
+                // 于是：身份各克隆独立（防关联），功能数据完整（果园可用）。
                 Method issM = class_getInstanceMethod(uc, @selector(initWithSuiteName:));
                 if (issM) {
-                    IMP origISS = method_getImplementation(issM);
+                    g_origISS = method_getImplementation(issM);
                     IMP impISS = imp_implementationWithBlock(^id(id s, NSString *suite) {
-                        NSString *mapped = mapGroupSuite(suite);
-                        return ((id (*)(id, SEL, NSString *))origISS)(
-                            s, @selector(initWithSuiteName:), mapped ? mapped : suite);
+                        id obj = ((id (*)(id, SEL, NSString *))g_origISS)(
+                            s, @selector(initWithSuiteName:), suite);
+                        if (obj && suite.length &&
+                            isGroupDomain((__bridge CFStringRef)suite)) {
+                            objc_setAssociatedObject(obj, &kUDGroupSuiteKey, suite,
+                                                     OBJC_ASSOCIATION_RETAIN);
+                        }
+                        return obj;
                     });
                     class_replaceMethod(uc, @selector(initWithSuiteName:), impISS, method_getTypeEncoding(issM));
                 }
@@ -1559,6 +1646,14 @@ static void initPrivacyHook(void) {
                 if (ofkM) {
                     IMP orig = method_getImplementation(ofkM);
                     IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
+                        // v64: group 域 + 身份键 → 重定向到本克隆私有域
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                return ((id (*)(id, SEL, NSString *))orig)(
+                                    p, @selector(objectForKey:), key);
+                            }
+                        }
                         if (!g_inUDHook && isDeviceKey(key)) {
                             g_inUDHook = YES;
                             @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
@@ -1572,6 +1667,13 @@ static void initPrivacyHook(void) {
                 if (sfkM) {
                     IMP orig = method_getImplementation(sfkM);
                     IMP imp = imp_implementationWithBlock(^NSString *(id s, NSString *key) {
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                return ((NSString *(*)(id, SEL, NSString *))orig)(
+                                    p, @selector(stringForKey:), key);
+                            }
+                        }
                         if (!g_inUDHook && isDeviceKey(key)) {
                             g_inUDHook = YES;
                             @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
@@ -1580,6 +1682,42 @@ static void initPrivacyHook(void) {
                         return ((NSString *(*)(id, SEL, NSString *))orig)(s, @selector(stringForKey:), key);
                     });
                     class_replaceMethod(uc, @selector(stringForKey:), imp, method_getTypeEncoding(sfkM));
+                }
+                // v64: 写入侧对称分流 —— 身份键写私有域，其余键写共享域
+                // （不这么做的话，因为 v64 已不改域名，身份键会被写进共享域 → 污染）
+                Method soM = class_getInstanceMethod(uc, @selector(setObject:forKey:));
+                if (soM) {
+                    IMP orig = method_getImplementation(soM);
+                    IMP imp = imp_implementationWithBlock(^(id s, id value, NSString *key) {
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                ((void (*)(id, SEL, id, NSString *))orig)(
+                                    p, @selector(setObject:forKey:), value, key);
+                                return;
+                            }
+                        }
+                        ((void (*)(id, SEL, id, NSString *))orig)(
+                            s, @selector(setObject:forKey:), value, key);
+                    });
+                    class_replaceMethod(uc, @selector(setObject:forKey:), imp, method_getTypeEncoding(soM));
+                }
+                Method rokM = class_getInstanceMethod(uc, @selector(removeObjectForKey:));
+                if (rokM) {
+                    IMP orig = method_getImplementation(rokM);
+                    IMP imp = imp_implementationWithBlock(^(id s, NSString *key) {
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                ((void (*)(id, SEL, NSString *))orig)(
+                                    p, @selector(removeObjectForKey:), key);
+                                return;
+                            }
+                        }
+                        ((void (*)(id, SEL, NSString *))orig)(
+                            s, @selector(removeObjectForKey:), key);
+                    });
+                    class_replaceMethod(uc, @selector(removeObjectForKey:), imp, method_getTypeEncoding(rokM));
                 }
             }
         } @catch (id e) {}
