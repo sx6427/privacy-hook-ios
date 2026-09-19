@@ -1,5 +1,5 @@
 //
-// PrivacyHook.m — v64: 按键精准隔离（修「果园选不了水果」）
+// PrivacyHook.m — v66: keychain 隔离恢复 + 非身份项读回退
 //
 // ============ 版本主线 ============
 //   v57N  伪造全套硬件人格（后被 v58 推翻）
@@ -14,6 +14,11 @@
 //   v64   隔离粒度收窄到「身份键」——整域隔离会让共享域 72 键全读不到，
 //         果园这类 H5 活动页拿不到渠道/活动参数 →「能进但选不了水果」。
 //         改为 init 不改域名 + 按 key 分流：身份键走私有域，其余走共享域。
+//   v65   对照实验：整体关闭 keychain 隔离。用户实测 → 原版 App 被
+//         连坐拉黑 → keychain 隔离是保命机制，不能关。
+//   v66   keychain 恢复隔离；读侧对「非身份项」做读回退：本克隆后缀
+//         域读不到时回读共享域原样项（写/删仍只落后缀域，原版零污染）。
+//         身份/登录类项绝不回退（防串号、防连坐）。
 //
 // ============ v60 设计（当前） ============
 //
@@ -58,22 +63,28 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// ★ v65 对照实验开关 ★
+// ★ v66: keychain 隔离恢复 + 非身份项读回退 ★
 //
-// 背景：用户从 v59 时期就反馈「多开的号进百度农场不对劲 / 选不了水果」，
-// 而 v64 已经回退了 group 域整域隔离、问题依旧 → 说明元凶不在 group 域。
-// 时间线上唯一与「从 v59 开始坏」吻合的改动，就是本文件里的
-// **keychain 全量命名空间隔离**（给所有 keychain 项的
-// service/account/generic 追加 #BdXX 后缀）。
+// v65 对照实验结论（用户实测）：关掉 keychain 隔离后，克隆与原版
+// 共用同一批 keychain 项（cuid/SToken/登录票据），**原版 App 被连坐
+// 拉黑** → keychain 隔离是保命机制，绝不能关。
 //
-// 本开关把 keychain 命名空间隔离整体关掉（v57V 的 cuid 精准拦截仍保留），
-// 用来做「只改一个变量」的对照实验：
-//   果园恢复正常 → 元凶是 keychain 隔离
-//   果园照旧不对 → 元凶在别处（cookie 伪造 / UA / 服务端风控）
+// 但 v59 的全量隔离把 keychain 里所有项都切到私有域，若某些
+// 非身份配置项是原版写入的（克隆从未写过），克隆就读不到 → 功能
+// 降级嫌疑（果园不对劲从 v59 开始）。
 //
-// 0 = 关闭（v65 对照实验版）    1 = 开启（正常版本，v59 起的默认）
+// v66 策略：
+//   写（Add/Update）/ 删（Delete）：始终落在本克隆后缀域 ——
+//     克隆永远不写共享域，原版绝不被污染。
+//   读（CopyMatching）：
+//     身份/登录类项（isIdentityKeychainDict）→ 只读后缀域，绝不
+//       回读共享域（防串号、防连坐 —— T4 的教训）。
+//     非身份类项 → 先读后缀域；读不到（errSecItemNotFound）再
+//       回读共享域原样项。读到的数据仍走 rewriteIdentityData
+//       出口消毒，身份字符串照样替换。
 // ============================================================
-#define BD_KCHAIN_NS_ISOLATION 0
+#define BD_KCHAIN_NS_ISOLATION 1
+#define BD_KCHAIN_READTHROUGH 1
 
 // ============================================================
 // ★ 硬件人格策略（v58 起变更）
@@ -840,6 +851,32 @@ static BOOL isCuidServiceDict(CFDictionaryRef dict) {
     return NO;
 }
 
+// v66: 判断 keychain 项是否「身份/登录」类 —— 这类项绝不回读共享域。
+// T4 实测教训：克隆读到原版的 cuid/SToken/登录票据 = 与原版共身份，
+// 原版 App 直接被连坐拉黑。
+// 关键字列表偏宽（宁可少回退、不冒串号风险）。
+static BOOL isIdentityKeychainDict(CFDictionaryRef dict) {
+    if (!dict) return NO;
+    static NSArray *kw = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        kw = @[@"cuid", @"devuid", @"deviceid", @"device_id", @"idfv", @"idfa",
+               @"udid", @"stoken", @"token", @"bduss", @"login", @"account",
+               @"passport", @"sapi", @"user", @"ptoken", @"session"];
+    });
+    const void *keys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, keys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            for (NSString *k in kw) {
+                if ([s rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+            }
+        }
+    }
+    return NO;
+}
+
 // 捕获真实值（仅当不是我们自己的伪造值，防自毒）并返回伪造 data
 static NSData *fakeCUIDDataFrom(NSData *realData) {
     @try {
@@ -905,9 +942,9 @@ static NSString *cloneTag(void) {
 static CFDictionaryRef mangleKeychainDict(CFDictionaryRef dict) {
     if (!dict) return NULL;
 #if !BD_KCHAIN_NS_ISOLATION
-    // v65 对照实验：关闭 keychain 全量命名空间隔离（v59 引入）。
-    // v57V 的「service 含 cuid → 替换伪造值」精准拦截走
-    // isCuidServiceDict / forceCuidInResultDict 那条路，不受本开关影响。
+    // v65 对照实验曾整体关闭 keychain 隔离（本分支未编译保留备查）。
+    // 用户实测结论：关闭后克隆与原版共身份 → 原版被连坐拉黑。
+    // v66 恢复隔离（=1），读侧改用「非身份项读回退」保功能兼容。
     return CFRetain(dict);
 #else
     const void *idKeys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
@@ -954,9 +991,18 @@ static void stripTagInResultDict(CFMutableDictionaryRef md) {
 
 static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     BOOL targeted = isCuidServiceDict(query);   // v57V: 按服务名精准拦截
+    BOOL identity = targeted || isIdentityKeychainDict(query);   // v66
     CFDictionaryRef mq = mangleKeychainDict(query);   // v59: 命名空间隔离
     OSStatus st = orig_SecItemCopyMatching(mq ? mq : query, result);
     if (mq) CFRelease(mq);
+#if BD_KCHAIN_READTHROUGH
+    // v66: 非身份项读回退 —— 本克隆后缀域没有该条目时，回读共享域原样项。
+    // 身份/登录类绝不回退（T4 教训：读到原版身份 = 连坐拉黑）。
+    // 回退命中的结果照走下方出口消毒（rewriteIdentityData / stripTag）。
+    if (!identity && query && st == -25300 /* errSecItemNotFound */) {
+        st = orig_SecItemCopyMatching(query, result);
+    }
+#endif
     if (st != 0 || !result || !*result) return st;   // 0 = errSecSuccess
     @try {
         CFTypeRef v = *result;
