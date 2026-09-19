@@ -58,6 +58,24 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
+// ★ v65 对照实验开关 ★
+//
+// 背景：用户从 v59 时期就反馈「多开的号进百度农场不对劲 / 选不了水果」，
+// 而 v64 已经回退了 group 域整域隔离、问题依旧 → 说明元凶不在 group 域。
+// 时间线上唯一与「从 v59 开始坏」吻合的改动，就是本文件里的
+// **keychain 全量命名空间隔离**（给所有 keychain 项的
+// service/account/generic 追加 #BdXX 后缀）。
+//
+// 本开关把 keychain 命名空间隔离整体关掉（v57V 的 cuid 精准拦截仍保留），
+// 用来做「只改一个变量」的对照实验：
+//   果园恢复正常 → 元凶是 keychain 隔离
+//   果园照旧不对 → 元凶在别处（cookie 伪造 / UA / 服务端风控）
+//
+// 0 = 关闭（v65 对照实验版）    1 = 开启（正常版本，v59 起的默认）
+// ============================================================
+#define BD_KCHAIN_NS_ISOLATION 0
+
+// ============================================================
 // ★ 硬件人格策略（v58 起变更）
 // v57N-v57V: 全套伪造 iPhone15,3 / iOS 17.6.1 / 6GB / 430x932
 //   → XS 实测「页面变大」（UIScreen 假尺寸是根因）。
@@ -886,6 +904,12 @@ static NSString *cloneTag(void) {
 // 改写 keychain 字典的标识字段（返回 +1；无需改写时返回原字典的 retain）
 static CFDictionaryRef mangleKeychainDict(CFDictionaryRef dict) {
     if (!dict) return NULL;
+#if !BD_KCHAIN_NS_ISOLATION
+    // v65 对照实验：关闭 keychain 全量命名空间隔离（v59 引入）。
+    // v57V 的「service 含 cuid → 替换伪造值」精准拦截走
+    // isCuidServiceDict / forceCuidInResultDict 那条路，不受本开关影响。
+    return CFRetain(dict);
+#else
     const void *idKeys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
     NSString *tag = cloneTag();
     BOOL need = NO;
@@ -908,6 +932,7 @@ static CFDictionaryRef mangleKeychainDict(CFDictionaryRef dict) {
         }
     }
     return md;
+#endif
 }
 
 // 结果字典里隐藏克隆后缀（App 若自检 service 不会看出异常）
