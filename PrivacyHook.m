@@ -16,9 +16,14 @@
 //         改为 init 不改域名 + 按 key 分流：身份键走私有域，其余走共享域。
 //   v65   对照实验：整体关闭 keychain 隔离。用户实测 → 原版 App 被
 //         连坐拉黑 → keychain 隔离是保命机制，不能关。
-//   v66   keychain 恢复隔离；读侧对「非身份项」做读回退：本克隆后缀
-//         域读不到时回读共享域原样项（写/删仍只落后缀域，原版零污染）。
-//         身份/登录类项绝不回退（防串号、防连坐）。
+//   v66   keychain 恢复隔离 + 非身份项读回退（T4 教训：共身份→连坐拉黑）
+//   v67   cuid 双格式修复：平台层 cuid 用真机 40大写HEX+尾格式（PLATCUID），
+//         cookie 层保持 b64url —— 两套 ID 本来就不同
+//   v68   诊断日志（T7）：果园相关请求/响应写 bd_diag.log
+//   v69   诊断增强（T7b）：delegate 型请求 + 响应体 + JSBridge 名单
+//   v70   硬件人格回归（iPhone13,2）：iPhone 13 本机被服务端拉黑（XS 正常、
+//         排除 IP）→ 机型串改报同屏同内存的 iPhone 12。uname/gethostname
+//         重新绑回保证通道一致；ProductType/HardwareModel 同步人格。
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -100,7 +105,7 @@ static BOOL g_inUDHook = NO;
 //   实测已证明百度风控认 cuid 不认硬件指纹（D1 与原版同机均可下单）。
 // 下方 FAKE_* 常量仅被未启用的 uname/sysctl hook 引用，保留备查。
 // ============================================================
-static const char *FAKE_MACHINE   = "iPhone15,3";        // 14 Pro Max
+static const char *FAKE_MACHINE   = "iPhone13,2";        // v70: iPhone 12 —— 与 13 同屏 390×844 @3x、同 4GB 内存、同 iOS 区间，透传值零矛盾
 static const char *FAKE_OSVER     = "17.6.1";            // 系统版本
 static const char *FAKE_DARWIN    = "23.6.0";            // 对应 Darwin 内核版本
 static const char *FAKE_PRODUCT   = "iPhone15,3";
@@ -349,7 +354,7 @@ static void installBundleIdentifierHooks(void) {
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
 // v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
 // v63: 15 → 14 —— 移除 CFBundleGetIdentifier（v60 包标识伪装同批停用）
-#define REBIND_COUNT 14
+#define REBIND_COUNT 16
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -392,8 +397,13 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         if (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.uuid") == 0) {
             return hook_return_cstr("", oldp, oldlenp);
         }
-        // v58: hw.machine / kern.osproductversion / kern.osversion /
-        //      kern.osrelease / hw.memsize 全部透传真值 —— 硬件人格跟真机
+        // v70: hw.machine/hw.model 回伪人格 iPhone13,2（iPhone 12，与真机 13
+        //      同屏同内存，屏幕/NSProcessInfo/UA 全部零矛盾）。uname 已同步 hook。
+        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
+            return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
+        }
+        // kern.osproductversion / kern.osversion / kern.osrelease /
+        // hw.memsize 全部透传真值 —— 与 iPhone 12 人格自洽（4GB/同系统区间）
     }
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
@@ -422,13 +432,10 @@ static int hook_uname(struct utsname *u) {
     if (!u) return orig_uname(u);
     int r = orig_uname(u);          // 先调真实版保证缓冲区有效，再覆盖
     if (r != 0) return r;
-    strlcpy(u->sysname,  "Darwin",      sizeof(u->sysname));
+    // v70: 只覆盖 nodename（防真实设备名泄漏）和 machine（机型人格）。
+    // sysname/release/version 保留真实值 —— 与 sysctlbyname 的
+    // kern.osrelease（透传真值）保持自洽，不能再用写死的 FAKE_DARWIN。
     strlcpy(u->nodename, "iPhone",      sizeof(u->nodename));
-    strlcpy(u->release,  FAKE_DARWIN,   sizeof(u->release));
-    strlcpy(u->version,
-            "Darwin Kernel Version 23.6.0: Mon Jul  8 20:36:33 PDT 2024; "
-            "root:xnu-11215.141.2~1/RELEASE_ARM64_T8120",
-            sizeof(u->version));
     strlcpy(u->machine,  FAKE_MACHINE,  sizeof(u->machine));
     return 0;
 }
@@ -512,6 +519,17 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
             NSString *n = getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)n;
+        }
+        // v70: ProductType —— 机型人格 iPhone13,2，与 hw.machine/uname 保持一致
+        if (CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_MACHINE];
+        }
+        // v70: PhysicalMachineModel（硬件板型号）同样归人格，防止与 machine 矛盾
+        if (CFStringCompare(key, CFSTR("PhysicalMachineModel"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("HardwareModel"), 0) == 0) {
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_MACHINE];
         }
         // ---- v58: ProductType / ModelNumber / ProductVersion / BuildVersion
         //      不再伪造 —— 硬件人格跟真机，避免「XS 假报 Pro Max」的矛盾。
@@ -2377,6 +2395,10 @@ static void initPrivacyHook(void) {
             g_hide_rebindings[2] = (struct rebinding){"_dyld_get_image_header",       (void *)hook_dyld_get_image_header,      (void **)&orig_dyld_get_image_header};
             g_hide_rebindings[3] = (struct rebinding){"_dyld_get_image_vmaddr_slide", (void *)hook_dyld_get_image_vmaddr_slide,(void **)&orig_dyld_get_image_vmaddr_slide};
             // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
+            // v70: uname/gethostname 绑回（真凶另有其人，见 REBIND_COUNT 注释）；
+            //      老 sysctl() 继续不绑。
+            g_rebindings[14] = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
+            g_rebindings[15] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
             // g_rebindings[11] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
