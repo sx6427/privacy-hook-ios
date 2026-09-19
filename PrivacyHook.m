@@ -1580,6 +1580,122 @@ static BOOL isDeviceKey(NSString *key) {
 static NSURL *(*orig_containerURL)(id, SEL, NSString *) = NULL;
 
 // ============================================================
+// ★ v68: 诊断日志（T7 专用）★
+//
+// 目的：抓果园相关网络请求的 URL / 请求头 / 请求体 / 响应体，
+// 对比克隆与原版的参数差异，定位「浏览任务不下发」的服务端判定依据。
+// 日志写 /var/mobile/Documents/bd_diag.log（Filza/WebDAV 可直读），
+// 无权限时退回 App 沙盒 Documents/bd_diag.log。
+// 上限 3MB，超过即停写（防止无限膨胀）。
+// ============================================================
+static NSFileHandle *diagFH(void) {
+    static NSFileHandle *fh = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @try {
+            NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            NSArray *cands = @[
+                @"/var/mobile/Documents/bd_diag.log",
+                [doc stringByAppendingPathComponent:@"bd_diag.log"],
+            ];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *path = nil;
+            for (NSString *p in cands) {
+                if (![fm isWritableFileAtPath:[p stringByDeletingLastPathComponent]]) continue;
+                if (![fm fileExistsAtPath:p]) {
+                    [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+                if ([fm fileExistsAtPath:p]) { path = p; break; }
+            }
+            if (!path) return;
+            fh = [NSFileHandle fileHandleForUpdatingAtPath:path];
+            [fh seekToEndOfFile];
+            NSString *hdr = [NSString stringWithFormat:
+                @"==== BD DIAG v68 start %@\n==== sandbox=%@\n==== fakeCookieCUID=%@\n==== fakePlatformCUID=%@\n",
+                [NSDate date], NSHomeDirectory(), getFakeID(@"BAIDUCUID"), getFakeID(@"PLATCUID")];
+            [fh writeData:[hdr dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data]];
+        } @catch (id e) { fh = nil; }
+    });
+    return fh;
+}
+
+static long long g_diagSize = 0;
+
+static void diagAppend(NSString *s) {
+    NSFileHandle *fh = diagFH();
+    if (!fh || !s) return;
+    @try {
+        @synchronized (fh) {
+            if (g_diagSize > 3LL * 1024 * 1024) return;
+            NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+            if (!d) return;
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            g_diagSize += d.length;
+        }
+    } @catch (id e) {}
+}
+
+// 果园/活动相关 URL 过滤（宽进，宁可多记）
+static BOOL diagInteresting(NSURL *u) {
+    if (!u) return NO;
+    NSString *s = u.absoluteString;
+    if (s.length == 0) return NO;
+    NSString *l = [s lowercaseString];
+    if ([l rangeOfString:@"bd_diag"].location != NSNotFound) return NO;
+    NSArray *kw = @[@"farm", @"fruit", @"orchard", @"niantuan", @"activity",
+                    @"huodong", @"task", @"mission", @"membership", @"growth",
+                    @"watering", @"sign", @"apiactivity", @"openwidget",
+                    @"chameleon", @"nuomi", @"tiebaapp", @"/api/"];
+    for (NSString *k in kw) {
+        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static void diagDumpRequest(NSURLRequest *req, NSString *tag) {
+    if (!req || !diagInteresting(req.URL)) return;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] %@ %@\n",
+                          [NSDate date], tag, req.HTTPMethod ?: @"GET"];
+    [m appendFormat:@"  URL: %@\n", req.URL.absoluteString];
+    NSDictionary *h = req.allHTTPHeaderFields;
+    for (NSString *k in h) {
+        NSString *v = h[k];
+        if (v.length > 300) v = [[v substringToIndex:300] stringByAppendingString:@"..."];
+        [m appendFormat:@"  H %@: %@\n", k, v];
+    }
+    NSData *b = req.HTTPBody;
+    if (b) {
+        NSString *bs = [[NSString alloc] initWithData:b encoding:NSUTF8StringEncoding];
+        if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)b.length];
+        if (bs.length > 2500) bs = [[bs substringToIndex:2500] stringByAppendingString:@"...<trunc>"];
+        [m appendFormat:@"  BODY: %@\n", bs];
+    } else if (req.HTTPBodyStream) {
+        [m appendString:@"  BODY: <stream>\n"];
+    }
+    diagAppend(m);
+}
+
+static void diagDumpResponse(NSURLRequest *req, NSHTTPURLResponse *resp, NSData *data) {
+    NSURL *u = resp.URL ?: req.URL;
+    if (!resp || !diagInteresting(u)) return;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] RESP %ld %@\n",
+                          [NSDate date], (long)resp.statusCode, u.absoluteString];
+    NSData *d = data;
+    if (d.length > 4000) d = [d subdataWithRange:NSMakeRange(0, 4000)];
+    NSString *bs = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)(data ? data.length : 0)];
+    [m appendFormat:@"  BODY: %@\n", bs];
+    diagAppend(m);
+}
+
+// 构造函数里安装：
+//   - NSURLSession dataTaskWithRequest:completionHandler:（原生接口层，含响应）
+//   - WKWebView loadRequest:（H5 页面导航 URL）
+// 注：WKWebView 内部的 XHR 不走 App 的 NSURLSession，第一版先抓这些；
+//     若日志里果园 API 一条都没有，说明走的别的通道，下一版再补。
+
+// ============================================================
 // Constructor — v58
 // ============================================================
 __attribute__((constructor))
@@ -2246,6 +2362,54 @@ static void initPrivacyHook(void) {
                 }
             } @catch (id e) {}
 #endif
+
+            // ---- 8. v68: 诊断日志（T7）----
+            @try {
+                Class sc = objc_getClass("NSURLSession");
+                if (sc) {
+                    SEL sel = @selector(dataTaskWithRequest:completionHandler:);
+                    Method m = class_getInstanceMethod(sc, sel);
+                    if (m) {
+                        IMP orig = method_getImplementation(m);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSessionDataTask *(id s, NSURLRequest *req,
+                                                     void (^ch)(NSData *, NSURLResponse *, NSError *)) {
+                                diagDumpRequest(req, @"REQ");
+                                if (!ch) {
+                                    return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(
+                                        s, @selector(dataTaskWithRequest:completionHandler:), req, nil);
+                                }
+                                void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
+                                    ^(NSData *d, NSURLResponse *r, NSError *e) {
+                                        @try {
+                                            if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                                diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
+                                            }
+                                        } @catch (id ex) {}
+                                        ch(d, r, e);
+                                    };
+                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(
+                                    s, @selector(dataTaskWithRequest:completionHandler:), req, wrapped);
+                            });
+                        class_replaceMethod(sc, sel, imp, method_getTypeEncoding(m));
+                    }
+                }
+                Class wc = objc_getClass("WKWebView");
+                if (wc) {
+                    SEL lsel = @selector(loadRequest:);
+                    Method lm = class_getInstanceMethod(wc, lsel);
+                    if (lm) {
+                        IMP orig = method_getImplementation(lm);
+                        IMP imp = imp_implementationWithBlock(^id (id s, NSURLRequest *req) {
+                            diagDumpRequest(req, @"WEBVIEW");
+                            return ((id (*)(id, SEL, NSURLRequest *))orig)(
+                                s, @selector(loadRequest:), req);
+                        });
+                        class_replaceMethod(wc, lsel, imp, method_getTypeEncoding(lm));
+                    }
+                }
+                diagAppend(@"==== diag hooks installed ====\n");
+            } @catch (id e) {}
         } @catch (id e) {}
     }
 }
