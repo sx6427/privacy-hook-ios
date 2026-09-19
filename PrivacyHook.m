@@ -19,6 +19,11 @@
 //   v66   keychain 恢复隔离；读侧对「非身份项」做读回退：本克隆后缀
 //         域读不到时回读共享域原样项（写/删仍只落后缀域，原版零污染）。
 //         身份/登录类项绝不回退（防串号、防连坐）。
+//   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
+//         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
+//         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
+//         → 服务端识别非法 cuid → 果园不下发浏览任务。新增 genPlatform
+//         CUID()，NSUserDefaults/keychain 层改用平台格式，cookie 层不变。
 //
 // ============ v60 设计（当前） ============
 //
@@ -832,9 +837,10 @@ static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query) = NULL;
 // 读写，值一律替换为伪造 cuid（与 cookie 伪造值同源，单一身份）。
 // 不再依赖捕获；同时顺带捕获真实值（若真出现）供按值替换兜底。
 
-// 伪造 cuid（与 cookie CUID_FAMILY 伪造值同源）
+// 伪造 cuid（v67: keychain 里存的 cuid = 平台层格式 40大写HEX+尾，
+// 与 plist cuid 一致；不再用 cookie 层的 b64url 格式）
 static NSString *fakeCUIDValue(void) {
-    return getFakeID(@"BAIDUCUID");
+    return getFakeID(@"PLATCUID");
 }
 
 // 判断 keychain 查询/属性字典是否为 cuid 存储（服务名/账号名含 cuid）
@@ -1324,10 +1330,28 @@ static NSString *b64urlEncode(NSData *data) {
 }
 
 static NSString *genCUID(void) {
-    // 真机结构: base64url(50字节随机) + "mA"
+    // cookie 层真机结构: base64url(50字节随机) + "mA"
+    // （v57M 抓的 cookie BAIDUCUID 样本，仅适用于 cookie 层；
+    //   NSUserDefaults/keychain 层的 cuid 是另一种格式，见 genPlatformCUID）
     NSMutableData *raw = [NSMutableData dataWithLength:50];
     arc4random_buf([raw mutableBytes], 50);
     return [NSString stringWithFormat:@"%@mA", b64urlEncode(raw)];
+}
+
+// ★ v67: 平台层 cuid（NSUserDefaults "cuid" 键 / keychain baidumobile.cuid 项）
+//
+// WebDAV 真机取证（bm_prefs.plist，原版 App 共享域）实锤：
+//   cuid         = 3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS
+//   BNPush_cuid  = D1311D9D3FA6AD38816050093190DA2CA145C5073OIAJMHMNOI
+// 格式 = 40位大写HEX + 11位[0-9A-Z]尾巴，共 51 字符。
+// 而旧实现（v57M 起）把 cookie 的 b64url 格式（~70字符，含小写/-/_）也顶给
+// 了平台层 cuid —— 服务端一眼识别非法格式 → 果园只给基础功能、
+// 不下发浏览任务（用户实测：原版正常、克隆「看不到浏览任务」）。
+static NSString *genPlatformCUID(void) {
+    NSString *hexCS = @"0123456789ABCDEF";
+    NSString *tailCS = @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    return [NSString stringWithFormat:@"%@%@",
+            genRandStr(40, hexCS), genRandStr(11, tailCS)];
 }
 
 static NSString *genBAIDUID(void) {
@@ -1371,6 +1395,10 @@ static NSString *genFakeCookie(NSString *name) {
         return genRandStr(40, hexCS);
 
     // —— 以下为各自独立的标识，不共享 ——
+    // ★ v67: 平台层 cuid —— 与 cookie CUID_FAMILY **不同值、不同格式**！
+    // 真机里 cookie BAIDUCUID（b64url）与 plist/keychain cuid（40大写HEX+尾）
+    // 本来就是两个 ID。旧实现把它们归一成一个 b64url 值是错误根源。
+    if ([name isEqualToString:@"PLATCUID"]) return genPlatformCUID();
     if ([name isEqualToString:@"DVIF"]) {
         NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)((uint64_t)arc4random() * arc4random() % 9000000000000000ULL + 1000000000000000ULL)];
         NSMutableData *d = [NSMutableData dataWithLength:300];
@@ -1727,7 +1755,7 @@ static void initPrivacyHook(void) {
                         }
                         if (!g_inUDHook && isDeviceKey(key)) {
                             g_inUDHook = YES;
-                            @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
+                            @try { NSString *f = getFakeID(@"PLATCUID"); g_inUDHook = NO; return f; }   // v67: NSUserDefaults 的 cuid 键 = 平台层格式
                             @catch (id e) { g_inUDHook = NO; }
                         }
                         return ((id (*)(id, SEL, NSString *))orig)(s, @selector(objectForKey:), key);
@@ -1747,7 +1775,7 @@ static void initPrivacyHook(void) {
                         }
                         if (!g_inUDHook && isDeviceKey(key)) {
                             g_inUDHook = YES;
-                            @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
+                            @try { NSString *f = getFakeID(@"PLATCUID"); g_inUDHook = NO; return f; }   // v67: NSUserDefaults 的 cuid 键 = 平台层格式
                             @catch (id e) { g_inUDHook = NO; }
                         }
                         return ((NSString *(*)(id, SEL, NSString *))orig)(s, @selector(stringForKey:), key);
