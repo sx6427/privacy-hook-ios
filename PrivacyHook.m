@@ -1636,21 +1636,27 @@ static void diagAppend(NSString *s) {
     } @catch (id e) {}
 }
 
-// 果园/活动相关 URL 过滤（宽进，宁可多记）
+// ★ v69: 排除法过滤 —— 果园接口 URL 关键词猜不准，改为只排除静态资源/CDN，
+// 其余全部记录（3MB 上限兜底）。宁可多记，遗漏才是最大成本。
 static BOOL diagInteresting(NSURL *u) {
     if (!u) return NO;
     NSString *s = u.absoluteString;
     if (s.length == 0) return NO;
-    NSString *l = [s lowercaseString];
+    NSString *l = [[s lowercaseString] stringByRemovingPercentEncoding] ?: [s lowercaseString];
     if ([l rangeOfString:@"bd_diag"].location != NSNotFound) return NO;
-    NSArray *kw = @[@"farm", @"fruit", @"orchard", @"niantuan", @"activity",
-                    @"huodong", @"task", @"mission", @"membership", @"growth",
-                    @"watering", @"sign", @"apiactivity", @"openwidget",
-                    @"chameleon", @"nuomi", @"tiebaapp", @"/api/"];
-    for (NSString *k in kw) {
-        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    // 静态资源扩展名
+    NSArray *ext = @[@".png", @".jpg", @".jpeg", @".gif", @".webp", @".css", @".js",
+                     @".ico", @".woff", @".woff2", @".ttf", @".mp4", @".m3u8", @".svg"];
+    for (NSString *e in ext) {
+        if ([l hasSuffix:e]) return NO;
     }
-    return NO;
+    // 静态 CDN / 推送等无关通道
+    NSArray *cdn = @[@"bdstatic.com", @"bdimg.com", @"bcebos.com", @"baidubce.com",
+                     @"bdurl.net", @"mipcdn.com", @"push", @"mtj", @"apoll"];
+    for (NSString *c in cdn) {
+        if ([l rangeOfString:c].location != NSNotFound) return NO;
+    }
+    return YES;
 }
 
 static void diagDumpRequest(NSURLRequest *req, NSString *tag) {
@@ -1691,9 +1697,87 @@ static void diagDumpResponse(NSURLRequest *req, NSHTTPURLResponse *resp, NSData 
 
 // 构造函数里安装：
 //   - NSURLSession dataTaskWithRequest:completionHandler:（原生接口层，含响应）
+//   - NSURLSession dataTaskWithRequest:（v69: delegate 型，请求侧）
+//   - uploadTaskWithRequest:fromData:completionHandler:（v69）
+//   - sessionWithConfiguration:delegate:delegateQueue:（v69: 抓 delegate 并 swizzle
+//     URLSession:dataTask:didReceiveData: / URLSession:task:didCompleteWithError:）
 //   - WKWebView loadRequest:（H5 页面导航 URL）
-// 注：WKWebView 内部的 XHR 不走 App 的 NSURLSession，第一版先抓这些；
-//     若日志里果园 API 一条都没有，说明走的别的通道，下一版再补。
+//   - addScriptMessageHandler:name:（v69: 记录 H5↔原生 JSBridge 名单）
+// 注：WKWebView 内部 XHR 在 WebKit 网络进程，App 内 hook 看不到；
+//     JSBridge 消息是 H5 数据的主要通道之一，先记录名单。
+
+// ---- v69: delegate 型响应体收集（per-task 缓存）----
+static NSMutableDictionary *diagTaskData(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary new]; });
+    return d;
+}
+
+// 对 delegate 类做一次性 swizzle（记录响应体）
+static void diagSwizzleNetDelegate(id d) {
+    if (!d) return;
+    @try {
+        Class c = object_getClass(d);
+        static NSMutableSet *done = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ done = [NSMutableSet new]; });
+        NSString *ck = NSStringFromClass(c);
+        @synchronized (done) {
+            if ([done containsObject:ck]) return;
+            [done addObject:ck];
+        }
+        SEL s1 = @selector(URLSession:dataTask:didReceiveData:);
+        SEL s2 = @selector(URLSession:task:didCompleteWithError:);
+        Method m1 = class_getInstanceMethod(c, s1);
+        Method m2 = class_getInstanceMethod(c, s2);
+        if (m1) {
+            IMP orig = method_getImplementation(m1);
+            IMP imp = imp_implementationWithBlock(
+                ^(id selfdg, NSURLSession *session, NSURLSessionDataTask *task, NSData *data) {
+                    @try {
+                        if (task && data) {
+                            NSString *tid = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+                            [[diagTaskData() objectForKey:tid] appendData:data];
+                        }
+                    } @catch (id e) {}
+                    ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))orig)(
+                        selfdg, s1, session, task, data);
+                });
+            method_setImplementation(m1, imp);
+        }
+        if (m2) {
+            IMP orig = method_getImplementation(m2);
+            IMP imp = imp_implementationWithBlock(
+                ^(id selfdg, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+                    @try {
+                        if (task) {
+                            NSURLRequest *req = task.originalRequest ?: task.currentRequest;
+                            NSHTTPURLResponse *resp = (NSHTTPURLResponse *)task.response;
+                            NSString *tid = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+                            NSData *acc = [diagTaskData() objectForKey:tid];
+                            [diagTaskData() removeObjectForKey:tid];
+                            if (req) diagDumpRequest(req, @"DELEG-REQ");
+                            if (resp && [resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] DELEG-RESP %ld %@\n",
+                                                      [NSDate date], (long)resp.statusCode, resp.URL.absoluteString];
+                                if (acc) {
+                                    NSData *d2 = acc.length > 4000 ? [acc subdataWithRange:NSMakeRange(0, 4000)] : acc;
+                                    NSString *bs = [[NSString alloc] initWithData:d2 encoding:NSUTF8StringEncoding];
+                                    if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)acc.length];
+                                    [m appendFormat:@"  BODY: %@\n", bs];
+                                }
+                                diagAppend(m);
+                            }
+                        }
+                    } @catch (id e) {}
+                    ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))orig)(
+                        selfdg, s2, session, task, error);
+                });
+            method_setImplementation(m2, imp);
+        }
+    } @catch (id e) {}
+}
 
 // ============================================================
 // Constructor — v58
@@ -2363,10 +2447,11 @@ static void initPrivacyHook(void) {
             } @catch (id e) {}
 #endif
 
-            // ---- 8. v68: 诊断日志（T7）----
+            // ---- 8. v68/v69: 诊断日志（T7）----
             @try {
                 Class sc = objc_getClass("NSURLSession");
                 if (sc) {
+                    // 8a. block 型 data task（v68，含响应）
                     SEL sel = @selector(dataTaskWithRequest:completionHandler:);
                     Method m = class_getInstanceMethod(sc, sel);
                     if (m) {
@@ -2393,7 +2478,76 @@ static void initPrivacyHook(void) {
                             });
                         class_replaceMethod(sc, sel, imp, method_getTypeEncoding(m));
                     }
+                    // 8b. v69: delegate 型 data task（请求侧）
+                    SEL sel2 = @selector(dataTaskWithRequest:);
+                    Method m2 = class_getInstanceMethod(sc, sel2);
+                    if (m2) {
+                        IMP orig = method_getImplementation(m2);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSessionDataTask *(id s, NSURLRequest *req) {
+                                diagDumpRequest(req, @"DELEG-REQ");
+                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))orig)(
+                                    s, @selector(dataTaskWithRequest:), req);
+                            });
+                        class_replaceMethod(sc, sel2, imp, method_getTypeEncoding(m2));
+                    }
+                    // 8c. v69: block 型 upload task
+                    SEL sel3 = @selector(uploadTaskWithRequest:fromData:completionHandler:);
+                    Method m3 = class_getInstanceMethod(sc, sel3);
+                    if (m3) {
+                        IMP orig = method_getImplementation(m3);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSessionUploadTask *(id s, NSURLRequest *req, NSData *body,
+                                                      void (^ch)(NSData *, NSURLResponse *, NSError *)) {
+                                diagDumpRequest(req, @"UPL-REQ");
+                                if (body) diagAppend([NSString stringWithFormat:
+                                    @"  UPBODY: %@\n", [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding] ?: @"<binary>"]);
+                                if (!ch) {
+                                    return ((NSURLSessionUploadTask *(*)(id, SEL, NSURLRequest *, NSData *, id))orig)(
+                                        s, @selector(uploadTaskWithRequest:fromData:completionHandler:), req, body, nil);
+                                }
+                                void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
+                                    ^(NSData *d, NSURLResponse *r, NSError *e) {
+                                        @try {
+                                            if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                                diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
+                                            }
+                                        } @catch (id ex) {}
+                                        ch(d, r, e);
+                                    };
+                                return ((NSURLSessionUploadTask *(*)(id, SEL, NSURLRequest *, NSData *, id))orig)(
+                                    s, @selector(uploadTaskWithRequest:fromData:completionHandler:), req, body, wrapped);
+                            });
+                        class_replaceMethod(sc, sel3, imp, method_getTypeEncoding(m3));
+                    }
                 }
+                // 8d. v69: session 创建时抓 delegate → swizzle 其 didReceiveData/didComplete
+                @try {
+                    SEL csel = @selector(sessionWithConfiguration:delegate:delegateQueue:);
+                    Method cm = class_getClassMethod(objc_getClass("NSURLSession"), csel);
+                    if (cm) {
+                        IMP orig = method_getImplementation(cm);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSession *(id s, NSURLSessionConfiguration *cfg, id dg, NSOperationQueue *q) {
+                                diagSwizzleNetDelegate(dg);
+                                return ((NSURLSession *(*)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *))orig)(
+                                    s, csel, cfg, dg, q);
+                            });
+                        method_setImplementation(cm, imp);
+                    }
+                    SEL isel = @selector(initWithConfiguration:delegate:delegateQueue:);
+                    Method im = class_getInstanceMethod(objc_getClass("NSURLSession"), isel);
+                    if (im) {
+                        IMP orig = method_getImplementation(im);
+                        IMP imp = imp_implementationWithBlock(
+                            ^id (id s, NSURLSessionConfiguration *cfg, id dg, NSOperationQueue *q) {
+                                diagSwizzleNetDelegate(dg);
+                                return ((id (*)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *))orig)(
+                                    s, isel, cfg, dg, q);
+                            });
+                        class_replaceMethod(objc_getClass("NSURLSession"), isel, imp, method_getTypeEncoding(im));
+                    }
+                } @catch (id e) {}
                 Class wc = objc_getClass("WKWebView");
                 if (wc) {
                     SEL lsel = @selector(loadRequest:);
@@ -2408,7 +2562,24 @@ static void initPrivacyHook(void) {
                         class_replaceMethod(wc, lsel, imp, method_getTypeEncoding(lm));
                     }
                 }
-                diagAppend(@"==== diag hooks installed ====\n");
+                // 8e. v69: 记录 H5↔原生 JSBridge 名单
+                @try {
+                    Class ucc = objc_getClass("WKUserContentController");
+                    if (ucc) {
+                        SEL asel = @selector(addScriptMessageHandler:name:);
+                        Method am = class_getInstanceMethod(ucc, asel);
+                        if (am) {
+                            IMP orig = method_getImplementation(am);
+                            IMP imp = imp_implementationWithBlock(
+                                ^void (id s, id handler, NSString *name) {
+                                    diagAppend([NSString stringWithFormat:@"\n[%@] JSBRIDGE register: %@\n", [NSDate date], name]);
+                                    ((void (*)(id, SEL, id, NSString *))orig)(s, asel, handler, name);
+                                });
+                            class_replaceMethod(ucc, asel, imp, method_getTypeEncoding(am));
+                        }
+                    }
+                } @catch (id e) {}
+                diagAppend(@"==== diag hooks v69 installed ====\n");
             } @catch (id e) {}
         } @catch (id e) {}
     }
