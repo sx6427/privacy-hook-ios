@@ -21,9 +21,9 @@
 //         cookie 层保持 b64url —— 两套 ID 本来就不同
 //   v68   诊断日志（T7）：果园相关请求/响应写 bd_diag.log
 //   v69   诊断增强（T7b）：delegate 型请求 + 响应体 + JSBridge 名单
-//   v70   硬件人格回归（iPhone13,2）：iPhone 13 本机被服务端拉黑（XS 正常、
-//         排除 IP）→ 机型串改报同屏同内存的 iPhone 12。uname/gethostname
-//         重新绑回保证通道一致；ProductType/HardwareModel 同步人格。
+//   v70   硬件人格回归（iPhone13,2）：下单通过但农场识破——真机是 13 Pro Max
+//         （屏幕 1284×2778 透传），与 iPhone12 机型串矛盾
+//   v71   人格改 iPhone13,4（12 Pro Max）：与真机同屏同内存，透传值全部自洽
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -105,7 +105,7 @@ static BOOL g_inUDHook = NO;
 //   实测已证明百度风控认 cuid 不认硬件指纹（D1 与原版同机均可下单）。
 // 下方 FAKE_* 常量仅被未启用的 uname/sysctl hook 引用，保留备查。
 // ============================================================
-static const char *FAKE_MACHINE   = "iPhone13,2";        // v70: iPhone 12 —— 与 13 同屏 390×844 @3x、同 4GB 内存、同 iOS 区间，透传值零矛盾
+static const char *FAKE_MACHINE   = "iPhone13,4";        // v71: 12 Pro Max —— 与真机 13 Pro Max 同屏 428×926/1284×2778、同 6GB 内存，透传值零矛盾
 static const char *FAKE_OSVER     = "17.6.1";            // 系统版本
 static const char *FAKE_DARWIN    = "23.6.0";            // 对应 Darwin 内核版本
 static const char *FAKE_PRODUCT   = "iPhone15,3";
@@ -397,13 +397,15 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         if (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.uuid") == 0) {
             return hook_return_cstr("", oldp, oldlenp);
         }
-        // v70: hw.machine/hw.model 回伪人格 iPhone13,2（iPhone 12，与真机 13
-        //      同屏同内存，屏幕/NSProcessInfo/UA 全部零矛盾）。uname 已同步 hook。
+        // v70/v71: hw.machine/hw.model 回伪人格。v71 改 iPhone13,4（12 Pro Max，
+        //      与真机 13 Pro Max 同屏 1284×2778 同 6GB）—— v70 用 iPhone13,2
+        //      被农场识破：请求里 cua@1284_2778/statusbar-height 等真屏幕参数
+        //      与 iPhone12 的 1170×2532 矛盾，物理不存在的组合。
         if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
             return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
         }
         // kern.osproductversion / kern.osversion / kern.osrelease /
-        // hw.memsize 全部透传真值 —— 与 iPhone 12 人格自洽（4GB/同系统区间）
+        // hw.memsize 全部透传真值 —— 与 12 Pro Max 人格自洽（6GB/同系统区间）
     }
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
@@ -520,7 +522,7 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)n;
         }
-        // v70: ProductType —— 机型人格 iPhone13,2，与 hw.machine/uname 保持一致
+        // v70/v71: ProductType —— 机型人格（v71 起 iPhone13,4），与 hw.machine/uname 保持一致
         if (CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_MACHINE];
