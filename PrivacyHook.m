@@ -55,6 +55,40 @@
 //              响应头落盘 —— 登录通道若不走 NSURLSession，前三次
 //              抓包是看不见的
 //         不动 dyld 镜像隐藏（v63 停用原因未二分，保持单一变量）
+//
+//   v75   ★ 美团设备身份隔离（2026-09-21，修「识别到本机」）★
+//         真机取证（原版 HAR + 克隆日志 + 手机容器双向比对）：
+//           原版(9/19 抓包) uuid=000000000000011F...546
+//           克隆(今天 v6)  uuid=000000000000011F...546  ← 完全相同
+//         且不止一处，同一身份以多个名字共用：
+//           · query  uuid= / did= / iuuid= / w_uuid= / wm_uuid=
+//           · body   env.deviceid= / babelid= / dpid= / unionId=
+//           · prefs  babelId / kNovaEnvironmentCacheUnionidKey /
+//                    sakguard_storage_dfpid 三键与原版同值
+//           而 IDFV 类（kLoganEncryptIdentify）两边不同 → 排除硬件派生，
+//           确定是「从共享存储读到了原版写的值」。
+//         根因（两条共享通道，均因克隆沿用原版授权而存在）：
+//           a) keychain：克隆 entitlements 原样保留原版
+//              keychain-access-groups = FSS9ANCQ68.com.meituan.access
+//              → 与「美团全家桶共享组」完全同一空间。美团 ONI SDK 把设备
+//              身份存 keychain（二进制实证 kONIPrivateKeychainValueUUID /
+//              ...DPID / ...UnionID / sharedKeychainGroup），
+//              而本库身份关键字表有 udid/deviceid 却**没有 uuid** →
+//              该条目被判为「非身份项」→ 触发 v66 读回退 → 读到原版真值
+//           b) App Group：group.com.meituan.imeituan 也是共用容器，
+//              其中的 widget_entry_appgroup_uuid / _token 就是原版设备 ID
+//              和**原版登录票据**（后者是连坐拉黑的高危通道）
+//         修法（三条，全部只在 MT_CLONE 生效，不碰在跑的百度 D 系列）：
+//           1) keychain 身份关键字补 uuid/oniprivate/oniid/onimaru/
+//              dpid/dfpid/unionid/utdid/babel/sakguard → 这些条目
+//              禁用读回退，克隆自建（硬件身份已被伪造 → 天然互不相同）
+//           2) NSUserDefaults/CFPreferences 身份键补美团项
+//              （babelId / widget_entry_appgroup_* / sakguard 设备身份
+//              / unionid 缓存）→ 改走本克隆私有域
+//           3) 出口兜底：出口串若仍出现已知的**本机真值**（设备 uuid /
+//              dpid / dfpid），说明还有没拦住的通道 → 记诊断日志；
+//              设备 uuid 直接换成本克隆等价 ID（dpid/dfpid 被签名覆盖
+//              不替换，避免破坏 mtgsig 校验）
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -875,6 +909,35 @@ static BOOL isStrictIdentityKeyStr(NSString *k) {
     });
     if ([exact containsObject:k]) return YES;
     if ([k rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+#if MT_CLONE
+    // ★ v75: 美团身份键（真机 prefs 取证，见文件头 v75 段）★
+    // 这些键在「原版 prefs / 共享 App Group」里存着原版的设备身份与票据，
+    // 克隆按「非身份项」读就会拿到原版的值 → 必须改走本克隆私有域。
+    static NSSet *mtExact = nil;
+    static dispatch_once_t once2;
+    dispatch_once(&once2, ^{
+        mtExact = [NSSet setWithArray:@[
+            @"babelId", @"UTDID", @"mputdid",
+            @"kNovaEnvironmentCacheUnionidKey",
+            @"widget_entry_appgroup_uuid", @"widget_entry_appgroup_token",
+            @"widget_entry_appgroup_userid",
+            @"ONIMMKVTransferFlagkONImaruUUIDKey",
+            @"ONIMMKVTransferFlagkONImaruDPIDKey",
+        ]];
+    });
+    if ([mtExact containsObject:k]) return YES;
+    static NSArray *mtSub = nil;
+    static dispatch_once_t once3;
+    dispatch_once(&once3, ^{
+        // 子串匹配（宁宽勿漏：多隔离只是让克隆自建，漏了就是身份共享）
+        mtSub = @[@"uuid", @"dfpid", @"dpid", @"unionid", @"utdid", @"babel",
+                  @"sakguard_storage", @"sakguard_deviceinfo", @"sakg_",
+                  @"oniprivate", @"oniid", @"onimaru", @"widget_entry_appgroup"];
+    });
+    for (NSString *t in mtSub) {
+        if ([k rangeOfString:t options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    }
+#endif
     return NO;
 }
 
@@ -1031,10 +1094,24 @@ static BOOL isIdentityKeychainDict(CFDictionaryRef dict) {
         // v72: 补 mtj/cdid/umid/oaid/vaid/aaid —— 百度统计(MTJ)设备 ID 族，
         //       主二进制引用 40+ 处。缺了它们，克隆会按「非身份项」把原版
         //       存的统计设备 ID 读回退读进来 → 统计图谱直接关联
-        kw = @[@"cuid", @"devuid", @"deviceid", @"device_id", @"idfv", @"idfa",
+        NSMutableArray *m = [@[@"cuid", @"devuid", @"deviceid", @"device_id", @"idfv", @"idfa",
                @"udid", @"stoken", @"token", @"bduss", @"login", @"account",
                @"passport", @"sapi", @"user", @"ptoken", @"session",
-               @"mtj", @"cdid", @"umid", @"oaid", @"vaid", @"aaid"];
+               @"mtj", @"cdid", @"umid", @"oaid", @"vaid", @"aaid"] mutableCopy];
+#if MT_CLONE
+        // ★ v75: 美团设备身份族（ONI SDK keychain 条目）★
+        // 二进制实证：kONIPrivateKeychainValueUUID / ...DPID / ...UnionID、
+        // sharedKeychainValue/sharedKeychainGroup、UTDIDKeychainItemWrapper。
+        // 之前表里只有 udid/deviceid，**没有 uuid** → ONI 的设备 uuid 被判为
+        // 「非身份项」→ 走 v66 读回退 → 读到原版设备 uuid（真机日志实锤：
+        // 原版与克隆对外发送的 64 位设备 ID 完全一致）。
+        // 加入后这些条目禁用回退，克隆在私有命名空间里重建 → 因硬件身份
+        // (UDID/ECID/IDFV) 已伪造，重建值天然与原版不同。
+        [m addObjectsFromArray:@[@"uuid", @"dpid", @"dfpid", @"unionid", @"utdid",
+                                 @"babel", @"oniprivate", @"oniid", @"onimaru",
+                                 @"mtkeychain", @"sakguard", @"sakg_", @"localid"]];
+#endif
+        kw = [m copy];
     });
     const void *keys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
     for (size_t i = 0; i < 3; i++) {
@@ -1173,6 +1250,20 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
     // 回退命中的结果照走下方出口消毒（rewriteIdentityData / stripTag）。
     if (!identity && query && st == -25300 /* errSecItemNotFound */) {
         st = orig_SecItemCopyMatching(query, result);
+    }
+#endif
+#if MT_CLONE
+    // v75 诊断：身份类条目在本克隆命名空间里「查不到」= 隔离生效
+    // （若一直不出现，说明关键字表还没命中 ONI 的真实 service/account 名）
+    if (identity && st == -25300 /* errSecItemNotFound */) {
+        @try {
+            CFTypeRef sv = query ? CFDictionaryGetValue(query, kSecAttrService) : NULL;
+            CFTypeRef av = query ? CFDictionaryGetValue(query, kSecAttrAccount) : NULL;
+            diagAppend([NSString stringWithFormat:@"\n[%@] KC-IDENTITY-MISS svc=%@ acct=%@\n",
+                        [NSDate date],
+                        (sv && CFGetTypeID(sv) == CFStringGetTypeID()) ? (__bridge NSString *)sv : @"?",
+                        (av && CFGetTypeID(av) == CFStringGetTypeID()) ? (__bridge NSString *)av : @"?"]);
+        } @catch (id e) {}
     }
 #endif
     if (st != 0 || !result || !*result) return st;   // 0 = errSecSuccess
@@ -1345,6 +1436,53 @@ static void captureRealIdentity(NSString *name, NSString *value) {
 }
 
 // 把字符串里出现的「本机真实身份值」替换为「伪造值」（所有出口共用）
+#if MT_CLONE
+// ============================================================
+// ★ v75 出口兜底：已知本机真值的替换/告警 ★
+//
+// 上面 1)/2) 两条堵的是「读」通道（keychain 读回退、prefs 共享键）。
+// 但共享面不止这两处（App Group 文件、MMKV、未 hook 的 SDK 自研存储…），
+// 所以再加一层「出口按值兜底」——不依赖猜通道，只认值。
+//
+// 真值来源：2026-09-21 手机容器取证 + 原版 9/19 HAR 交叉验证。
+// 注意：dpid/dfpid 被 mtgsig 签名覆盖（a3 就是 dfpid），**不做替换**，
+//       只落诊断日志 —— 一旦日志里出现 MTID-LEAK DPID/DFPID，就说明
+//       「读」通道还有没堵住的，需要继续从存储层查，而不是改这里。
+// ============================================================
+#define ORIG_DEVICE_UUID @"000000000000011F129BC70EA4697A50968D9D4C404BDA165456959808621466"
+#define ORIG_DPID        @"c266bb5d3d3b49d79f297d3f689e44faa161867936417050000"
+#define ORIG_DFPID       @"d87187750bb3692e4cdfa00eed1538bca58ff988c6f4b8189e54176b"
+
+// 本克隆自己的 64 位设备 ID（与真值同形：16 hex 前缀 + 48 hex）
+static NSString *mtFakeDeviceUUID(void) {
+    return getPersistent(@"BdD1.mt.uuid64", ^{
+        static const char *H = "0123456789ABCDEF";
+        char b[49];
+        for (int i = 0; i < 48; i++) b[i] = H[arc4random_uniform(16)];
+        b[48] = 0;
+        return [NSString stringWithFormat:@"000000000000011F%s", b];
+    });
+}
+
+static NSString *swapKnownDeviceIDs(NSString *s) {
+    if (!s || s.length < 40) return s;
+    @try {
+        if ([s rangeOfString:ORIG_DEVICE_UUID].location != NSNotFound) {
+            diagAppend([NSString stringWithFormat:@"\n[%@] MTID-LEAK DEVICE-UUID -> swapped\n", [NSDate date]]);
+            s = [s stringByReplacingOccurrencesOfString:ORIG_DEVICE_UUID
+                                            withString:mtFakeDeviceUUID()];
+        }
+        if ([s rangeOfString:ORIG_DPID].location != NSNotFound) {
+            diagAppend([NSString stringWithFormat:@"\n[%@] MTID-LEAK DPID (mtgsig-bound, not swapped)\n", [NSDate date]]);
+        }
+        if ([s rangeOfString:ORIG_DFPID].location != NSNotFound) {
+            diagAppend([NSString stringWithFormat:@"\n[%@] MTID-LEAK DFPID (mtgsig-bound, not swapped)\n", [NSDate date]]);
+        }
+    } @catch (id e) {}
+    return s;
+}
+#endif
+
 static NSString *rewriteIdentityString(NSString *s) {
     if (!s || s.length < 20) return s;
     @try {
@@ -1358,6 +1496,9 @@ static NSString *rewriteIdentityString(NSString *s) {
         }
     } @catch (id e) {}
     // v74: 克隆包名一律换成官方包名（URL query / 请求体是主要出口）
+#if MT_CLONE
+    s = swapKnownDeviceIDs(s);   // v75: 已知本机真值兜底
+#endif
     s = maskCloneBundleID(s);
     return s;
 }
