@@ -31,6 +31,30 @@
 //         P0: keychain 身份关键字补 mtj/cdid/umid/oaid/vaid/aaid（统计 SDK 串号）
 //         P0: DCDevice/AppAttest 失败化（Apple 签名设备证明，绑定物理机）
 //         P1: CNCopyCurrentNetworkInfo 返空（家庭 WiFi BSSID 网络锚点）
+//   v74   ★ 克隆包名消毒 + 包标识伪装启用（2026-09-21，修 M1 登录发码）★
+//         诊断依据（M1 v4 日志）：美团三处把克隆包名明文上报服务端 ——
+//           · URL query  csecpkgname=com.meituan.imeituan.MtM1（csec 安全 SDK）
+//           · URL query  packageName=com.meituan.imeituan.MtM1（账号 SDK）
+//           · POST body  {"appInfo":{"app":"com.meituan.imeituan.MtM1"}}
+//           · 请求头     User-Agent: com.meituan.imeituan.MtM1/349883 (...)
+//         而「获取验证码」在全部三次抓包里**没有发出任何请求**
+//         （其余接口全 200，无 WebView）→ 客户端本地判定层拦截。
+//         多开必然改 bundle id，改包名是重打包检测的经典特征，故：
+//           1) 出口消毒 maskCloneBundleID()：URL / 请求体 / 请求头
+//              里的克隆包名一律换成官方包名（复用它现成的
+//              rewriteIdentityString/Data 出口，零新增 hook 风险）
+//           2) 包标识伪装启用（v60 写过但 v63 因启动闪退停用；
+//              真因是 isMainBundleObject 内部调 [NSBundle mainBundle]
+//              读 Info.plist → 触发自身 hook → 无限递归。
+//              改为安装 hook 前缓存 mainBundle 指针一次，比较指针，
+//              彻底消除递归）
+//           3) MT 构建不再强制 DCDevice/AppAttest 失败（美团主二进制
+//              有 DCDevice 引用；强制失败＝把自己变成「设备证明异常」
+//              的少数派，且错误域里带 "BdClone" 字样）
+//           4) 诊断补盲：NSURLConnection / NSURLProtocol 全覆盖，
+//              响应头落盘 —— 登录通道若不走 NSURLSession，前三次
+//              抓包是看不见的
+//         不动 dyld 镜像隐藏（v63 停用原因未二分，保持单一变量）
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -325,15 +349,31 @@ static struct rebinding g_hide_rebindings[HIDE_REBIND_COUNT];
 // ⚠️ 克隆后缀（keychain 命名空间）必须改走 realBundleIdentifier()，
 //    绝不能再取被 hook 后的值 —— 否则每个克隆算出的后缀都会变成
 //    "BaiduMobile"，v59 的隔离当场失效（所有克隆挤进同一命名空间）。
+//
+// ★ v63 停用原因（v74 修复）★
+//   原实现判断「是不是主 bundle」用 `bundle == [NSBundle mainBundle]`，
+//   而首次调用 [NSBundle mainBundle] 自身要读 Info.plist → 触发
+//   -infoDictionary hook → 再次调用 [NSBundle mainBundle] → 无限递归。
+//   v74 改为：安装 hook **之前**先把 mainBundle 指针缓存下来，
+//   hook 内部只做指针比较，永不调用 [NSBundle mainBundle]。
 // ============================================================
-#define OFFICIAL_BUNDLE_ID "com.baidu.BaiduMobile"
+#if MT_CLONE
+#define OFFICIAL_BUNDLE_ID "com.meituan.imeituan"      // 美团官方包名
+#else
+#define OFFICIAL_BUNDLE_ID "com.baidu.BaiduMobile"     // 百度官方包名
+#endif
 
 static NSString *(*orig_bundleIdentifier)(id, SEL) = NULL;
 static NSDictionary *(*orig_infoDictionary)(id, SEL) = NULL;
 static id (*orig_objectForInfoDictionaryKey)(id, SEL, NSString *) = NULL;
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef) = NULL;
 
-// 取真实 bundle id（绕过 hook）—— 只给 cloneTag 用
+// v74: 安装 hook 前缓存，hook 内只比指针（消除 v63 的递归闪退）
+static NSBundle *g_mainBundleCached = nil;
+// v74: 本克隆的真实 bundle id（构造函数最早期固定，hook 生效后仍可用）
+static NSString *g_cloneBundleID = nil;
+
+// 取真实 bundle id（绕过 hook）—— 只给 cloneTag / 出口消毒用
 static NSString *realBundleIdentifier(void) {
     if (orig_bundleIdentifier) {
         return orig_bundleIdentifier([NSBundle mainBundle], @selector(bundleIdentifier));
@@ -341,9 +381,39 @@ static NSString *realBundleIdentifier(void) {
     return [[NSBundle mainBundle] bundleIdentifier];
 }
 
-static BOOL isMainBundleObject(id bundle) {
-    return (bundle != nil) && (bundle == [NSBundle mainBundle]);
+// ★ v74: 出口包名消毒 —— 任何要发出去/写下去的字符串里的克隆包名换成官方包名
+//   （URL query 的 csecpkgname/packageName、POST body 的 appInfo.app、
+//     User-Agent 头部，以及 keychain/共享域回读内容）
+static NSString *maskCloneBundleID(NSString *s) {
+    if (!s || s.length < 12) return s;
+    @try {
+        NSString *cloneID = g_cloneBundleID;
+        if (cloneID.length < 12) cloneID = realBundleIdentifier();
+        if (cloneID.length < 12) return s;
+        if ([cloneID isEqualToString:@(OFFICIAL_BUNDLE_ID)]) return s;   // 未改包名，无需消毒
+        if ([s rangeOfString:cloneID].location == NSNotFound) return s;
+        return [s stringByReplacingOccurrencesOfString:cloneID withString:@(OFFICIAL_BUNDLE_ID)];
+    } @catch (id e) {}
+    return s;
 }
+
+static NSData *maskCloneBundleIDData(NSData *d) {
+    if (!d || d.length < 12) return d;
+    @try {
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s) return d;
+        NSString *r = maskCloneBundleID(s);
+        if (r == s) return d;
+        return [r dataUsingEncoding:NSUTF8StringEncoding] ?: d;
+    } @catch (id e) { return d; }
+}
+
+static BOOL isMainBundleObject(id bundle) {
+    if (!bundle) return NO;
+    if (g_mainBundleCached) return (bundle == g_mainBundleCached);
+    return (bundle == [NSBundle mainBundle]);
+}
+
 
 static NSString *hook_bundleIdentifier(id self, SEL _cmd) {
     if (isMainBundleObject(self)) return @(OFFICIAL_BUNDLE_ID);
@@ -398,6 +468,9 @@ static void installInstanceMethod(Class cls, SEL sel, IMP newImp, void *outOrig)
 static void installBundleIdentifierHooks(void) {
     Class nb = objc_getClass("NSBundle");
     if (!nb) return;
+    // ★ v74: 先缓存 mainBundle 指针（此刻 hook 未装，读取路径干净），
+    //   之后 hook 内只做指针比较 —— 这是 v63 递归闪退的正式修复
+    g_mainBundleCached = [NSBundle mainBundle];
     installInstanceMethod(nb, @selector(bundleIdentifier),
                           (IMP)hook_bundleIdentifier, &orig_bundleIdentifier);
     installInstanceMethod(nb, @selector(infoDictionary),
@@ -1284,6 +1357,8 @@ static NSString *rewriteIdentityString(NSString *s) {
             s = [s stringByReplacingOccurrencesOfString:rb withString:getFakeID(@"BAIDUID")];
         }
     } @catch (id e) {}
+    // v74: 克隆包名一律换成官方包名（URL query / 请求体是主要出口）
+    s = maskCloneBundleID(s);
     return s;
 }
 
@@ -1291,9 +1366,9 @@ static NSData *rewriteIdentityData(NSData *d) {
     if (!d || d.length < 16) return d;
     @try {
         NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-        if (!s) return d;
+        if (!s) return maskCloneBundleIDData(d);   // 非 UTF8：至少试一遍字节级包名消毒
         NSString *r = rewriteIdentityString(s);
-        if (r == s) return d;
+        if (r == s) return maskCloneBundleIDData(d);
         NSData *nd = [r dataUsingEncoding:NSUTF8StringEncoding];
         return nd ?: d;
     } @catch (id e) { return d; }
@@ -1782,6 +1857,21 @@ static void diagDumpResponse(NSURLRequest *req, NSHTTPURLResponse *resp, NSData 
     if (!resp || !diagInteresting(u)) return;
     NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] RESP %ld %@\n",
                           [NSDate date], (long)resp.statusCode, u.absoluteString];
+    // v74: 响应头落盘 —— 风控/账号接口的令牌经常只走响应头
+    //      （Set-Cookie / 自定义 token 头），只记 body 会得出
+    //      「返回空 data」这种误导性结论
+    @try {
+        NSDictionary *rh = resp.allHeaderFields;
+        if (rh.count > 0) {
+            NSUInteger n = 0;
+            for (NSString *k in rh) {
+                if (n++ >= 12) { [m appendString:@"  RH <more...>\n"]; break; }
+                NSString *v = [rh[k] description];
+                if (v.length > 200) v = [[v substringToIndex:200] stringByAppendingString:@"..."];
+                [m appendFormat:@"  RH %@: %@\n", k, v];
+            }
+        }
+    } @catch (id e) {}
     NSData *d = data;
     if (d.length > 4000) d = [d subdataWithRange:NSMakeRange(0, 4000)];
     NSString *bs = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
@@ -1890,6 +1980,25 @@ static void diagSwizzleNetDelegate(id d) {
     } @catch (id e) {}
 }
 
+// v74: 登录通道盲区补漏 —— 三次抓包（v1/v3/v4）里「获取验证码」没有产生
+// 任何 NSURLSession 任务，但美团账号 SDK（SAKNetworkRequestOperation /
+// SAKURLDelegate）与 csec 安全 SDK 都引用了 NSURLConnection、NSURLProtocol，
+// 且主二进制里有 CFReadStream 系直连符号。因此在 Session 之外再罩一层：
+//   NSURLConnection 四个入口 + NSURLProtocol 初始化（所有走 URL 加载系统的
+//   请求最后都会过 NSURLProtocol，是最靠后的兜底观测点）。
+// 纯观测：只写日志，不改请求（不影响签名/行为）。
+static void diagDumpConnRequest(NSURLRequest *req, NSString *tag) {
+    if (!req) return;
+    // 与 REQ 日志同一套排除法（静态资源/CDN 不记），否则 PROTO 兜底层
+    // 会把图片/CDN 流量全写进来，3MB 上限几分钟就挤满
+    if (!diagInteresting(req.URL)) return;
+    @try {
+        diagAppend([NSString stringWithFormat:@"\n[%@] %@ %@\n  URL: %@\n",
+                    [NSDate date], tag, req.HTTPMethod ?: @"GET",
+                    req.URL.absoluteString ?: @"?"]);
+    } @catch (id e) {}
+}
+
 // ============================================================
 // Constructor — v58
 // ============================================================
@@ -1907,6 +2016,9 @@ static void initPrivacyHook(void) {
         // 在很深的调用栈上（甚至初始化过程中）触发。此刻尚未安装任何
         // hook，NSBundle 读取路径最干净，提前固定下来可彻底避免
         // 「惰性计算 → 重入 → 递归爆栈」这一类风险。
+        // v74: 同时把「克隆真实 bundle id」固定下来 —— 包标识伪装装上之后
+        //      NSBundle 读到的就是官方包名了，出口消毒必须用这个快照值。
+        g_cloneBundleID = [realBundleIdentifier() copy];
         (void)cloneTag();
 
         // ---- 1. v59: 首启只清 Cookie ----
@@ -2085,10 +2197,18 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 
         // ---- 3c. v72: DeviceCheck / App Attest 失败化 ★P0★ ----
-        // 审计：主二进制 DCDevice/DCAppAttestService/generateToken/attestKey 都有引用。
+        // 审计：百度主二进制 DCDevice/DCAppAttestService/generateToken/attestKey 都有引用。
         // DeviceCheck 是 Apple 服务器签名的设备证明，绑定物理设备 —— 卸载重装、
         // 换 bundle id 全部无效，是「刚装能下单、几天后被拉黑」的最强解释。
         // 做法：所有 token/assert 生成回调直接报错。风控 SDK 对可选信号失败一般静默容忍。
+        //
+        // ★ v74: 仅百度构建启用。美团主二进制同样引用 DCDevice，但美团这次
+        //   的病灶是「登录发码被本地判定拦」——在克隆里额外制造一个
+        //   「设备证明异常」的少数派特征，只会给风控多一个抓手；且原版美团
+        //   在同一台机器上 DeviceCheck 是正常的。美团构建直接透传真实现。
+        //   错误域同时从 "BdCloneV72" 改为中性的 "DCErrorDomain"
+        //   （旧域名字面带 Clone，若 SDK 记录错误域就是自曝）。
+#if !MT_CLONE
         @try {
             Class dcd = objc_getClass("DCDevice");
             if (dcd) {
@@ -2096,7 +2216,7 @@ static void initPrivacyHook(void) {
                 Method gtM = class_getInstanceMethod(dcd, gtSel);
                 if (gtM) {
                     IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSData *, NSError *)) {
-                        if (h) h(nil, [NSError errorWithDomain:@"BdCloneV72" code:-1 userInfo:nil]);
+                        if (h) h(nil, [NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
                     });
                     class_replaceMethod(dcd, gtSel, imp, method_getTypeEncoding(gtM));
                 }
@@ -2107,7 +2227,7 @@ static void initPrivacyHook(void) {
                 Method gkM = class_getInstanceMethod(dca, gkSel);
                 if (gkM) {
                     IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSString *, NSError *)) {
-                        if (h) h(nil, [NSError errorWithDomain:@"BdCloneV72" code:-2 userInfo:nil]);
+                        if (h) h(nil, [NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
                     });
                     class_replaceMethod(dca, gkSel, imp, method_getTypeEncoding(gkM));
                 }
@@ -2115,7 +2235,7 @@ static void initPrivacyHook(void) {
                 Method akM = class_getInstanceMethod(dca, akSel);
                 if (akM) {
                     IMP imp = imp_implementationWithBlock(^(id s, NSString *keyId, NSData *hash, void (^h)(NSError *)) {
-                        if (h) h([NSError errorWithDomain:@"BdCloneV72" code:-3 userInfo:nil]);
+                        if (h) h([NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
                     });
                     class_replaceMethod(dca, akSel, imp, method_getTypeEncoding(akM));
                 }
@@ -2123,12 +2243,13 @@ static void initPrivacyHook(void) {
                 Method gaM = class_getInstanceMethod(dca, gaSel);
                 if (gaM) {
                     IMP imp = imp_implementationWithBlock(^(id s, NSString *attestObj, NSData *hash, void (^h)(NSData *, NSError *)) {
-                        if (h) h(nil, [NSError errorWithDomain:@"BdCloneV72" code:-4 userInfo:nil]);
+                        if (h) h(nil, [NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
                     });
                     class_replaceMethod(dca, gaSel, imp, method_getTypeEncoding(gaM));
                 }
             }
         } @catch (id e) {}
+#endif // !MT_CLONE
 
         // ---- 4. NSUserDefaults hooks — 设备 ID 伪造 + v64 按键精准隔离 ----
         @try {
@@ -2399,11 +2520,36 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
                 }
-#endif // !MT_CLONE
+#else
+                // ---- v74: 美团构建的请求头消毒 ----
+                // 美团版不做百度 UA 补段 / Cookie 身份改写（原本就 #if !MT_CLONE
+                // 整段跳过），但**必须**处理包名泄漏：
+                //   User-Agent: com.meituan.imeituan.MtM1/349883 (unknown, iOS 16.1, ...)
+                // 该 UA 由 App 自己用 bundle id 拼出来，是明面上的重打包特征。
+                Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+                if (svM) {
+                    IMP origSV = method_getImplementation(svM);
+                    IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        ((void (*)(id, SEL, NSString *, NSString *))origSV)(
+                            s, @selector(setValue:forHTTPHeaderField:), maskCloneBundleID(value), field);
+                    });
+                    class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
+                }
+                Method addValM = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
+                if (addValM) {
+                    IMP origAddVal = method_getImplementation(addValM);
+                    IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(
+                            s, @selector(addValue:forHTTPHeaderField:), maskCloneBundleID(value), field);
+                    });
+                    class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
+                }
+#endif // MT_CLONE 分支
 
                 // v57U: 请求出口消毒 —— URL 参数 / POST body 里的真实 cuid
                 // 原生 SDK 拼请求时 cuid=%@ 直接进 query/body（不走 cookie），
                 // 按值替换为本克隆伪造值，与 cookie 保持单一身份
+                // v74: 同一出口顺带做克隆包名消毒（csecpkgname/packageName/appInfo.app）
                 Method suM = class_getInstanceMethod(reqClass, @selector(setURL:));
                 if (suM) {
                     IMP origSetURL = method_getImplementation(suM);
@@ -2631,33 +2777,37 @@ static void initPrivacyHook(void) {
             // 7b. 注册 dyld 回调（动态加载的框架也覆盖，用全局 C 函数）
             _dyld_register_func_for_add_image(hook_new_image);
 
-            // ---- 7c/7d. v63: v60 的「包标识伪装 + dyld 枚举隐藏」整体停用 ----
+            // ---- 7c/7d. v63 停用 → v74 恢复 7c（包标识伪装）----
             //
             // ★ 启动闪退根因（v59 好用、v62 崩，中间只有这两段是新增）★
             //
             // 7c（installBundleIdentifierHooks）把 NSBundle 的
             //   -bundleIdentifier / -infoDictionary / -objectForInfoDictionaryKey
-            // 全局替换，而这几个 hook 里判断「是不是主 bundle」用的是
+            // 全局替换，而原实现判断「是不是主 bundle」用
             //   bundle == [NSBundle mainBundle]
             // 首次调用 [NSBundle mainBundle] 需要读自己的 Info.plist →
             // 触发 -infoDictionary → 进 hook → 再调 [NSBundle mainBundle]
             // （此刻尚未缓存）→ 无限递归 → 栈溢出 → 启动即崩。
-            // 且它在启动早期被 Foundation 高频调用，必崩。
             //
-            // 7d（dyld 枚举隐藏）hook 的是 _dyld_image_count /
-            //   _dyld_get_image_name 等 dyld 自身的 API，系统组件、
-            //   ObjC 运行时、崩溃上报 SDK 在启动早期都会调它们，
-            //   每次调用都要 O(n) 遍历重映射，且与系统用这些 API 的
-            //   时序互相干扰 —— 同为启动期高危。
+            // ★ v74 正式修复：installBundleIdentifierHooks() 内部在装 hook
+            //   **之前**先把 [NSBundle mainBundle] 指针缓存到
+            //   g_mainBundleCached，isMainBundleObject 只做指针比较，
+            //   hook 路径里再也没有 [NSBundle mainBundle]。递归不可能发生。
             //
-            // 结论：这两项收益本来就低（包名检测百度实际没做；dyld 枚举
-            // 是崩溃 SDK 的常规用法），风险却最高。先用最稳的组合：
-            //   v59 的 keychain 隔离 + v61 的功能回退 + v62 的 suite 域隔离。
-            // 两段实现全部保留在文件里（未删除），后续要恢复需先修掉
-            // isMainBundleObject 的递归（改成缓存 mainBundle 指针一次性比较）。
-#if 0
+            // 7d（dyld 枚举隐藏）仍停用：它 hook 的是 _dyld_image_count /
+            //   _dyld_get_image_name 等 dyld 自身 API，系统组件、ObjC 运行时、
+            //   崩溃上报 SDK 在启动早期都会调，每次 O(n) 遍历重映射 ——
+            //   与 7c 同批停用但从未单独二分验证。保持单一变量，先不开。
+            //
+            // ⚠️ v74: 7c 仅美团构建启用。百度 D/E/P/T 系列当前实测正常
+            //    （能下单、能进农场），没有证据需要动它的包标识；
+            //   在跑通的链路上加未经真机验证的 hook 属于自找变量。
+            //    百度侧真要用：先把 isMainBundleObject 的递归修复
+            //    （已在 v74 完成）带过去，再单独测一版。
+#if MT_CLONE
             installBundleIdentifierHooks();
-
+#endif
+#if 0
             @try {
                 static void *hideHdrs[HIDE_MAX_IMG];
                 static intptr_t hideSlides[HIDE_MAX_IMG];
@@ -2816,6 +2966,98 @@ static void initPrivacyHook(void) {
                     }
                 } @catch (id e) {}
                 diagAppend(@"==== diag hooks v69 installed ====\n");
+
+                // ---- 8f. v74: NSURLConnection / NSURLProtocol 观测层 ----
+                // M1 抓包三次都看不到「获取验证码」的请求，必须先证明
+                // 「请求到底有没有出去」，否则所有修复都是盲猜。
+                // NSURLProtocol 是 URL 加载系统的最后一道公共入口：
+                // NSURLSession / NSURLConnection / WebView 的请求都会经过它。
+                @try {
+                    Class nc = objc_getClass("NSURLConnection");
+                    if (nc) {
+                        // +sendSynchronousRequest:returningResponse:error:
+                        SEL s1 = @selector(sendSynchronousRequest:returningResponse:error:);
+                        Method m1 = class_getClassMethod(nc, s1);
+                        if (m1) {
+                            IMP o1 = method_getImplementation(m1);
+                            IMP n1 = imp_implementationWithBlock(
+                                ^NSData *(id s, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
+                                    diagDumpConnRequest(req, @"CONN-SYNC");
+                                    NSData *d = ((NSData *(*)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **))o1)(
+                                        s, s1, req, resp, err);
+                                    @try {
+                                        if (resp && *resp && [*resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                            diagDumpResponse(req, (NSHTTPURLResponse *)*resp, d);
+                                        }
+                                    } @catch (id e) {}
+                                    return d;
+                                });
+                            method_setImplementation(m1, n1);
+                        }
+                        // +connectionWithRequest:delegate: / -initWithRequest:delegate:startImmediately:
+                        SEL s2 = @selector(connectionWithRequest:delegate:);
+                        Method m2 = class_getClassMethod(nc, s2);
+                        if (m2) {
+                            IMP o2 = method_getImplementation(m2);
+                            IMP n2 = imp_implementationWithBlock(^id(id s, NSURLRequest *req, id dg) {
+                                diagDumpConnRequest(req, @"CONN-REQ");
+                                return ((id (*)(id, SEL, NSURLRequest *, id))o2)(s, s2, req, dg);
+                            });
+                            method_setImplementation(m2, n2);
+                        }
+                        SEL s3 = @selector(initWithRequest:delegate:startImmediately:);
+                        Method m3 = class_getInstanceMethod(nc, s3);
+                        if (m3) {
+                            IMP o3 = method_getImplementation(m3);
+                            IMP n3 = imp_implementationWithBlock(^id(id s, NSURLRequest *req, id dg, BOOL start) {
+                                diagDumpConnRequest(req, @"CONN-INIT");
+                                return ((id (*)(id, SEL, NSURLRequest *, id, BOOL))o3)(s, s3, req, dg, start);
+                            });
+                            class_replaceMethod(nc, s3, n3, method_getTypeEncoding(m3));
+                        }
+                        SEL s4 = @selector(sendAsynchronousRequest:queue:completionHandler:);
+                        Method m4 = class_getClassMethod(nc, s4);
+                        if (m4) {
+                            IMP o4 = method_getImplementation(m4);
+                            IMP n4 = imp_implementationWithBlock(
+                                ^void(id s, NSURLRequest *req, NSOperationQueue *q,
+                                      void (^h)(NSURLResponse *, NSData *, NSError *)) {
+                                    diagDumpConnRequest(req, @"CONN-ASYNC");
+                                    if (!h) {
+                                        ((void (*)(id, SEL, NSURLRequest *, NSOperationQueue *, id))o4)(s, s4, req, q, nil);
+                                        return;
+                                    }
+                                    void (^w)(NSURLResponse *, NSData *, NSError *) =
+                                        ^(NSURLResponse *r, NSData *d, NSError *e) {
+                                            @try {
+                                                if (e) diagDumpError(req, e, @"CONN");
+                                                if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                                    diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
+                                                }
+                                            } @catch (id ex) {}
+                                            h(r, d, e);
+                                        };
+                                    ((void (*)(id, SEL, NSURLRequest *, NSOperationQueue *, id))o4)(s, s4, req, q, w);
+                                });
+                            method_setImplementation(m4, n4);
+                        }
+                    }
+                    // NSURLProtocol 兜底：记录所有进入 URL 加载系统的请求
+                    Class np = objc_getClass("NSURLProtocol");
+                    if (np) {
+                        SEL psel = @selector(initWithRequest:cachedResponse:client:);
+                        Method pm = class_getInstanceMethod(np, psel);
+                        if (pm) {
+                            IMP op = method_getImplementation(pm);
+                            IMP npi = imp_implementationWithBlock(^id(id s, NSURLRequest *req, NSCachedURLResponse *cr, id client) {
+                                diagDumpConnRequest(req, @"PROTO");
+                                return ((id (*)(id, SEL, NSURLRequest *, NSCachedURLResponse *, id))op)(s, psel, req, cr, client);
+                            });
+                            class_replaceMethod(np, psel, npi, method_getTypeEncoding(pm));
+                        }
+                    }
+                } @catch (id e) {}
+                diagAppend(@"==== diag hooks v74 (conn/proto) installed ====\n");
             } @catch (id e) {}
         } @catch (id e) {}
     }
