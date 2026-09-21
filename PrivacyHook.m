@@ -143,11 +143,16 @@ static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CF
 // v72: WiFi 信息返空 —— SSID/BSSID 是家庭路由器锚点，所有克隆与原版一致，
 // 服务端 IP+BSSID 聚类就能把新 bundle id 和被拉黑的原版连起来。
 // iOS14+ 无定位权限本来也拿不到，返 NULL 不异常。
+// ⚠️ 仅百度构建启用。美团版（MT_CLONE=1）禁用：实测美团登录模块用
+//    CNCopyCurrentNetworkInfo 判网络状态，返 NULL → 获取验证码报「网络异常」；
+//    且美团原版本就正常使用、不存在被拉黑原版可关联，隐藏 WiFi 无收益。
+#if !MT_CLONE
 static CFArrayRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
 static CFArrayRef hook_CNCopyCurrentNetworkInfo(CFStringRef ifName) {
     (void)ifName;
     return NULL;
 }
+#endif // !MT_CLONE
 
 // ============ CFNetwork C 层 Cookie API ============
 // iOS SDK 未公开 CFHTTPCookie 头文件（仅 macOS 公开），手动声明类型，
@@ -384,8 +389,13 @@ static void installBundleIdentifierHooks(void) {
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
 // v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
 // v63: 15 → 14 —— 移除 CFBundleGetIdentifier（v60 包标识伪装同批停用）
-// v72: 16 → 17 —— 新增 CNCopyCurrentNetworkInfo（WiFi 锚点返空）
+// v72: 16 → 17 —— 新增 CNCopyCurrentNetworkInfo（WiFi 锚点返空，仅百度构建）
+// MT_CLONE=1 时该 rebind 不注册，表长回 16
+#if !MT_CLONE
 #define REBIND_COUNT 17
+#else
+#define REBIND_COUNT 16
+#endif
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -2553,7 +2563,9 @@ static void initPrivacyHook(void) {
             //      老 sysctl() 继续不绑。
             g_rebindings[14] = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             g_rebindings[15] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
+#if !MT_CLONE
             g_rebindings[16] = (struct rebinding){"CNCopyCurrentNetworkInfo",            (void *)hook_CNCopyCurrentNetworkInfo,               (void **)&orig_CNCopyCurrentNetworkInfo};
+#endif // !MT_CLONE
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
             // g_rebindings[11] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
