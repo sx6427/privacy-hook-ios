@@ -24,6 +24,11 @@
 //   v70   硬件人格回归（iPhone13,2）：下单通过但农场识破——真机是 13 Pro Max
 //         （屏幕 1284×2778 透传），与 iPhone12 机型串矛盾
 //   v71   人格改 iPhone13,4（12 Pro Max）：与真机同屏同内存，透传值全部自洽
+//   v72   ★ 泄漏点修复（2026-09-21 审计）★
+//         P0: UIPasteboard 克隆私有化（TalosPro 风控 SDK 在用，跨 App 串号）
+//         P0: keychain 身份关键字补 mtj/cdid/umid/oaid/vaid/aaid（统计 SDK 串号）
+//         P0: DCDevice/AppAttest 失败化（Apple 签名设备证明，绑定物理机）
+//         P1: CNCopyCurrentNetworkInfo 返空（家庭 WiFi BSSID 网络锚点）
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -122,6 +127,15 @@ static __thread BOOL g_inMGHook = NO;
 
 typedef unsigned int io_registry_entry_t;
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, uint32_t) = NULL;
+
+// v72: WiFi 信息返空 —— SSID/BSSID 是家庭路由器锚点，所有克隆与原版一致，
+// 服务端 IP+BSSID 聚类就能把新 bundle id 和被拉黑的原版连起来。
+// iOS14+ 无定位权限本来也拿不到，返 NULL 不异常。
+static CFArrayRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
+static CFArrayRef hook_CNCopyCurrentNetworkInfo(CFStringRef ifName) {
+    (void)ifName;
+    return NULL;
+}
 
 // ============ CFNetwork C 层 Cookie API ============
 // iOS SDK 未公开 CFHTTPCookie 头文件（仅 macOS 公开），手动声明类型，
@@ -354,7 +368,8 @@ static void installBundleIdentifierHooks(void) {
 // hook 函数本体保留（未注册不影响体积），随时可恢复。
 // v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
 // v63: 15 → 14 —— 移除 CFBundleGetIdentifier（v60 包标识伪装同批停用）
-#define REBIND_COUNT 16
+// v72: 16 → 17 —— 新增 CNCopyCurrentNetworkInfo（WiFi 锚点返空）
+#define REBIND_COUNT 17
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -886,9 +901,13 @@ static BOOL isIdentityKeychainDict(CFDictionaryRef dict) {
     static NSArray *kw = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        // v72: 补 mtj/cdid/umid/oaid/vaid/aaid —— 百度统计(MTJ)设备 ID 族，
+        //       主二进制引用 40+ 处。缺了它们，克隆会按「非身份项」把原版
+        //       存的统计设备 ID 读回退读进来 → 统计图谱直接关联
         kw = @[@"cuid", @"devuid", @"deviceid", @"device_id", @"idfv", @"idfa",
                @"udid", @"stoken", @"token", @"bduss", @"login", @"account",
-               @"passport", @"sapi", @"user", @"ptoken", @"session"];
+               @"passport", @"sapi", @"user", @"ptoken", @"session",
+               @"mtj", @"cdid", @"umid", @"oaid", @"vaid", @"aaid"];
     });
     const void *keys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
     for (size_t i = 0; i < 3; i++) {
@@ -1802,6 +1821,11 @@ static void diagSwizzleNetDelegate(id d) {
 // ============================================================
 // Constructor — v58
 // ============================================================
+// v72: UIPasteboard 私有化 —— 保存 pasteboardWithNamespace: 原始 IMP + 防自递归标记
+static IMP g_origPBNamespace = NULL;
+static IMP g_origPWName = NULL;
+static BOOL g_inPBCall = NO;
+
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
@@ -1925,6 +1949,111 @@ static void initPrivacyHook(void) {
                         return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdD1.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3b. v72: UIPasteboard 克隆私有化 ★P0★ ----
+        // 审计：主二进制 UIPasteboard ×22，风控 SDK TalosPro 就在调。所有克隆
+        // 与原版共享同一物理剪贴板 → 风控写入的设备标识跨 App 串回真机。
+        // 做法：generalPasteboard 重定向到克隆专属 namespace（bdclone.general.<tag>）；
+        //       App 发起的 pasteboardWithNamespace: / pasteboardWithName:create:
+        //       名字追加克隆后缀（同克隆重启后名字稳定，App 内持久性不受影响；
+        //       与原版/其他克隆物理隔离）。
+        @try {
+            Class pbc = objc_getClass("UIPasteboard");
+            if (pbc) {
+                Class meta = object_getClass(pbc);
+                SEL pnSel = NSSelectorFromString(@"pasteboardWithNamespace:");
+                Method pnM = class_getInstanceMethod(meta, pnSel);
+                if (pnM) {
+                    g_origPBNamespace = method_getImplementation(pnM);
+                    IMP impPN = imp_implementationWithBlock(^UIPasteboard *(id s, NSString *ns) {
+                        if (!g_inPBCall && ns.length > 0 && ![ns hasPrefix:@"bdclone."]) {
+                            g_inPBCall = YES;
+                            @try {
+                                return ((UIPasteboard *(*)(id, SEL, NSString *))g_origPBNamespace)(
+                                    s, pnSel, [[@"bdclone." stringByAppendingString:ns]
+                                               stringByAppendingString:[@"." stringByAppendingString:cloneTag()]]);
+                            } @finally { g_inPBCall = NO; }
+                        }
+                        return ((UIPasteboard *(*)(id, SEL, NSString *))g_origPBNamespace)(s, pnSel, ns);
+                    });
+                    class_replaceMethod(meta, pnSel, impPN, method_getTypeEncoding(pnM));
+
+                    SEL gpSel = @selector(generalPasteboard);
+                    Method gpM = class_getInstanceMethod(meta, gpSel);
+                    if (gpM) {
+                    IMP impGP = imp_implementationWithBlock(^UIPasteboard *(id s) {
+                        g_inPBCall = YES;
+                        @try {
+                            return ((UIPasteboard *(*)(id, SEL, NSString *))g_origPBNamespace)(
+                                s, pnSel, [@"bdclone.general." stringByAppendingString:cloneTag()]);
+                        } @finally { g_inPBCall = NO; }
+                    });
+                        class_replaceMethod(meta, gpSel, impGP, method_getTypeEncoding(gpM));
+                    }
+
+                    SEL pwnSel = NSSelectorFromString(@"pasteboardWithName:create:");
+                    Method pwnM = class_getInstanceMethod(meta, pwnSel);
+                    if (pwnM) {
+                        g_origPWName = method_getImplementation(pwnM);
+                        IMP impPWN = imp_implementationWithBlock(^UIPasteboard *(id s, NSString *name, BOOL create) {
+                            if (name.length > 0 && ![name hasPrefix:@"bdclone."]) {
+                                name = [[@"bdclone." stringByAppendingString:name]
+                                        stringByAppendingString:[@"." stringByAppendingString:cloneTag()]];
+                            }
+                            return ((UIPasteboard *(*)(id, SEL, NSString *, BOOL))g_origPWName)(
+                                s, pwnSel, name, create);
+                        });
+                        class_replaceMethod(meta, pwnSel, impPWN, method_getTypeEncoding(pwnM));
+                    }
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3c. v72: DeviceCheck / App Attest 失败化 ★P0★ ----
+        // 审计：主二进制 DCDevice/DCAppAttestService/generateToken/attestKey 都有引用。
+        // DeviceCheck 是 Apple 服务器签名的设备证明，绑定物理设备 —— 卸载重装、
+        // 换 bundle id 全部无效，是「刚装能下单、几天后被拉黑」的最强解释。
+        // 做法：所有 token/assert 生成回调直接报错。风控 SDK 对可选信号失败一般静默容忍。
+        @try {
+            Class dcd = objc_getClass("DCDevice");
+            if (dcd) {
+                SEL gtSel = NSSelectorFromString(@"generateTokenWithCompletionHandler:");
+                Method gtM = class_getInstanceMethod(dcd, gtSel);
+                if (gtM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSData *, NSError *)) {
+                        if (h) h(nil, [NSError errorWithDomain:@"BdCloneV72" code:-1 userInfo:nil]);
+                    });
+                    class_replaceMethod(dcd, gtSel, imp, method_getTypeEncoding(gtM));
+                }
+            }
+            Class dca = objc_getClass("DCAppAttestService");
+            if (dca) {
+                SEL gkSel = NSSelectorFromString(@"generateKeyWithCompletionHandler:");
+                Method gkM = class_getInstanceMethod(dca, gkSel);
+                if (gkM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSString *, NSError *)) {
+                        if (h) h(nil, [NSError errorWithDomain:@"BdCloneV72" code:-2 userInfo:nil]);
+                    });
+                    class_replaceMethod(dca, gkSel, imp, method_getTypeEncoding(gkM));
+                }
+                SEL akSel = NSSelectorFromString(@"attestKey:clientDataHash:completionHandler:");
+                Method akM = class_getInstanceMethod(dca, akSel);
+                if (akM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, NSString *keyId, NSData *hash, void (^h)(NSError *)) {
+                        if (h) h([NSError errorWithDomain:@"BdCloneV72" code:-3 userInfo:nil]);
+                    });
+                    class_replaceMethod(dca, akSel, imp, method_getTypeEncoding(akM));
+                }
+                SEL gaSel = NSSelectorFromString(@"generateAssertion:clientDataHash:completionHandler:");
+                Method gaM = class_getInstanceMethod(dca, gaSel);
+                if (gaM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, NSString *attestObj, NSData *hash, void (^h)(NSData *, NSError *)) {
+                        if (h) h(nil, [NSError errorWithDomain:@"BdCloneV72" code:-4 userInfo:nil]);
+                    });
+                    class_replaceMethod(dca, gaSel, imp, method_getTypeEncoding(gaM));
                 }
             }
         } @catch (id e) {}
@@ -2401,6 +2530,7 @@ static void initPrivacyHook(void) {
             //      老 sysctl() 继续不绑。
             g_rebindings[14] = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             g_rebindings[15] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
+            g_rebindings[16] = (struct rebinding){"CNCopyCurrentNetworkInfo",            (void *)hook_CNCopyCurrentNetworkInfo,               (void **)&orig_CNCopyCurrentNetworkInfo};
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
             // g_rebindings[11] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
