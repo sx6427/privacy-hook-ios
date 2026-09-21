@@ -20,6 +20,8 @@
 //   v67   cuid 双格式修复：平台层 cuid 用真机 40大写HEX+尾格式（PLATCUID），
 //         cookie 层保持 b64url —— 两套 ID 本来就不同
 //   v68   诊断日志（T7）：果园相关请求/响应写 bd_diag.log
+//   v73   诊断补全：连接层错误落盘（didCompleteWithError / completion error），
+//         之前错误分支静默，「请求没发 vs 连接失败」无法判读（M1 登录排查用）
 //   v69   诊断增强（T7b）：delegate 型请求 + 响应体 + JSBridge 名单
 //   v70   硬件人格回归（iPhone13,2）：下单通过但农场识破——真机是 13 Pro Max
 //         （屏幕 1284×2778 透传），与 iPhone12 机型串矛盾
@@ -1762,6 +1764,19 @@ static void diagDumpResponse(NSURLRequest *req, NSHTTPURLResponse *resp, NSData 
     diagAppend(m);
 }
 
+// v73: 连接层错误落盘 —— 错误码/域名/描述/URL 全记
+static void diagDumpError(NSURLRequest *req, NSError *e, NSString *tag) {
+    if (!e) return;
+    @try {
+        NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] %@-ERR %ld %@\n",
+                              [NSDate date], tag, (long)e.code, e.domain ?: @"?"];
+        [m appendFormat:@"  DESC: %@\n", e.localizedDescription ?: @""];
+        NSURL *u = req.URL;
+        if (u) [m appendFormat:@"  URL: %@\n", u.absoluteString];
+        diagAppend(m);
+    } @catch (id ex) {}
+}
+
 // 构造函数里安装：
 //   - NSURLSession dataTaskWithRequest:completionHandler:（原生接口层，含响应）
 //   - NSURLSession dataTaskWithRequest:（v69: delegate 型，请求侧）
@@ -1794,6 +1809,7 @@ static void diagSwizzleNetDelegate(id d) {
             if ([done containsObject:ck]) return;
             [done addObject:ck];
         }
+        diagAppend([NSString stringWithFormat:@"\n[%@] SWIZZLE-DELEG %@\n", [NSDate date], ck]);
         SEL s1 = @selector(URLSession:dataTask:didReceiveData:);
         SEL s2 = @selector(URLSession:task:didCompleteWithError:);
         Method m1 = class_getInstanceMethod(c, s1);
@@ -1821,6 +1837,8 @@ static void diagSwizzleNetDelegate(id d) {
                         if (task) {
                             NSURLRequest *req = task.originalRequest ?: task.currentRequest;
                             NSHTTPURLResponse *resp = (NSHTTPURLResponse *)task.response;
+                            // v73: 失败任务必须留痕（resp 非 HTTP 或为空 = 连接层错误）
+                            if (error) diagDumpError(req, error, @"DELEG");
                             NSString *tid = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
                             NSData *acc = [diagTaskData() objectForKey:tid];
                             [diagTaskData() removeObjectForKey:tid];
@@ -2656,6 +2674,7 @@ static void initPrivacyHook(void) {
                                 void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
                                     ^(NSData *d, NSURLResponse *r, NSError *e) {
                                         @try {
+                                            if (e) diagDumpError(req, e, @"REQ");
                                             if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
                                                 diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
                                             }
@@ -2698,6 +2717,7 @@ static void initPrivacyHook(void) {
                                 void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
                                     ^(NSData *d, NSURLResponse *r, NSError *e) {
                                         @try {
+                                            if (e) diagDumpError(req, e, @"UPL");
                                             if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
                                                 diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
                                             }
