@@ -156,6 +156,31 @@ static CFArrayRef hook_CNCopyCurrentNetworkInfo(CFStringRef ifName) {
 }
 #endif // !MT_CLONE
 
+// v73: SCNetworkReachabilityGetFlags 诊断 —— 只记录「判定为不可达」的调用。
+// M1 登录验证码「网络异常」疑点：登录 SDK 本地 Reachability 状态卡死，
+// 点发码时本地直接拒绝、无任何网络请求。此 hook 验证系统层到底报什么。
+static void diagAppend(NSString *s); // 前置声明（实现在诊断日志段）
+static Boolean (*orig_SCNetworkReachabilityGetFlags)(const void *, uint32_t *) = NULL;
+static int g_reachUnreachableLogs = 0;
+static Boolean hook_SCNetworkReachabilityGetFlags(const void *target, uint32_t *flags) {
+    Boolean r = orig_SCNetworkReachabilityGetFlags(target, flags);
+    @try {
+        // kSCNetworkFlagsReachable = 0x2；不可达才记（可达的调用太频繁）
+        if (r && flags && !(*flags & 0x2) && g_reachUnreachableLogs < 60) {
+            g_reachUnreachableLogs++;
+            NSMutableString *m = [NSMutableString stringWithFormat:
+                @"\n[%@] REACH-UNREACHABLE flags=0x%lx\n", [NSDate date], (unsigned long)*flags];
+            if (target) {
+                // target 是 SCNetworkReachabilityRef，描述里带 host
+                NSString *desc = CFBridgingRelease(CFCopyDescription(target));
+                [m appendFormat:@"  TARGET: %@\n", desc ?: @"?"];
+            }
+            diagAppend(m);
+        }
+    } @catch (id e) {}
+    return r;
+}
+
 // ============ CFNetwork C 层 Cookie API ============
 // iOS SDK 未公开 CFHTTPCookie 头文件（仅 macOS 公开），手动声明类型，
 // 工具函数用 dlsym 运行时解析，hook 函数的 orig 指针由 fishhook 填充
@@ -393,10 +418,11 @@ static void installBundleIdentifierHooks(void) {
 // v63: 15 → 14 —— 移除 CFBundleGetIdentifier（v60 包标识伪装同批停用）
 // v72: 16 → 17 —— 新增 CNCopyCurrentNetworkInfo（WiFi 锚点返空，仅百度构建）
 // MT_CLONE=1 时该 rebind 不注册，表长回 16
+// v73: 新增 SCNetworkReachabilityGetFlags 诊断 rebind（两系都注册）
 #if !MT_CLONE
-#define REBIND_COUNT 17
+#define REBIND_COUNT 18
 #else
-#define REBIND_COUNT 16
+#define REBIND_COUNT 17
 #endif
 static struct rebinding g_rebindings[REBIND_COUNT];
 
@@ -2581,8 +2607,9 @@ static void initPrivacyHook(void) {
             //      老 sysctl() 继续不绑。
             g_rebindings[14] = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             g_rebindings[15] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
+            g_rebindings[16] = (struct rebinding){"SCNetworkReachabilityGetFlags",       (void *)hook_SCNetworkReachabilityGetFlags,          (void **)&orig_SCNetworkReachabilityGetFlags};
 #if !MT_CLONE
-            g_rebindings[16] = (struct rebinding){"CNCopyCurrentNetworkInfo",            (void *)hook_CNCopyCurrentNetworkInfo,               (void **)&orig_CNCopyCurrentNetworkInfo};
+            g_rebindings[17] = (struct rebinding){"CNCopyCurrentNetworkInfo",            (void *)hook_CNCopyCurrentNetworkInfo,               (void **)&orig_CNCopyCurrentNetworkInfo};
 #endif // !MT_CLONE
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
