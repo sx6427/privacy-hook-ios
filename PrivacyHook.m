@@ -89,6 +89,27 @@
 //              dpid / dfpid），说明还有没拦住的通道 → 记诊断日志；
 //              设备 uuid 直接换成本克隆等价 ID（dpid/dfpid 被签名覆盖
 //              不替换，避免破坏 mtgsig 校验）
+//   v76   ★ 给克隆发自己的身份证（2026-09-21，v75 的副作用修复）★
+//         v75 装到真机实测：原版 uuid/dpid 出口命中 0 次（隔离成功），
+//         KC-IDENTITY-MISS 37 条（身份条目已不回退）—— 但**克隆对外
+//         上报的是空 UUID**，比原来更醒目：
+//           csec 上报  {"app_version":"1200660201",...,"UUID":"","bundles":[]}
+//           block-popup URL  ...&uuid=&version_name=12.66.201&...
+//           lx0 上报  {"cityId":0,"userId":"","uuid":"",...}
+//         根因：v75 把身份条目的读回退关掉了（防泄漏，正确），但 MISS 后
+//         直接返回 errSecItemNotFound → 美团 ONI/csec SDK 读到 nil →
+//         拼出空串上报。原版这些字段都带合法值，克隆报空 =
+//         「环境异常/设备信息缺失」标记，仍会被判定为异常设备。
+//         修法（只在 MT_CLONE 生效）：
+//           1) keychain 身份条目 MISS 时**合成同形稳定伪值并返回**
+//              （mtSynthIdentityValue / mtSynthKeychainResult）
+//              · uuid/localid/utdid/oni* → 64 位 hex（同美团设备 ID 形态）
+//              · dpid/dfpid/unionid      → 32 hex + 19 位数字（同原版形态）
+//              · 含 token/login/session/passport/bduss 的条目**不合成**
+//                （伪造票据会破坏登录态，查不到才是正确行为）
+//              新增诊断 KC-IDENTITY-SYNTH 便于下轮核对
+//           2) mtFakeDeviceUUID 前缀不再硬编码原版的 011F，改随机 4 位 hex
+//              （同前缀 = 给服务端留一个「同批次」聚类锚点）
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -1126,6 +1147,104 @@ static BOOL isIdentityKeychainDict(CFDictionaryRef dict) {
     return NO;
 }
 
+#if MT_CLONE
+// ============================================================
+// ★ v76: 身份类 keychain 条目的「合成返回值」★
+//
+// v75 的副作用（真机日志实锤）：身份条目在克隆私有命名空间里 MISS 后
+// 直接返回 errSecItemNotFound → 美团 ONI/csec SDK 读到 nil → 对外上报
+// 空 UUID：
+//     csec 上报体      {"app_version":"1200660201",...,"UUID":"","bundles":[]}
+//     block-popup URL  ...&uuid=&version_name=12.66.201&...
+//     lx0 上报体        {"cityId":0,"userId":"","uuid":"",...}
+// 原版这些都带合法值。克隆报空 = 比「报原版值」更醒目的异常特征，
+// 这就是「识别到本机」的现行嫌疑（堵死了却没给克隆发自己的身份证）。
+//
+// 修法：设备标识类条目 MISS 时，按 service+account 生成「与美团原生格式
+// 同形」且持久稳定的伪值直接返回，让克隆像一个正常的新设备。
+//   - uuid/localid/utdid/oni*  → 64 位 hex（同美团设备 ID 形态）
+//   - dpid/dfpid/unionid       → 32 位 hex + 19 位数字（同原版 dpid 形态）
+//   - 含 token/login/session/passport/bduss 的条目绝不合成 —— 伪造票据会
+//     破坏登录态，保持「查不到」才是正确行为（克隆就该是未登录）。
+// ============================================================
+static BOOL mtIsDeviceIdentityName(NSString *s) {
+    if (!s || s.length == 0) return NO;
+    NSString *l = [s lowercaseString];
+    for (NSString *bad in @[@"token", @"login", @"session", @"passport", @"bduss"]) {
+        if ([l rangeOfString:bad].location != NSNotFound) return NO;
+    }
+    for (NSString *k in @[@"uuid", @"localid", @"utdid", @"dpid", @"dfpid",
+                          @"unionid", @"deviceid", @"device_id", @"devuid",
+                          @"idfv", @"idfa", @"oni", @"babel", @"sakg"]) {
+        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static NSString *mtSynthIdentityValue(NSString *svc, NSString *acct) {
+    NSString *joined = [NSString stringWithFormat:@"%@|%@", svc ?: @"", acct ?: @""];
+    NSString *l = [joined lowercaseString];
+    BOOL dpidLike = ([l rangeOfString:@"dpid"].location != NSNotFound ||
+                     [l rangeOfString:@"unionid"].location != NSNotFound);
+    NSString *storeKey = [NSString stringWithFormat:@"BdD1.mtkc.%@",
+                          [joined stringByReplacingOccurrencesOfString:@"|" withString:@"."]];
+    return getPersistent(storeKey, ^{
+        static const char *H = "0123456789ABCDEF";
+        if (dpidLike) {
+            char a[33];
+            for (int i = 0; i < 32; i++) a[i] = H[arc4random_uniform(16)];
+            a[32] = 0;
+            char d[20];
+            for (int i = 0; i < 19; i++) d[i] = (char)('0' + arc4random_uniform(10));
+            d[19] = 0;
+            return [NSString stringWithFormat:@"%s%s", a, d];
+        }
+        char b[65];
+        for (int i = 0; i < 64; i++) b[i] = H[arc4random_uniform(16)];
+        b[64] = 0;
+        return [NSString stringWithUTF8String:b];
+    });
+}
+
+// 按 query 要求的返回形态构造 result；成功返 0(errSecSuccess)，否则 -25300
+static OSStatus mtSynthKeychainResult(CFDictionaryRef query, CFTypeRef *result, NSString *valStr) {
+    if (!query || !result || !valStr) return -25300;   // errSecItemNotFound
+    @try {
+        BOOL wantData = (CFDictionaryGetValue(query, kSecReturnData) == kCFBooleanTrue);
+        BOOL wantAttrs = (CFDictionaryGetValue(query, kSecReturnAttributes) == kCFBooleanTrue);
+        BOOL wantRef = (CFDictionaryGetValue(query, kSecReturnRef) == kCFBooleanTrue);
+        // SecKeychainItemRef 无法伪造；只要存在性/计数也保持原样
+        if (wantRef && !wantData && !wantAttrs) return -25300;
+        if (!wantData && !wantAttrs) return -25300;
+
+        NSData *vd = [valStr dataUsingEncoding:NSUTF8StringEncoding];
+        if (!vd) return -25300;
+
+        // kSecReturnData=true 且不要属性时，result 类型就是 CFDataRef
+        if (wantData && !wantAttrs) {
+            *result = (__bridge_retained CFTypeRef)vd;
+            return 0;   // errSecSuccess
+        }
+        // 需要属性字典（可能同时要 data）
+        CFMutableDictionaryRef md = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (!md) return -25300;
+        CFTypeRef av = CFDictionaryGetValue(query, kSecAttrAccount);
+        if (av) CFDictionarySetValue(md, kSecAttrAccount, av);
+        CFTypeRef sv = CFDictionaryGetValue(query, kSecAttrService);
+        if (sv) CFDictionarySetValue(md, kSecAttrService, sv);
+        CFTypeRef gv = CFDictionaryGetValue(query, kSecAttrGeneric);
+        if (gv) CFDictionarySetValue(md, kSecAttrGeneric, gv);
+        CFDictionarySetValue(md, kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlock);
+        if (wantData) CFDictionarySetValue(md, kSecValueData, (__bridge CFDataRef)vd);
+        *result = (CFTypeRef)md;    // +1 交给调用方
+        return 0;
+    } @catch (id e) {}
+    return -25300;
+}
+#endif // MT_CLONE
+
 // 捕获真实值（仅当不是我们自己的伪造值，防自毒）并返回伪造 data
 static NSData *fakeCUIDDataFrom(NSData *realData) {
     @try {
@@ -1253,16 +1372,26 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
     }
 #endif
 #if MT_CLONE
-    // v75 诊断：身份类条目在本克隆命名空间里「查不到」= 隔离生效
-    // （若一直不出现，说明关键字表还没命中 ONI 的真实 service/account 名）
+    // v75 诊断 → v76 合成：身份类条目在本克隆命名空间里「查不到」
     if (identity && st == -25300 /* errSecItemNotFound */) {
         @try {
             CFTypeRef sv = query ? CFDictionaryGetValue(query, kSecAttrService) : NULL;
             CFTypeRef av = query ? CFDictionaryGetValue(query, kSecAttrAccount) : NULL;
+            NSString *svcS = (sv && CFGetTypeID(sv) == CFStringGetTypeID()) ? (__bridge NSString *)sv : @"";
+            NSString *acctS = (av && CFGetTypeID(av) == CFStringGetTypeID()) ? (__bridge NSString *)av : @"";
             diagAppend([NSString stringWithFormat:@"\n[%@] KC-IDENTITY-MISS svc=%@ acct=%@\n",
-                        [NSDate date],
-                        (sv && CFGetTypeID(sv) == CFStringGetTypeID()) ? (__bridge NSString *)sv : @"?",
-                        (av && CFGetTypeID(av) == CFStringGetTypeID()) ? (__bridge NSString *)av : @"?"]);
+                        [NSDate date], svcS.length ? svcS : @"?", acctS.length ? acctS : @"?"]);
+            // ★ v76 核心：堵死泄漏的同时必须给克隆发一张自己的身份证 ★
+            // 否则美团读到 nil → 对外上报空 UUID → 比原来更醒目。
+            if (mtIsDeviceIdentityName(svcS) || mtIsDeviceIdentityName(acctS)) {
+                NSString *synth = mtSynthIdentityValue(svcS, acctS);
+                OSStatus s2 = mtSynthKeychainResult(query, result, synth);
+                if (s2 == 0) {
+                    diagAppend([NSString stringWithFormat:@"\n[%@] KC-IDENTITY-SYNTH svc=%@ acct=%@ len=%lu\n",
+                                [NSDate date], svcS, acctS, (unsigned long)synth.length]);
+                    return s2;   // errSecSuccess + 合成值
+                }
+            }
         } @catch (id e) {}
     }
 #endif
@@ -1460,7 +1589,11 @@ static NSString *mtFakeDeviceUUID(void) {
         char b[49];
         for (int i = 0; i < 48; i++) b[i] = H[arc4random_uniform(16)];
         b[48] = 0;
-        return [NSString stringWithFormat:@"000000000000011F%s", b];
+        // v76: 前缀不再复用原版的 011F —— 同前缀等于给服务端留了一个
+        // 「同批次/同机型码」聚类锚点。改为随机 4 位 hex，保持 16+48 同形。
+        unsigned p = arc4random_uniform(0xFFFE) + 1;
+        if (p == 0x011F) p = 0x011E;   // 明确避开原版值
+        return [NSString stringWithFormat:@"000000000000%04X%s", p, b];
     });
 }
 
