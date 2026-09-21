@@ -74,12 +74,15 @@
 
 // ============================================================
 // MT_CLONE — 美团多开构建开关（2026-09-21）
-//   1 = 美团多开（禁用百度专属 hook：WKWebView 百度 UA 注入等）
+//   1 = 美团多开（禁用百度专属 hook：WKWebView UA / NSMutableURLRequest UA 补段等）
 //   0 = 百度多开（D/E/T/P 系列）
-// 两系共用一份源码，出包前确认此值。dylib 产物下载后本地留档
-// （百度 = dylib_v72/，美团 = dylib_mt/），互不覆盖。
+// ★ 由 Makefile 决定：默认 0；美团构建目标 $(DYLIB_MT) 传 -DMT_CLONE=1。
+//   不要在这里硬编码——否则另一系重建时静默翻车。
+// dylib 产物下载后本地留档（百度 = dylib_v72/，美团 = dylib_mt/），互不覆盖。
 // ============================================================
-#define MT_CLONE 1
+#ifndef MT_CLONE
+#define MT_CLONE 0
+#endif
 
 #define NSLog(...)
 
@@ -221,7 +224,11 @@ static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
 static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
 
 #define HIDDEN_IMAGE_COUNT 1
-static const char *g_hiddenImageKeys[HIDDEN_IMAGE_COUNT] = { "BaiduBoxSys.dylib" };
+#if MT_CLONE
+static const char *g_hiddenImageKeys[HIDDEN_IMAGE_COUNT] = { "MtKit.dylib" };       // 美团克隆内嵌名
+#else
+static const char *g_hiddenImageKeys[HIDDEN_IMAGE_COUNT] = { "BaiduBoxSys.dylib" }; // 百度克隆内嵌名
+#endif
 
 static int isHiddenImageIndex(uint32_t idx) {
     if (!orig_dyld_get_image_name) return 0;
@@ -1281,6 +1288,7 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
     return s;
 }
 
+#if !MT_CLONE
 // ============================================================
 // ============================================================
 // UA 伪装 — v57N 必须替换（否则 UA 泄露真系统版本，与假机型矛盾）
@@ -1360,6 +1368,7 @@ static BOOL isUALike(NSString *s) {
            [s rangeOfString:@"baiduboxapp"].location != NSNotFound ||
            [s rangeOfString:@"baidu"].location != NSNotFound;
 }
+#endif // !MT_CLONE
 
 // Cookie/设备标识生成（保持与真实格式一致）
 //
@@ -2263,6 +2272,7 @@ static void initPrivacyHook(void) {
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
+#if !MT_CLONE
                 Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
                 if (svM) {
                     IMP origSV = method_getImplementation(svM);
@@ -2335,6 +2345,7 @@ static void initPrivacyHook(void) {
                     });
                     class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
                 }
+#endif // !MT_CLONE
 
                 // v57U: 请求出口消毒 —— URL 参数 / POST body 里的真实 cuid
                 // 原生 SDK 拼请求时 cuid=%@ 直接进 query/body（不走 cookie），
