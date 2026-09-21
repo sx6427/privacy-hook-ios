@@ -72,6 +72,15 @@
 #include <string.h>
 #include "fishhook.h"
 
+// ============================================================
+// MT_CLONE — 美团多开构建开关（2026-09-21）
+//   1 = 美团多开（禁用百度专属 hook：WKWebView 百度 UA 注入等）
+//   0 = 百度多开（D/E/T/P 系列）
+// 两系共用一份源码，出包前确认此值。dylib 产物下载后本地留档
+// （百度 = dylib_v72/，美团 = dylib_mt/），互不覆盖。
+// ============================================================
+#define MT_CLONE 1
+
 #define NSLog(...)
 
 static __thread BOOL g_inCookieHook = NO;
@@ -2373,6 +2382,7 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
+#if !MT_CLONE
         // ---- 6b. WKWebView hooks — UA 注入（v57Q 新增，农场关键） ----
         //
         // ★★ 这是「活动太火爆，请稍后再试」的真正根因 ★★
@@ -2492,6 +2502,8 @@ static void initPrivacyHook(void) {
                 // 强制为完整 App UA，该方法即使被调用也不会生效，无需额外 hook。
             }
         } @catch (id e) {}
+#endif // !MT_CLONE
+        // （MT_CLONE=1 时跳过 6b：百度 UA 注入对美团是风控现行，美团 H5 用系统默认 UA）
 
         // ---- 7. fishhook — hook 所有非系统镜像 + dyld 回调 ----
         // v57L rebind 清单：sysctlbyname + MGCopyAnswer + IOKit
