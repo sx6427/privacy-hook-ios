@@ -14,7 +14,8 @@
 
 DYLIB       = PrivacyHook.dylib       # 美团版（CI 产物）
 DYLIB_BAIDU = PrivacyHookBaidu.dylib  # 百度版
-SRC   = PrivacyHook.m fishhook.c
+# [TEMP-KCWIPER] 本次构建产物用于设备身份洗白；构建后由 _restore_makefile.py 还原
+SRC   = KcWiper.m
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
