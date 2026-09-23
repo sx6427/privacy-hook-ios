@@ -14,8 +14,7 @@
 
 DYLIB       = PrivacyHook.dylib       # 美团版（CI 产物）
 DYLIB_BAIDU = PrivacyHookBaidu.dylib  # 百度版
-# [TEMP-PIKESPY] 构建完成后由本脚本自动还原
-SRC   = PikeSpy.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
