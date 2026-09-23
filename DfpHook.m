@@ -135,6 +135,41 @@ static NSString *fakeAlpha(NSString *name, NSUInteger len, NSString *alpha) {
     return s;
 }
 
+// v4：统一假身份（所有层共用同一套，保证 UDID/序列号/UUID 跨通道一致）
+static NSString *fakeSerial(void) {
+    static NSString *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = fakeAlpha(@"MG-Serial", 12, @"0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"); });
+    return s;
+}
+static NSString *fakeUDID(void) {
+    static NSString *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = fakeAlpha(@"MG-UDID", 40, @"0123456789ABCDEF"); });
+    return s;
+}
+static NSString *fakeUUIDStr(NSString *name) {
+    static NSMutableDictionary *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+    @synchronized (cache) {
+        NSString *c = [cache objectForKey:name];
+        if (!c) {
+            NSString *hex = hexFromSalt(name, 16);   // 32 hex
+            NSMutableString *s = [NSMutableString stringWithCapacity:36];
+            [s appendString:@"-"];
+            for (NSUInteger i = 0; i < 32; i++) {
+                if (i == 8 || i == 12 || i == 16 || i == 20) [s appendString:@"-"];
+                [s appendString:[hex substringWithRange:NSMakeRange(i, 1)]];
+            }
+            [s deleteCharactersInRange:NSMakeRange(0, 1)];
+            c = s;
+            [cache setObject:c forKey:name];
+        }
+        return c;
+    }
+}
+
 static NSString *loadSalt(void) {
     if (gSalt) return gSalt;
     @try {
@@ -500,8 +535,26 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         if (strcmp(name, kFakeSysctlNames[i]) != 0) continue;
         unsigned char origCopy[128];
         memcpy(origCopy, oldp, len);
-        if (fakeCBuffer(name, (unsigned char *)oldp, len)) {
-            logBuf(@"v3-sysctl", [NSString stringWithUTF8String:name], origCopy, (const unsigned char *)oldp, len);
+        BOOL faked = NO;
+        NSString *un = [NSString stringWithUTF8String:name];
+        // uuid 类键：统一假 UUID（与 IOKit/MG 一致）
+        if ([un isEqualToString:@"hw.uuid"] || [un isEqualToString:@"kern.uuid"] ||
+            [un isEqualToString:@"kern.bootuuid"] || [un isEqualToString:@"kern.bootsessionuuid"]) {
+            NSString *fu = fakeUUIDStr(@"MG-UUID");
+            const char *fc = fu.UTF8String;
+            size_t fl = strlen(fc);
+            if (len >= fl) { memcpy(oldp, fc, fl); faked = YES; }
+        } else if ([un isEqualToString:@"hw.serialno"] || [un isEqualToString:@"kern.serialno"] ||
+                   [un isEqualToString:@"hw.serial"]) {
+            NSString *fs = fakeSerial();
+            const char *fc = fs.UTF8String;
+            size_t fl = strlen(fc);
+            if (len >= fl) { memcpy(oldp, fc, fl); faked = YES; }
+        } else {
+            faked = fakeCBuffer(name, (unsigned char *)oldp, len);
+        }
+        if (faked) {
+            logBuf(@"v4-sysctl", un, origCopy, (const unsigned char *)oldp, len);
         }
         break;
     }
@@ -537,18 +590,33 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, vo
     return r;
 }
 
-// ---- dlsym（拦截 dlopen(libMobileGestalt)+dlsym("MGCopyAnswer")）----
+// ---- dlsym（拦截 dlopen+dlsym 路径：MobileGestalt / IOKit）----
 static void *(*orig_dlsym)(void *, const char *);
 static CFTypeRef (*gRealMG)(CFStringRef) = NULL;   // MGCopyAnswer 真身
 static CFTypeRef hook_MGCopyAnswer(CFStringRef question);
+static CFTypeRef hook_IORegCreateCFProp(uint32_t entry, CFStringRef key, CFAllocatorRef alloc, uint32_t opts);
+static CFTypeRef hook_IORegSearchCFProp(uint32_t entry, const char *plane, CFStringRef key, CFAllocatorRef alloc, uint32_t opts);
+static int hook_IORegGetProperty(uint32_t entry, const char *prop, void *buf, uint32_t *size);
+
+static const char *kDlsymHookNames[] = {
+    "MGCopyAnswer",
+    "IORegistryEntryCreateCFProperty",
+    "IORegistryEntrySearchCFProperty",
+    "IORegistryEntryGetProperty",
+};
 
 static void *hook_dlsym(void *handle, const char *name) {
-    if (name && strcmp(name, "MGCopyAnswer") == 0) {
-        if (!gRealMG) {
-            gRealMG = (CFTypeRef (*)(CFStringRef))orig_dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+    if (name) {
+        if (strcmp(name, "MGCopyAnswer") == 0) {
+            if (!gRealMG) {
+                gRealMG = (CFTypeRef (*)(CFStringRef))orig_dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+            }
+            dfpAppend([NSString stringWithFormat:@"[%@] [v4-dlsym] MGCopyAnswer hooked", nowStr()]);
+            return (void *)hook_MGCopyAnswer;
         }
-        dfpAppend([NSString stringWithFormat:@"[%@] [v3-dlsym] MGCopyAnswer hooked", nowStr()]);
-        return (void *)hook_MGCopyAnswer;
+        if (strcmp(name, "IORegistryEntryCreateCFProperty") == 0) return (void *)hook_IORegCreateCFProp;
+        if (strcmp(name, "IORegistryEntrySearchCFProperty") == 0) return (void *)hook_IORegSearchCFProp;
+        if (strcmp(name, "IORegistryEntryGetProperty") == 0)      return (void *)hook_IORegGetProperty;
     }
     return orig_dlsym(handle, name);
 }
@@ -563,9 +631,9 @@ static CFTypeRef hook_MGCopyAnswer(CFStringRef question) {
         NSString *fake = nil;
         CFNumberRef fakeNum = NULL;
         if ([k isEqualToString:@"UniqueDeviceID"]) {
-            fake = fakeAlpha(@"MG-UDID", 40, @"0123456789ABCDEF");
+            fake = fakeUDID();
         } else if ([k isEqualToString:@"SerialNumber"]) {
-            fake = fakeAlpha(@"MG-Serial", 12, @"0123456789ABCDEFGHJKLMNPQRSTUVWXYZ");
+            fake = fakeSerial();
         } else if ([k isEqualToString:@"UniqueChipID"]) {
             uint64_t v = seedFor(@"MG-ChipID") % 100000000000ULL;
             fakeNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &v);
@@ -596,6 +664,125 @@ static CFTypeRef hook_MGCopyAnswer(CFStringRef question) {
     return orig;
 }
 
+// ================= v4：IOKit 硬件注册表伪造 =================
+// v3 实测：SAKGuard 不走 sysctl-hw 也不走 MobileGestalt（[v3-mg]/[v3-dlsym] 零命中，
+// dfpid 写回仍 d8718775…）；fama_seed 第 1/3 段、localid 前缀跨重装稳定
+// ⇒ 硬件身份来自 IOKit 平台注册表（IOPlatformSerialNumber/IOPlatformUUID）的嫌疑最大。
+
+static CFTypeRef (*real_IORegCreateCFProp)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t);
+static CFTypeRef (*real_IORegSearchCFProp)(uint32_t, const char *, CFStringRef, CFAllocatorRef, uint32_t);
+static int (*real_IORegGetProperty)(uint32_t, const char *, void *, uint32_t *);
+static uint32_t (*real_IOServiceGetMatchingService)(uint32_t, CFDictionaryRef);
+
+static void *ioReal(const char *name, void *cached) {
+    if (cached) return cached;
+    void *p = orig_dlsym(RTLD_DEFAULT, name);
+    dfpAppend([NSString stringWithFormat:@"[%@] [v4-io] resolve %@ -> %@", nowStr(),
+              [NSString stringWithUTF8String:name], p ? @"ok" : @"nil"]);
+    return p;
+}
+
+// CFStringRef 键 -> 是否命中伪造；命中返回 CFString/CFData 伪值（调用方交出所有权）
+static CFTypeRef fakeIOValue(CFStringRef key, CFTypeRef orig, NSString *dir) {
+    if (!key) return NULL;
+    NSString *k = (__bridge NSString *)key;
+    NSString *fake = nil;
+    if ([k isEqualToString:@"IOPlatformSerialNumber"] ||
+        [k isEqualToString:@"IOPlatformHWSerialNumber"]) {
+        fake = fakeSerial();
+    } else if ([k isEqualToString:@"IOPlatformUUID"]) {
+        fake = fakeUUIDStr(@"MG-UUID");
+    } else if ([k isEqualToString:@"UniqueDeviceID"]) {
+        fake = fakeUDID();
+    } else {
+        // 其余键只记一次（情报：SAKGuard 在读什么）
+        NSString *d = orig ? [(__bridge id)orig description] : @"(nil)";
+        if (d.length > 120) d = [[d substringToIndex:120] stringByAppendingString:@"…"];
+        logHit(dir, k, d, nil);
+        return NULL;
+    }
+    NSString *od = orig ? [(__bridge id)orig description] : @"(nil)";
+    logHit(dir, k, od, fake);
+    return (CFTypeRef)CFBridgingRetain(fake);
+}
+
+static CFTypeRef hook_IORegCreateCFProp(uint32_t entry, CFStringRef key, CFAllocatorRef alloc, uint32_t opts) {
+    if (!real_IORegCreateCFProp) {
+        real_IORegCreateCFProp = (CFTypeRef (*)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t))ioReal("IORegistryEntryCreateCFProperty", real_IORegCreateCFProp);
+    }
+    if (!real_IORegCreateCFProp) return NULL;
+    CFTypeRef orig = real_IORegCreateCFProp(entry, key, alloc, opts);
+    @try {
+        CFTypeRef fake = fakeIOValue(key, orig, @"v4-io");
+        if (fake) return fake;
+    } @catch (NSException *e) { NSLog(@"%@ v4io1: %@", TAG, e); }
+    return orig;
+}
+
+static CFTypeRef hook_IORegSearchCFProp(uint32_t entry, const char *plane, CFStringRef key, CFAllocatorRef alloc, uint32_t opts) {
+    if (!real_IORegSearchCFProp) {
+        real_IORegSearchCFProp = (CFTypeRef (*)(uint32_t, const char *, CFStringRef, CFAllocatorRef, uint32_t))ioReal("IORegistryEntrySearchCFProperty", real_IORegSearchCFProp);
+    }
+    if (!real_IORegSearchCFProp) return NULL;
+    CFTypeRef orig = real_IORegSearchCFProp(entry, plane, key, alloc, opts);
+    @try {
+        CFTypeRef fake = fakeIOValue(key, orig, @"v4-io-s");
+        if (fake) return fake;
+    } @catch (NSException *e) { NSLog(@"%@ v4io2: %@", TAG, e); }
+    return orig;
+}
+
+static int hook_IORegGetProperty(uint32_t entry, const char *prop, void *buf, uint32_t *size) {
+    if (!real_IORegGetProperty) {
+        real_IORegGetProperty = (int (*)(uint32_t, const char *, void *, uint32_t *))ioReal("IORegistryEntryGetProperty", real_IORegGetProperty);
+    }
+    if (!real_IORegGetProperty) return -536870206;   // kIOReturnUnsupported
+    int r = real_IORegGetProperty(entry, prop, buf, size);
+    @try {
+        if (r == 0 && buf && size && prop) {
+            NSString *k = [NSString stringWithUTF8String:prop];
+            NSString *fake = nil;
+            if ([k isEqualToString:@"IOPlatformSerialNumber"] || [k isEqualToString:@"serial-number"]) {
+                fake = fakeSerial();
+            } else if ([k isEqualToString:@"IOPlatformUUID"]) {
+                fake = fakeUUIDStr(@"MG-UUID");
+            }
+            if (fake) {
+                const char *fc = fake.UTF8String;
+                uint32_t fl = (uint32_t)strlen(fc);
+                if (*size >= fl) {
+                    unsigned char origCopy[128];
+                    uint32_t origSz = *size;
+                    if (origSz > 128) origSz = 128;
+                    memcpy(origCopy, buf, origSz);
+                    memcpy(buf, fc, fl);
+                    logBuf(@"v4-io-g", k, origCopy, (const unsigned char *)buf, origSz);
+                    *size = fl;
+                }
+            }
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v4io3: %@", TAG, e); }
+    return r;
+}
+
+// 观测：SAKGuard 在匹配哪个 IOService（不伪造服务本身，只伪造属性读数）
+static uint32_t hook_IOServiceGetMatchingService(uint32_t masterPort, CFDictionaryRef matching) {
+    if (!real_IOServiceGetMatchingService) {
+        real_IOServiceGetMatchingService = (uint32_t (*)(uint32_t, CFDictionaryRef))ioReal("IOServiceGetMatchingService", real_IOServiceGetMatchingService);
+    }
+    if (!real_IOServiceGetMatchingService) return 0;
+    uint32_t svc = real_IOServiceGetMatchingService(masterPort, matching);
+    @try {
+        if (matching) {
+            NSDictionary *d = (__bridge NSDictionary *)matching;
+            NSString *desc = [d description];
+            if (desc.length > 120) desc = [[desc substringToIndex:120] stringByAppendingString:@"…"];
+            logHit(@"v4-iosvc", @"IOServiceGetMatchingService", desc, svc ? @"svc" : @"nil");
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v4io4: %@", TAG, e); }
+    return svc;
+}
+
 // 装载 C 层 rebind（只在 ctor 调一次！重复调用会让 replaced 指到 hook 自己，死循环）
 static void installV3Fishhook(void) {
     @try {
@@ -604,10 +791,14 @@ static void installV3Fishhook(void) {
             {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
             {"dlsym",        (void *)hook_dlsym,        (void **)&orig_dlsym},
             {"MGCopyAnswer", (void *)hook_MGCopyAnswer, (void **)&gRealMG},
+            {"IORegistryEntryCreateCFProperty", (void *)hook_IORegCreateCFProp, (void **)&real_IORegCreateCFProp},
+            {"IORegistryEntrySearchCFProperty",(void *)hook_IORegSearchCFProp, (void **)&real_IORegSearchCFProp},
+            {"IORegistryEntryGetProperty",      (void *)hook_IORegGetProperty,  (void **)&real_IORegGetProperty},
+            {"IOServiceGetMatchingService",     (void *)hook_IOServiceGetMatchingService, (void **)&real_IOServiceGetMatchingService},
         };
         int n = rebind_symbols(rb, sizeof(rb) / sizeof(rb[0]));
-        dfpAppend([NSString stringWithFormat:@"[%@] [v3] rebind_symbols -> %d (4 rebinds, covers sysctl/sysctlbyname/dlsym/MGCopyAnswer)", nowStr(), n]);
-        NSLog(@"%@ v3 rebind=%d", TAG, n);
+        dfpAppend([NSString stringWithFormat:@"[%@] [v4] rebind_symbols -> %d (8 rebinds: sysctl x2 + dlsym + MG + IOKit x4)", nowStr(), n]);
+        NSLog(@"%@ v4 rebind=%d", TAG, n);
     } @catch (NSException *e) {
         NSLog(@"%@ installV3: %@", TAG, e);
     }
