@@ -77,8 +77,10 @@ static void logHit(NSString *dir, NSString *key, NSString *orig, NSString *fake)
     @try {
         NSString *op = [NSString stringWithFormat:@"%@|%@|%@", dir, key, orig ?: @"(nil)"];
         if (orig.length > 20) op = [NSString stringWithFormat:@"%@|%@|%@…", dir, key, [orig substringToIndex:20]];
-        if ([gLoggedOnce objectForKey:op]) return;
-        [gLoggedOnce setObject:@YES forKey:op];
+        @synchronized (gLoggedOnce) {
+            if ([gLoggedOnce objectForKey:op]) return;
+            [gLoggedOnce setObject:@YES forKey:op];
+        }
         NSString *line = [NSString stringWithFormat:@"[%@] %@ %@\n    orig=%@\n    fake=%@",
                           nowStr(), dir, key, orig ?: @"(nil)", fake ?: @"-"];
         NSLog(@"%@ %@", TAG, line);
