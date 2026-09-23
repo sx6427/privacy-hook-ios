@@ -92,6 +92,19 @@ static void logHit(NSString *dir, NSString *key, NSString *orig, NSString *fake)
 
 // ---------- 盐值（每次安装一份，删 App 即消失） ----------
 static NSString *gSalt = nil;
+static NSString *gFakeDfp = nil;   // 52 hex（与实测 dfpid 同长）
+static NSString *gFakeXid = nil;   // 56 hex（与实测 localid 同长）
+
+static NSString *hexFromSalt(NSString *name, int bytes) {
+    uint64_t h = seedFor(name);
+    NSMutableString *s = [NSMutableString stringWithCapacity:bytes * 2];
+    for (int i = 0; i < bytes; i++) {
+        h = h * 0x100000001b3ULL + (uint64_t)(i + 1) + 0x97ULL;
+        h ^= h >> 23;
+        [s appendFormat:@"%02x", (unsigned char)(h & 0xff)];
+    }
+    return s;
+}
 
 static NSString *loadSalt(void) {
     if (gSalt) return gSalt;
@@ -119,6 +132,8 @@ static NSString *loadSalt(void) {
         NSLog(@"%@ salt fail: %@", TAG, e);
     }
     dfpAppend([NSString stringWithFormat:@"[%@] [boot] salt=%@ pid=%d", nowStr(), gSalt, getpid()]);
+    gFakeDfp = hexFromSalt(@"dfp", 26);   // 52 chars
+    gFakeXid = hexFromSalt(@"xid", 28);   // 56 chars
     return gSalt;
 }
 
@@ -249,6 +264,131 @@ static NSUUID *hook_idfv(id self, SEL _cmd) {
     return orig;
 }
 
+// ================= v2：SAKGuard 指纹生成/持有点 hook =================
+// v1 教训：dfpid 由 SAKGuard 每次启动从信号现算并回写（[write] d87187750b…），
+// 只拦存储层读取没用 —— 服务端收到的是内存里的真指纹。
+// v2 直接 hook 生成/持有类（类清单来自 v1 的 class-dump）：
+//   SAKGuardDeviceFingerprint: getDeviceFingerprintString / static_dfpID / fingerprintStr /
+//                              static_dfpXID / generateLocalXID / dpID
+//   SAKFingerprintGenerator:   dfp / dpID / setDfp:
+//   SAKWindFingerprintGenerator: dpID
+//   观测（只记不改）：MSIRiskControlFingerprintContext getRiskControlFingerprint:（风控指纹载荷）
+//                     SAKGuardCommon encrypt:/decrypt:（SAKGuard 私有存储，明文情报）
+
+static NSMutableDictionary *gOrigV2 = nil;   // "类名+sel" -> NSValue(IMP)
+
+static NSString *v2Key(id self, SEL _cmd) {
+    return [NSStringFromClass(object_getClass(self)) stringByAppendingString:NSStringFromSelector(_cmd)];
+}
+
+// 通用 getter：NSString 原值 -> 同长度同字符集伪值；nil -> 固定伪 dfp/xid
+static id hook_v2_getter(id self, SEL _cmd) {
+    IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
+    if (!orig) return nil;
+    NSString *origv = ((id(*)(id, SEL))orig)(self, _cmd);
+    NSString *key = NSStringFromSelector(_cmd);
+    @try {
+        if ([origv isKindOfClass:[NSString class]] && origv.length > 0 && origv.length <= 4096) {
+            NSString *fake = fakeLike(origv, key);
+            if (fake) { logHit(@"v2-prop", key, origv, fake); return fake; }
+        }
+        if (!origv) {
+            NSString *fake = ([key rangeOfString:@"XID"].location != NSNotFound ||
+                              [key rangeOfString:@"xid"].location != NSNotFound ||
+                              [key isEqualToString:@"generateLocalXID"]) ? gFakeXid : gFakeDfp;
+            logHit(@"v2-nil", key, nil, fake);
+            return fake;
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v2g: %@", TAG, e); }
+    return origv;
+}
+
+// setDfp: —— 真值写入前替换成伪值（内存里从此只有伪指纹）
+static void hook_v2_setDfp(id self, SEL _cmd, id v) {
+    IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
+    if (!orig) return;
+    @try {
+        if ([v isKindOfClass:[NSString class]] && v.length > 0) {
+            NSString *fake = fakeLike(v, @"setDfp");
+            logHit(@"v2-set", NSStringFromSelector(_cmd), v, fake);
+            ((void(*)(id, SEL, id))orig)(self, _cmd, fake ?: v);
+            return;
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v2s: %@", TAG, e); }
+    ((void(*)(id, SEL, id))orig)(self, _cmd, v);
+}
+
+// getRiskControlFingerprint: —— 只记（风控指纹载荷，v3 情报）
+static id hook_v2_risk(id self, SEL _cmd, id arg) {
+    IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
+    if (!orig) return nil;
+    id out = ((id(*)(id, SEL, id))orig)(self, _cmd, arg);
+    @try {
+        NSString *s = [out description];
+        if (s.length > 1200) s = [[s substringToIndex:1200] stringByAppendingString:@"…"];
+        logHit(@"v2-risk", NSStringFromSelector(_cmd), s, nil);
+    } @catch (NSException *e) { NSLog(@"%@ v2r: %@", TAG, e); }
+    return out;
+}
+
+// encrypt:/decrypt: —— 只记（SAKGuard 私有存储明文，v3 情报）
+static id hook_v2_codec(id self, SEL _cmd, id arg) {
+    IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
+    if (!orig) return nil;
+    id out = ((id(*)(id, SEL, id))orig)(self, _cmd, arg);
+    @try {
+        NSString *s = [out isKindOfClass:[NSString class]] ? (NSString *)out : [out description];
+        if (s.length > 600) s = [[s substringToIndex:600] stringByAppendingString:@"…"];
+        NSString *a = [arg isKindOfClass:[NSString class]] ? (NSString *)arg : [arg description];
+        if (a.length > 200) a = [[a substringToIndex:200] stringByAppendingString:@"…"];
+        logHit([NSString stringWithFormat:@"v2-%@", NSStringFromSelector(_cmd)],
+               [NSString stringWithFormat:@"%@(%@)", NSStringFromClass(object_getClass(self)), a ?: @"-"], s, nil);
+    } @catch (NSException *e) { NSLog(@"%@ v2c: %@", TAG, e); }
+    return out;
+}
+
+// 装 v2 hook（类 + 方法列表；找不到类/方法跳过并记日志）
+static void installV2(void) {
+    @try {
+        @synchronized (gOrigV2) {
+            struct { const char *cls; const char *sel; IMP imp; } plan[] = {
+                {"SAKGuardDeviceFingerprint", "getDeviceFingerprintString", (IMP)hook_v2_getter},
+                {"SAKGuardDeviceFingerprint", "static_dfpID",               (IMP)hook_v2_getter},
+                {"SAKGuardDeviceFingerprint", "fingerprintStr",             (IMP)hook_v2_getter},
+                {"SAKGuardDeviceFingerprint", "static_dfpXID",              (IMP)hook_v2_getter},
+                {"SAKGuardDeviceFingerprint", "generateLocalXID",           (IMP)hook_v2_getter},
+                {"SAKGuardDeviceFingerprint", "dpID",                       (IMP)hook_v2_getter},
+                {"SAKFingerprintGenerator",   "dfp",                        (IMP)hook_v2_getter},
+                {"SAKFingerprintGenerator",   "dpID",                       (IMP)hook_v2_getter},
+                {"SAKFingerprintGenerator",   "setDfp:",                    (IMP)hook_v2_setDfp},
+                {"SAKWindFingerprintGenerator","dpID",                      (IMP)hook_v2_getter},
+                {"MSIRiskControlFingerprintContext","getRiskControlFingerprint:", (IMP)hook_v2_risk},
+                {"SAKGuardCommon",            "encrypt:",                   (IMP)hook_v2_codec},
+                {"SAKGuardCommon",            "decrypt:",                   (IMP)hook_v2_codec},
+            };
+            int ok = 0;
+            for (unsigned long i = 0; i < sizeof(plan)/sizeof(plan[0]); i++) {
+                Class cls = objc_getClass(plan[i].cls);
+                if (!cls) { dfpAppend([NSString stringWithFormat:@"[%@] [v2-miss-class] %@", nowStr(), [NSString stringWithUTF8String:plan[i].cls]]); continue; }
+                SEL sel = sel_registerName(plan[i].sel);
+                Method m = class_getInstanceMethod(cls, sel);
+                if (!m) { dfpAppend([NSString stringWithFormat:@"[%@] [v2-miss-sel] %@ %@", nowStr(), [NSString stringWithUTF8String:plan[i].cls], [NSString stringWithUTF8String:plan[i].sel]]); continue; }
+                NSString *k = [[NSString stringWithUTF8String:plan[i].cls] stringByAppendingString:[NSString stringWithUTF8String:plan[i].sel]];
+                IMP old = method_setImplementation(m, plan[i].imp);
+                [gOrigV2 setObject:[NSValue valueWithPointer:old] forKey:k];
+                ok++;
+                dfpAppend([NSString stringWithFormat:@"[%@] [v2-swizzle] %@ %@ (%@)", nowStr(),
+                          [NSString stringWithUTF8String:plan[i].cls],
+                          [NSString stringWithUTF8String:plan[i].sel], old ? @"ok" : @"old-nil"]);
+            }
+            dfpAppend([NSString stringWithFormat:@"[%@] [v2] installed %d hooks", nowStr(), ok]);
+            NSLog(@"%@ v2 installed %d", TAG, ok);
+        }
+    } @catch (NSException *e) {
+        NSLog(@"%@ installV2: %@", TAG, e);
+    }
+}
+
 // ---------- swizzle 工具 ----------
 static BOOL swizzleOne(Class cls, NSString *selName, IMP newImp, IMP *origOut) {
     if (!cls) return NO;
@@ -293,13 +433,14 @@ static void dumpFpClasses(void) {
     }
 }
 
-// 延迟补装：ASIdentifierManager 若首装时类未加载，这里再试一次
+// 延迟补装：ASIdentifierManager 若首装时类未加载，这里再试一次；并安装 v2 类 hook
 static void lateInstall(void) {
     @try {
         Class as = objc_getClass("ASIdentifierManager");
         if (as && !orig_idfa) {
             swizzleOne(as, @"advertisingIdentifier", (IMP)hook_idfa, (IMP *)&orig_idfa);
         }
+        installV2();          // ← v2：SAKGuard 指纹生成/持有点（App 类此时已注册）
         dumpFpClasses();
         dfpAppend([NSString stringWithFormat:@"[%@] [late] done", nowStr()]);
     } @catch (NSException *e) {
@@ -311,6 +452,7 @@ static void lateInstall(void) {
 __attribute__((constructor)) static void dfphook_ctor(void) {
     @try {
         gLoggedOnce = [NSMutableDictionary new];
+        gOrigV2 = [NSMutableDictionary new];
         loadSalt();
 
         Class nud = objc_getClass("NSUserDefaults");
