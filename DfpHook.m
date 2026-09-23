@@ -95,6 +95,8 @@ static NSString *gSalt = nil;
 static NSString *gFakeDfp = nil;   // 52 hex（与实测 dfpid 同长）
 static NSString *gFakeXid = nil;   // 56 hex（与实测 localid 同长）
 
+static uint64_t seedFor(NSString *key);   // 前置声明（hexFromSalt 在其定义之前使用）
+
 static NSString *hexFromSalt(NSString *name, int bytes) {
     uint64_t h = seedFor(name);
     NSMutableString *s = [NSMutableString stringWithCapacity:bytes * 2];
@@ -308,7 +310,7 @@ static void hook_v2_setDfp(id self, SEL _cmd, id v) {
     IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
     if (!orig) return;
     @try {
-        if ([v isKindOfClass:[NSString class]] && v.length > 0) {
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
             NSString *fake = fakeLike(v, @"setDfp");
             logHit(@"v2-set", NSStringFromSelector(_cmd), v, fake);
             ((void(*)(id, SEL, id))orig)(self, _cmd, fake ?: v);
