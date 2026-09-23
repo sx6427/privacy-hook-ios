@@ -15,7 +15,7 @@
 DYLIB       = PrivacyHook.dylib       # 美团版（CI 产物）
 DYLIB_BAIDU = PrivacyHookBaidu.dylib  # 百度版
 # [TEMP-DFPHOOK] 构建完成后由本脚本自动还原
-SRC   = DfpHook.m
+SRC   = DfpHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
