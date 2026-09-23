@@ -1,20 +1,29 @@
 //
-//  DfpHook.m — 换设备指纹（SAKGuard dfpid/seed + IDFA + IDFV）
+//  DfpHook.m v3 — C 层原始信号伪造（fishhook）+ 身份键白名单修正
 //
-//  背景：一号机身份已整体换新（keychain/AppGroup/uuid/IDFV/badge 全新），
-//        但登录 a0 仍报「网络异常或设备异常」。剩余设备级向量：
-//        ① sakguard_storage_dfpid（硬件指纹派生值，同机必然同值）
-//        ② IDFA（全设备级、跨重装串联，从未重置）
-//        本 dylib 把上述向量在 App 进程内替换成按「装机盐值」确定性派生的新值：
-//        同一次安装内稳定不变（避免值抖动触发风控），删 App 重装后盐值随容器消失、
-//        重新生成 → 得到全新指纹。
+//  v2 实测结论（2026-09-23 日志）：
+//   ① v2 的 12 个 ObjC hook 全部生效（static_dfpID 等 getter 均返回伪值），
+//     但 App 启动时把「重算后的 dfpid」原样写回 sakguard_storage_dfpid（d8718775…，
+//     与历史值完全一致）⇒ dfpid 由底层硬件信号确定性重算，拦 ObjC getter 无效。
+//   ② v2 的 fakeLike 把加密配置键（sakguard_func_instruction_key 等）也污染了，
+//     产出非法 base64，可能反而让 SAKGuard 判定异常。
 //
-//  形态约束（同 KcWiper/PikeSpy）：只做 ObjC method swizzle（改 runtime 方法表），
-//        不做 inline hook、不装信号处理器。不影响 App 其它功能：非命中键一律透传原实现。
+//  v3 方案：
+//   A. fishhook rebind C 层符号：sysctl / sysctlbyname / dlsym / MGCopyAnswer
+//      - sysctlbyname：伪造 hw.uuid / hw.serialno / hw.ufid / kern.serialno /
+//        kern.uuid / kern.bootuuid / kern.bootsessionuuid（同长度同字符集）
+//      - sysctl：观测全部 (mib0,mib1) 组合；伪造 CTL_HW/HW_UUID
+//      - dlsym：拦截 SAKGuard dlopen(libMobileGestalt)+dlsym("MGCopyAnswer") 路径
+//      - MGCopyAnswer：伪造 UniqueDeviceID(UDID 40hex)/SerialNumber(12位)/
+//        UniqueChipID(CFNumber)/IMEI(15位)/MEID(14hex)
+//      ⇒ dfpid 的原料（硬件身份）在源头被替换，重算自然得到全新 dfpid。
+//   B. NSUserDefaults 读取伪造收缩为「身份键白名单」（dfpid/localid/xid/fama），
+//      加密配置键一律透传，修掉 v2 的污染 bug。
+//   C. v2 的 ObjC getter/setter hook 降级为「只观测不伪造」——v3 起所有指纹值
+//      统一由伪原料推导，避免「伪上加伪」造成存储值与上报值不一致。
 //
-//  观测：Documents/dfphook.log 记录每次命中（原值前缀 -> 新值前缀）；
-//        另记录 SDK 对指纹键的「写入」——若启动后 dfpid 被回写重算，说明指纹是
-//        硬件信号重推导的，下轮需要换更底层的信号 hook。
+//  形态约束：ObjC method swizzle + fishhook GOT 重绑定（无 inline hook）。
+//  观测：Documents/dfphook.log。
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -22,6 +31,10 @@
 #import <dispatch/dispatch.h>
 #import <stdint.h>
 #import <stdio.h>
+#import <string.h>
+#import <dlfcn.h>
+#import <sys/sysctl.h>
+#include "fishhook.h"
 
 #define TAG @"DFPHOOK"
 
@@ -104,6 +117,20 @@ static NSString *hexFromSalt(NSString *name, int bytes) {
         h = h * 0x100000001b3ULL + (uint64_t)(i + 1) + 0x97ULL;
         h ^= h >> 23;
         [s appendFormat:@"%02x", (unsigned char)(h & 0xff)];
+    }
+    return s;
+}
+
+// v3：按 (盐,名字) 派生指定字符集、指定长度的伪串（MG 伪造用）
+static NSString *fakeAlpha(NSString *name, NSUInteger len, NSString *alpha) {
+    uint64_t h = seedFor(name);
+    const char *a = alpha.UTF8String;
+    NSUInteger al = strlen(a);
+    NSMutableString *s = [NSMutableString stringWithCapacity:len];
+    for (NSUInteger i = 0; i < len; i++) {
+        h = h * 0x100000001b3ULL + (uint64_t)(i + 1) + 0x97ULL;
+        h ^= h >> 23;
+        [s appendFormat:@"%c", a[h % (uint64_t)al]];
     }
     return s;
 }
@@ -202,7 +229,26 @@ static NSUUID *fakeUUID(NSString *name) {
     return [[NSUUID alloc] initWithUUIDString:s];
 }
 
-// ---------- 指纹键判定 ----------
+// ---------- 指纹键判定（v3 收缩白名单） ----------
+// 配置键：SAKGuard 从服务端下发的加密配置，值必须原样 —— v2 污染它们的教训
+static BOOL isConfigKey(NSString *k) {
+    return [k containsString:@"config"] || [k containsString:@"instruction"] ||
+           [k containsString:@"index"]  || [k containsString:@"collect"] ||
+           [k containsString:@"raptor"] || [k containsString:@"blacklist"] ||
+           [k containsString:@"method"] || [k containsString:@"enc_str"] ||
+           [k containsString:@"_bio"]   || [k containsString:@"stat_"] ||
+           [k containsString:@"record"] || [k containsString:@"reported"];
+}
+
+// 身份键：可以安全替换的设备身份派生值
+static BOOL isIdentityKey(NSString *k) {
+    if (![k isKindOfClass:[NSString class]] || k.length == 0 || k.length > 256) return NO;
+    if (isConfigKey(k)) return NO;
+    return [k containsString:@"dfpid"] || [k containsString:@"localid"] ||
+           [k containsString:@"fama"]  || [k hasSuffix:@"_xid"];
+}
+
+// 观测键（只记日志不改值）：所有 sakguard 系
 static BOOL isFpKey(NSString *k) {
     if (![k isKindOfClass:[NSString class]] || k.length == 0 || k.length > 256) return NO;
     return [k containsString:@"sakguard"] || [k hasPrefix:@"sakg_"] ||
@@ -215,7 +261,7 @@ static id (*orig_objForKey)(id, SEL, id);
 static id hook_objForKey(id self, SEL _cmd, id key) {
     id orig = orig_objForKey(self, _cmd, key);
     @try {
-        if (isFpKey(key) && [orig isKindOfClass:[NSString class]]) {
+        if (isIdentityKey(key) && [orig isKindOfClass:[NSString class]]) {
             NSString *fake = fakeLike(orig, key);
             if (fake) { logHit(@"read", key, orig, fake); return fake; }
             logHit(@"read-pass", key, orig, nil);   // 字符集不认识，透传
@@ -228,7 +274,7 @@ static id (*orig_objForKeyedSub)(id, SEL, id);
 static id hook_objForKeyedSub(id self, SEL _cmd, id key) {
     id orig = orig_objForKeyedSub(self, _cmd, key);
     @try {
-        if (isFpKey(key) && [orig isKindOfClass:[NSString class]]) {
+        if (isIdentityKey(key) && [orig isKindOfClass:[NSString class]]) {
             NSString *fake = fakeLike(orig, key);
             if (fake) { logHit(@"read-sub", key, orig, fake); return fake; }
         }
@@ -283,38 +329,30 @@ static NSString *v2Key(id self, SEL _cmd) {
     return [NSStringFromClass(object_getClass(self)) stringByAppendingString:NSStringFromSelector(_cmd)];
 }
 
-// 通用 getter：NSString 原值 -> 同长度同字符集伪值；nil -> 固定伪 dfp/xid
+// 通用 getter —— v3 起只观测不伪造：原料已在 C 层替换，
+// 这里再伪造会造成「存储值 ≠ 上报值」的伪上加伪
 static id hook_v2_getter(id self, SEL _cmd) {
     IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
     if (!orig) return nil;
-    NSString *origv = ((id(*)(id, SEL))orig)(self, _cmd);
-    NSString *key = NSStringFromSelector(_cmd);
+    id out = ((id(*)(id, SEL))orig)(self, _cmd);
     @try {
-        if ([origv isKindOfClass:[NSString class]] && origv.length > 0 && origv.length <= 4096) {
-            NSString *fake = fakeLike(origv, key);
-            if (fake) { logHit(@"v2-prop", key, origv, fake); return fake; }
-        }
-        if (!origv) {
-            NSString *fake = ([key rangeOfString:@"XID"].location != NSNotFound ||
-                              [key rangeOfString:@"xid"].location != NSNotFound ||
-                              [key isEqualToString:@"generateLocalXID"]) ? gFakeXid : gFakeDfp;
-            logHit(@"v2-nil", key, nil, fake);
-            return fake;
+        NSString *key = NSStringFromSelector(_cmd);
+        if ([out isKindOfClass:[NSString class]]) {
+            logHit(@"v3-obs", key, (NSString *)out, nil);
+        } else if (!out) {
+            logHit(@"v3-obs-nil", key, nil, nil);
         }
     } @catch (NSException *e) { NSLog(@"%@ v2g: %@", TAG, e); }
-    return origv;
+    return out;
 }
 
-// setDfp: —— 真值写入前替换成伪值（内存里从此只有伪指纹）
+// setDfp: —— v3 起只观测
 static void hook_v2_setDfp(id self, SEL _cmd, id v) {
     IMP orig = (IMP)[[gOrigV2 objectForKey:v2Key(self, _cmd)] pointerValue];
     if (!orig) return;
     @try {
-        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
-            NSString *fake = fakeLike(v, @"setDfp");
-            logHit(@"v2-set", NSStringFromSelector(_cmd), v, fake);
-            ((void(*)(id, SEL, id))orig)(self, _cmd, fake ?: v);
-            return;
+        if ([v isKindOfClass:[NSString class]]) {
+            logHit(@"v3-obs-set", NSStringFromSelector(_cmd), (NSString *)v, nil);
         }
     } @catch (NSException *e) { NSLog(@"%@ v2s: %@", TAG, e); }
     ((void(*)(id, SEL, id))orig)(self, _cmd, v);
@@ -391,6 +429,190 @@ static void installV2(void) {
     }
 }
 
+// ================= v3：C 层原始信号伪造 =================
+// 依据：v2 日志证实 dfpid 是从底层信号确定性重算的（写回值与历史完全一致）。
+// 在原料层（sysctl / MobileGestalt）替换硬件身份，重算自然产出全新 dfpid。
+
+// 同长度同字符集地把缓冲区改成伪值；认不出的字符集返回 NO（不动）
+static BOOL fakeCBuffer(const char *key, unsigned char *buf, size_t len) {
+    if (!buf || len == 0 || len > 128) return NO;
+    size_t n = len;
+    if (buf[n - 1] == 0) n--;          // 去掉结尾 NUL，不伪造它
+    if (n < 4) return NO;
+    BOOL hexL = YES, hexU = YES, digits = YES, alnum = YES, uuid = YES, uuidUpper = NO;
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)buf[i];
+        BOOL isDig = (c >= '0' && c <= '9');
+        BOOL isL   = (c >= 'a' && c <= 'f');
+        BOOL isU   = (c >= 'A' && c <= 'F');
+        BOOL isAln = isDig || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (!(isDig || isL)) hexL = NO;
+        if (!(isDig || isU)) hexU = NO;
+        if (!isDig) digits = NO;
+        if (!isAln && c != '-') { alnum = NO; uuid = NO; }
+        else if (c == '-') { if (n != 36 || (i != 8 && i != 13 && i != 18 && i != 23)) uuid = NO; }
+        else if (!(isDig || isL || isU)) uuid = NO;
+        if (isU) uuidUpper = YES;
+    }
+    NSString *alpha = nil;
+    BOOL isUuid = NO;
+    if (uuid && n == 36) { isUuid = YES; alpha = uuidUpper ? @"0123456789ABCDEF" : @"0123456789abcdef"; }
+    else if (digits)      alpha = @"0123456789";
+    else if (hexL)        alpha = @"0123456789abcdef";
+    else if (hexU)        alpha = @"0123456789ABCDEF";
+    else if (alnum)       alpha = @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    else return NO;
+    if (!gSalt) loadSalt();
+    uint64_t h = seedFor([NSString stringWithUTF8String:key]);
+    const char *a = alpha.UTF8String;
+    NSUInteger al = alpha.length;
+    for (size_t i = 0; i < n; i++) {
+        if (isUuid && (i == 8 || i == 13 || i == 18 || i == 23)) { buf[i] = '-'; continue; }
+        h = h * 0x100000001b3ULL + (uint64_t)(i + 1) + 0x97ULL;
+        h ^= h >> 23;
+        buf[i] = (unsigned char)a[h % (uint64_t)al];
+    }
+    return YES;
+}
+
+static void logBuf(NSString *dir, NSString *key, const unsigned char *o, const unsigned char *f, size_t len) {
+    NSMutableString *os = [NSMutableString string], *fs = [NSMutableString string];
+    for (size_t j = 0; j < len && j < 128; j++) {
+        [os appendFormat:@"%02x", o[j]];
+        [fs appendFormat:@"%02x", f[j]];
+    }
+    logHit(dir, key, os, fs);
+}
+
+// ---- sysctlbyname ----
+static const char *kFakeSysctlNames[] = {
+    "hw.uuid", "hw.serialno", "hw.ufid", "hw.serial",
+    "kern.serialno", "kern.uuid", "kern.bootuuid", "kern.bootsessionuuid",
+};
+
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
+static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int r = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    if (r != 0 || !oldp || !oldlenp || !name) return r;
+    size_t len = *oldlenp;
+    if (len == 0 || len > 128) return r;
+    for (unsigned long i = 0; i < sizeof(kFakeSysctlNames) / sizeof(kFakeSysctlNames[0]); i++) {
+        if (strcmp(name, kFakeSysctlNames[i]) != 0) continue;
+        unsigned char origCopy[128];
+        memcpy(origCopy, oldp, len);
+        if (fakeCBuffer(name, (unsigned char *)oldp, len)) {
+            logBuf(@"v3-sysctl", [NSString stringWithUTF8String:name], origCopy, (const unsigned char *)oldp, len);
+        }
+        break;
+    }
+    return r;
+}
+
+// ---- sysctl（MIB 形式）----
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int r = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    if (r != 0 || !name || namelen < 2) return r;
+    if (!gSalt) loadSalt();
+    // 观测：每组 (mib0,mib1) 记录一次（情报：SAKGuard 在查哪些信号）
+    @try {
+        NSString *mk = [NSString stringWithFormat:@"v3-mib|%d|%d", name[0], name[1]];
+        BOOL isNew = NO;
+        @synchronized (gLoggedOnce) {
+            if (![gLoggedOnce objectForKey:mk]) { [gLoggedOnce setObject:@YES forKey:mk]; isNew = YES; }
+        }
+        if (isNew) dfpAppend([NSString stringWithFormat:@"[%@] [v3-mib] %d / %d", nowStr(), name[0], name[1]]);
+        // 伪造 CTL_HW(6) / HW_UUID(202)
+        if (name[0] == 6 && name[1] == 202 && oldp && oldlenp) {
+            size_t len = *oldlenp;
+            if (len > 0 && len <= 128) {
+                unsigned char origCopy[128];
+                memcpy(origCopy, oldp, len);
+                if (fakeCBuffer("hw.uuid", (unsigned char *)oldp, len)) {
+                    logBuf(@"v3-sysctl-mib", @"CTL_HW/HW_UUID", origCopy, (const unsigned char *)oldp, len);
+                }
+            }
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v3sys: %@", TAG, e); }
+    return r;
+}
+
+// ---- dlsym（拦截 dlopen(libMobileGestalt)+dlsym("MGCopyAnswer")）----
+static void *(*orig_dlsym)(void *, const char *);
+static CFTypeRef (*gRealMG)(CFStringRef) = NULL;   // MGCopyAnswer 真身
+static CFTypeRef hook_MGCopyAnswer(CFStringRef question);
+
+static void *hook_dlsym(void *handle, const char *name) {
+    if (name && strcmp(name, "MGCopyAnswer") == 0) {
+        if (!gRealMG) {
+            gRealMG = (CFTypeRef (*)(CFStringRef))orig_dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+        }
+        dfpAppend([NSString stringWithFormat:@"[%@] [v3-dlsym] MGCopyAnswer hooked", nowStr()]);
+        return (void *)hook_MGCopyAnswer;
+    }
+    return orig_dlsym(handle, name);
+}
+
+static CFTypeRef hook_MGCopyAnswer(CFStringRef question) {
+    if (!gRealMG) gRealMG = (CFTypeRef (*)(CFStringRef))orig_dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+    if (!gRealMG) return NULL;
+    CFTypeRef orig = gRealMG(question);
+    @try {
+        if (!question) return orig;
+        NSString *k = (__bridge NSString *)question;
+        NSString *fake = nil;
+        CFNumberRef fakeNum = NULL;
+        if ([k isEqualToString:@"UniqueDeviceID"]) {
+            fake = fakeAlpha(@"MG-UDID", 40, @"0123456789ABCDEF");
+        } else if ([k isEqualToString:@"SerialNumber"]) {
+            fake = fakeAlpha(@"MG-Serial", 12, @"0123456789ABCDEFGHJKLMNPQRSTUVWXYZ");
+        } else if ([k isEqualToString:@"UniqueChipID"]) {
+            uint64_t v = seedFor(@"MG-ChipID") % 100000000000ULL;
+            fakeNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &v);
+        } else if ([k isEqualToString:@"InternationalMobileEquipmentIdentity"]) {
+            fake = fakeAlpha(@"MG-IMEI", 15, @"0123456789");
+        } else if ([k isEqualToString:@"MobileEquipmentIdentifier"]) {
+            fake = fakeAlpha(@"MG-MEID", 14, @"0123456789ABCDEF");
+        } else if ([k isEqualToString:@"DeviceSupportsSilentRingSwitch"] ||
+                   [k isEqualToString:@"mainScreenMagnificationEnabled"]) {
+            return orig;   // 布尔/无身份语义的键不记日志
+        }
+        if (fakeNum) {
+            logHit(@"v3-mg", k, [(__bridge NSNumber *)orig description], nil);
+            return fakeNum;
+        }
+        if (fake) {
+            NSString *origS = @"?";
+            if ([(__bridge id)orig isKindOfClass:[NSString class]]) origS = (__bridge NSString *)orig;
+            else if (orig) origS = [(__bridge id)orig description];
+            logHit(@"v3-mg", k, origS, fake);
+            return (CFTypeRef)CFBridgingRetain(fake);
+        }
+        // 其它键：只记录一次（情报）
+        NSString *d = orig ? [(__bridge id)orig description] : @"(nil)";
+        logHit(@"v3-mg-pass", k, d, nil);
+        return orig;
+    } @catch (NSException *e) { NSLog(@"%@ v3mg: %@", TAG, e); }
+    return orig;
+}
+
+// 装载 C 层 rebind（只在 ctor 调一次！重复调用会让 replaced 指到 hook 自己，死循环）
+static void installV3Fishhook(void) {
+    @try {
+        struct rebinding rb[] = {
+            {"sysctl",       (void *)hook_sysctl,       (void **)&orig_sysctl},
+            {"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname},
+            {"dlsym",        (void *)hook_dlsym,        (void **)&orig_dlsym},
+            {"MGCopyAnswer", (void *)hook_MGCopyAnswer, (void **)&gRealMG},
+        };
+        int n = rebind_symbols(rb, sizeof(rb) / sizeof(rb[0]));
+        dfpAppend([NSString stringWithFormat:@"[%@] [v3] rebind_symbols -> %d (4 rebinds, covers sysctl/sysctlbyname/dlsym/MGCopyAnswer)", nowStr(), n]);
+        NSLog(@"%@ v3 rebind=%d", TAG, n);
+    } @catch (NSException *e) {
+        NSLog(@"%@ installV3: %@", TAG, e);
+    }
+}
+
 // ---------- swizzle 工具 ----------
 static BOOL swizzleOne(Class cls, NSString *selName, IMP newImp, IMP *origOut) {
     if (!cls) return NO;
@@ -456,6 +678,9 @@ __attribute__((constructor)) static void dfphook_ctor(void) {
         gLoggedOnce = [NSMutableDictionary new];
         gOrigV2 = [NSMutableDictionary new];
         loadSalt();
+
+        // v3：C 层 rebind 必须最先装（SAKGuard 初始化前生效）
+        installV3Fishhook();
 
         Class nud = objc_getClass("NSUserDefaults");
         Class uid = objc_getClass("UIDevice");
