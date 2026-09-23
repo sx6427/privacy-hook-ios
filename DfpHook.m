@@ -818,59 +818,21 @@ static BOOL swizzleOne(Class cls, NSString *selName, IMP newImp, IMP *origOut) {
     return YES;
 }
 
-// ================= v5：网络层观测（只记不改，判断 dfpid 是否服务端下发） =================
-// v4 实测：sysctl/MG/IOKit 三条硬件通道 SAKGuard 全都没查（零命中），
-// dfpid=d8718775… 跨 4 个全新容器一字不差 ⇒ 原料只剩「服务端下发」或 DeviceCheck。
-// v5 hook 网络层，把启动期请求/响应记下来：
-//   - 全部 URL 各记一次（[v5-req]）
-//   - 关键词 URL（dfp/risk/sakguard/cips/fingerprint/…）记请求体和响应（[v5-resp]）
-//   - 任何响应里出现 "dfpid" 或已知 dfpid 值 → [v5-DFPID-HIT]（烟测，实锤来源）
-//   - 顺带观测 SAKGuard 上传的参数里有哪些设备信号（找还能伪造的）
-
-extern void *_Block_copy(const void *);
-
-static NSMutableDictionary *gBlockInvokes = nil;   // NSValue(块指针) -> NSValue(原 invoke)
-
-static void logV5Response(id resp, id data, id err);
-static void logV5Request(id request);
-
-// completion handler 统一签名：void(^)(NSData*, NSURLResponse*, NSError*)
-static void comp_trampoline(void *blk, void *dataP, void *respP, void *errP) {
-    void *origInvoke = NULL;
-    @synchronized (gBlockInvokes) {
-        NSValue *v = [gBlockInvokes objectForKey:[NSValue valueWithPointer:blk]];
-        origInvoke = v ? [v pointerValue] : NULL;
-    }
-    @try {
-        id data = (__bridge id)dataP, resp = (__bridge id)respP, err = (__bridge id)errP;
-        logV5Response(resp, data, err);
-    } @catch (NSException *e) { NSLog(@"%@ v5tr: %@", TAG, e); }
-    if (origInvoke) ((void (*)(void *, void *, void *, void *))origInvoke)(blk, dataP, respP, errP);
-}
-
-static id wrapComp(id block) {
-    if (!block) return nil;
-    @try {
-        void *heap = _Block_copy((__bridge void *)block);
-        if (!heap) return block;
-        struct BL { void *isa; int32_t flags; int32_t reserved; void *invoke; void *descriptor; };
-        struct BL *b = (struct BL *)heap;
-        @synchronized (gBlockInvokes) {
-            [gBlockInvokes setObject:[NSValue valueWithPointer:b->invoke]
-                              forKey:[NSValue valueWithPointer:heap]];
-        }
-        b->invoke = (void *)comp_trampoline;
-        return (__bridge id)heap;
-    } @catch (NSException *e) {
-        NSLog(@"%@ v5wrap: %@", TAG, e);
-        return block;
-    }
-}
+// ================= v5b：网络层观测（无块包装，零内存写入） =================
+// v5 闪退教训：_Block_copy 对全局块返回原指针，改其 invoke = 写只读内存 → 崩溃。
+// v5b 一律不动 completion 块；响应侧改走 NSJSONSerialization 烟测
+// （系统解析 JSON 必经，raw bytes 里扫 dfpid / 已知 dfpid 值）。
+// v5 实测（88KB 日志）：风控请求实为 tte.meituan.com/api/v1/tte/fips/verify、
+// appsec-mobile.meituan.com/api/{latte,ristretto}、api-unionid.meituan.com/mc/{config,register}、
+// uuid/v2/collect、p*.d.meituan.net POST —— 关键词表已按此扩充；POST 一律记 body。
 
 static BOOL isInterestingURL(NSString *u) {
     if (u.length == 0) return NO;
     NSArray *kw = @[@"dfp", @"risk", @"sakguard", @"cips", @"fingerprint",
-                    @"deviceid", @"guard", @"antispider", @"verifyid", @"shumei"];
+                    @"deviceid", @"guard", @"antispider", @"verifyid", @"shumei",
+                    @"tte.meituan", @"/fips", @"ristretto", @"/latte",
+                    @"unionid", @"uuid/v2", @"appsec", @"bdgcf",
+                    @"d.meituan.net", @"dreport", @"catdot", @"lx0.meituan"];
     for (NSString *k in kw)
         if ([u rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
     return NO;
@@ -891,17 +853,22 @@ static void logV5Request(id request) {
         if (![request isKindOfClass:[NSURLRequest class]]) return;
         NSString *url = [(NSURLRequest *)request URL].absoluteString;
         if (url.length == 0) return;
-        NSString *dk = [@"v5-req|" stringByAppendingString:url];
+        NSString *method = [(NSURLRequest *)request HTTPMethod] ?: @"GET";
+        BOOL interesting = isInterestingURL(url);
+        BOOL isPost = [method isEqualToString:@"POST"];
+        if (!interesting && !isPost) return;
+        // 去重键：URL + body 前 60 字符（同 URL 不同 body 的上报也要记）
+        NSData *body = [(NSURLRequest *)request HTTPBody];
+        NSString *bpre = dataPreview(body, 60) ?: @"";
+        NSString *dk = [NSString stringWithFormat:@"v5-req|%@|%@", url, bpre];
         BOOL isNew = NO;
         @synchronized (gLoggedOnce) {
             if (![gLoggedOnce objectForKey:dk]) { [gLoggedOnce setObject:@YES forKey:dk]; isNew = YES; }
         }
         if (!isNew) return;
-        dfpAppend([NSString stringWithFormat:@"[%@] [v5-req] %@ %@", nowStr(),
-                  [(NSURLRequest *)request HTTPMethod] ?: @"GET", url]);
-        if (isInterestingURL(url)) {
-            NSData *body = [(NSURLRequest *)request HTTPBody];
-            NSString *bp = dataPreview(body, 2500);
+        dfpAppend([NSString stringWithFormat:@"[%@] [v5-req] %@ %@", nowStr(), method, url]);
+        if (interesting || isPost) {
+            NSString *bp = dataPreview(body, 2200);
             if (!bp && [(NSURLRequest *)request HTTPBodyStream]) bp = @"<body is stream>";
             dfpAppend([NSString stringWithFormat:@"    body: %@", bp ?: @"(empty)"]);
         }
@@ -936,7 +903,7 @@ static void logV5Response(id resp, id data, id err) {
 static id (*orig_dtWRCH)(id, SEL, id, id);
 static id hook_dtWRCH(id self, SEL _cmd, id request, id handler) {
     @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5a: %@", TAG, e); }
-    return orig_dtWRCH(self, _cmd, request, handler ? wrapComp(handler) : handler);
+    return orig_dtWRCH(self, _cmd, request, handler);   // 块原样透传，不包装
 }
 
 static id (*orig_dtWR)(id, SEL, id);
@@ -948,7 +915,7 @@ static id hook_dtWR(id self, SEL _cmd, id request) {
 static id (*orig_utWRFDCH)(id, SEL, id, id, id);
 static id hook_utWRFDCH(id self, SEL _cmd, id request, id body, id handler) {
     @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5c: %@", TAG, e); }
-    return orig_utWRFDCH(self, _cmd, request, body, handler ? wrapComp(handler) : handler);
+    return orig_utWRFDCH(self, _cmd, request, body, handler);
 }
 
 static NSData *(*orig_ssr)(id, SEL, id, id *, id *);
@@ -964,21 +931,50 @@ static NSData *hook_ssr(id self, SEL _cmd, id request, id *respOut, id *errOut) 
 static void (*orig_sar)(id, SEL, id, id, id);
 static void hook_sar(id self, SEL _cmd, id request, id queue, id handler) {
     @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5e: %@", TAG, e); }
-    orig_sar(self, _cmd, request, queue, handler ? wrapComp(handler) : handler);
+    orig_sar(self, _cmd, request, queue, handler);   // 块原样透传
+}
+
+// NSJSONSerialization 烟测：所有 JSON 解析的必经之路；raw bytes 扫 dfpid 特征。
+// 这是响应侧唯一的观测点（配合 sendSynchronousRequest 的响应记录），全程零内存写入。
+static id (*orig_jsonObj)(id, SEL, id, NSUInteger, id *);
+static id hook_jsonObj(id self, SEL _cmd, id data, NSUInteger opt, id *err) {
+    id out = orig_jsonObj(self, _cmd, data, opt, err);
+    @try {
+        if ([data isKindOfClass:[NSData class]] && [(NSData *)data length] > 0) {
+            NSUInteger len = [(NSData *)data length];
+            if (len <= 4194304) {
+                const void *base = [(NSData *)data bytes];
+                if (base && (memmem(base, len, "dfpid", 5) || memmem(base, len, "d8718775", 8))) {
+                    NSString *pv = dataPreview(data, 4000);
+                    NSString *dk = [@"v5-json|" stringByAppendingString:
+                                    (pv.length > 100 ? [pv substringToIndex:100] : (pv ?: @""))];
+                    BOOL isNew = NO;
+                    @synchronized (gLoggedOnce) {
+                        if (![gLoggedOnce objectForKey:dk]) { [gLoggedOnce setObject:@YES forKey:dk]; isNew = YES; }
+                    }
+                    if (isNew)
+                        dfpAppend([NSString stringWithFormat:@"[%@] [v5-JSON-HIT] len=%lu\n    %@",
+                                  nowStr(), (unsigned long)len, pv ?: @"(binary)"]);
+                }
+            }
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v5j: %@", TAG, e); }
+    return out;
 }
 
 static void installV5(void) {
     @try {
-        gBlockInvokes = [NSMutableDictionary new];
         Class sess = objc_getClass("NSURLSession");
         Class conn = objc_getClass("NSURLConnection");
+        Class json = objc_getClass("NSJSONSerialization");
         int ok = 0;
         ok += swizzleOne(sess, @"dataTaskWithRequest:completionHandler:", (IMP)hook_dtWRCH, (IMP *)&orig_dtWRCH);
         ok += swizzleOne(sess, @"dataTaskWithRequest:",                   (IMP)hook_dtWR,   (IMP *)&orig_dtWR);
         ok += swizzleOne(sess, @"uploadTaskWithRequest:fromData:completionHandler:", (IMP)hook_utWRFDCH, (IMP *)&orig_utWRFDCH);
         ok += swizzleOne(conn, @"sendSynchronousRequest:returningResponse:error:",   (IMP)hook_ssr, (IMP *)&orig_ssr);
         ok += swizzleOne(conn, @"sendAsynchronousRequest:queue:completionHandler:",  (IMP)hook_sar, (IMP *)&orig_sar);
-        dfpAppend([NSString stringWithFormat:@"[%@] [v5] installed %d network hooks", nowStr(), ok]);
+        ok += swizzleOne(json, @"JSONObjectWithData:options:error:",      (IMP)hook_jsonObj,(IMP *)&orig_jsonObj);
+        dfpAppend([NSString stringWithFormat:@"[%@] [v5] installed %d network hooks (no block wrapping)", nowStr(), ok]);
         NSLog(@"%@ v5 installed %d", TAG, ok);
     } @catch (NSException *e) {
         NSLog(@"%@ installV5: %@", TAG, e);
