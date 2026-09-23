@@ -818,6 +818,173 @@ static BOOL swizzleOne(Class cls, NSString *selName, IMP newImp, IMP *origOut) {
     return YES;
 }
 
+// ================= v5：网络层观测（只记不改，判断 dfpid 是否服务端下发） =================
+// v4 实测：sysctl/MG/IOKit 三条硬件通道 SAKGuard 全都没查（零命中），
+// dfpid=d8718775… 跨 4 个全新容器一字不差 ⇒ 原料只剩「服务端下发」或 DeviceCheck。
+// v5 hook 网络层，把启动期请求/响应记下来：
+//   - 全部 URL 各记一次（[v5-req]）
+//   - 关键词 URL（dfp/risk/sakguard/cips/fingerprint/…）记请求体和响应（[v5-resp]）
+//   - 任何响应里出现 "dfpid" 或已知 dfpid 值 → [v5-DFPID-HIT]（烟测，实锤来源）
+//   - 顺带观测 SAKGuard 上传的参数里有哪些设备信号（找还能伪造的）
+
+extern void *_Block_copy(const void *);
+
+static NSMutableDictionary *gBlockInvokes = nil;   // NSValue(块指针) -> NSValue(原 invoke)
+
+static void logV5Response(id resp, id data, id err);
+static void logV5Request(id request);
+
+// completion handler 统一签名：void(^)(NSData*, NSURLResponse*, NSError*)
+static void comp_trampoline(void *blk, void *dataP, void *respP, void *errP) {
+    void *origInvoke = NULL;
+    @synchronized (gBlockInvokes) {
+        NSValue *v = [gBlockInvokes objectForKey:[NSValue valueWithPointer:blk]];
+        origInvoke = v ? [v pointerValue] : NULL;
+    }
+    @try {
+        id data = (__bridge id)dataP, resp = (__bridge id)respP, err = (__bridge id)errP;
+        logV5Response(resp, data, err);
+    } @catch (NSException *e) { NSLog(@"%@ v5tr: %@", TAG, e); }
+    if (origInvoke) ((void (*)(void *, void *, void *, void *))origInvoke)(blk, dataP, respP, errP);
+}
+
+static id wrapComp(id block) {
+    if (!block) return nil;
+    @try {
+        void *heap = _Block_copy((__bridge void *)block);
+        if (!heap) return block;
+        struct BL { void *isa; int32_t flags; int32_t reserved; void *invoke; void *descriptor; };
+        struct BL *b = (struct BL *)heap;
+        @synchronized (gBlockInvokes) {
+            [gBlockInvokes setObject:[NSValue valueWithPointer:b->invoke]
+                              forKey:[NSValue valueWithPointer:heap]];
+        }
+        b->invoke = (void *)comp_trampoline;
+        return (__bridge id)heap;
+    } @catch (NSException *e) {
+        NSLog(@"%@ v5wrap: %@", TAG, e);
+        return block;
+    }
+}
+
+static BOOL isInterestingURL(NSString *u) {
+    if (u.length == 0) return NO;
+    NSArray *kw = @[@"dfp", @"risk", @"sakguard", @"cips", @"fingerprint",
+                    @"deviceid", @"guard", @"antispider", @"verifyid", @"shumei"];
+    for (NSString *k in kw)
+        if ([u rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    return NO;
+}
+
+static NSString *dataPreview(NSData *d, NSUInteger max) {
+    if (!d || d.length == 0) return nil;
+    NSUInteger take = MIN(d.length, max);
+    NSString *s = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, take)]
+                                         encoding:NSUTF8StringEncoding];
+    if (!s) return [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)d.length];
+    if (d.length > max) s = [s stringByAppendingString:@"…"];
+    return s;
+}
+
+static void logV5Request(id request) {
+    @try {
+        if (![request isKindOfClass:[NSURLRequest class]]) return;
+        NSString *url = [(NSURLRequest *)request URL].absoluteString;
+        if (url.length == 0) return;
+        NSString *dk = [@"v5-req|" stringByAppendingString:url];
+        BOOL isNew = NO;
+        @synchronized (gLoggedOnce) {
+            if (![gLoggedOnce objectForKey:dk]) { [gLoggedOnce setObject:@YES forKey:dk]; isNew = YES; }
+        }
+        if (!isNew) return;
+        dfpAppend([NSString stringWithFormat:@"[%@] [v5-req] %@ %@", nowStr(),
+                  [(NSURLRequest *)request HTTPMethod] ?: @"GET", url]);
+        if (isInterestingURL(url)) {
+            NSData *body = [(NSURLRequest *)request HTTPBody];
+            NSString *bp = dataPreview(body, 2500);
+            if (!bp && [(NSURLRequest *)request HTTPBodyStream]) bp = @"<body is stream>";
+            dfpAppend([NSString stringWithFormat:@"    body: %@", bp ?: @"(empty)"]);
+        }
+    } @catch (NSException *e) { NSLog(@"%@ v5req: %@", TAG, e); }
+}
+
+static void logV5Response(id resp, id data, id err) {
+    @try {
+        NSString *url = nil;
+        long status = -1;
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+            url = [(NSHTTPURLResponse *)resp URL].absoluteString;
+            status = [(NSHTTPURLResponse *)resp statusCode];
+        } else if ([resp isKindOfClass:[NSURLResponse class]]) {
+            url = [(NSURLResponse *)resp URL].absoluteString;
+        }
+        if (url.length == 0) return;
+        NSString *body = [data isKindOfClass:[NSData class]] ? dataPreview(data, 65536) : nil;
+        // 烟测：任何响应里出现 dfpid 关键字或已知 dfpid 值都高亮
+        if (body && ([body containsString:@"dfpid"] || [body containsString:@"d8718775"])) {
+            NSString *full = [data isKindOfClass:[NSData class]] ? dataPreview(data, 4000) : nil;
+            dfpAppend([NSString stringWithFormat:@"[%@] [v5-DFPID-HIT] %ld %@\n    %@",
+                      nowStr(), status, url, full ?: @"(binary)"]);
+        }
+        if (!isInterestingURL(url)) return;
+        NSString *pv = [data isKindOfClass:[NSData class]] ? dataPreview(data, 3000) : nil;
+        dfpAppend([NSString stringWithFormat:@"[%@] [v5-resp] %ld %@\n    %@", nowStr(), status, url, pv ?: @"(empty)"]);
+        if (err) dfpAppend([NSString stringWithFormat:@"    err: %@", [err description]]);
+    } @catch (NSException *e) { NSLog(@"%@ v5resp: %@", TAG, e); }
+}
+
+static id (*orig_dtWRCH)(id, SEL, id, id);
+static id hook_dtWRCH(id self, SEL _cmd, id request, id handler) {
+    @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5a: %@", TAG, e); }
+    return orig_dtWRCH(self, _cmd, request, handler ? wrapComp(handler) : handler);
+}
+
+static id (*orig_dtWR)(id, SEL, id);
+static id hook_dtWR(id self, SEL _cmd, id request) {
+    @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5b: %@", TAG, e); }
+    return orig_dtWR(self, _cmd, request);
+}
+
+static id (*orig_utWRFDCH)(id, SEL, id, id, id);
+static id hook_utWRFDCH(id self, SEL _cmd, id request, id body, id handler) {
+    @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5c: %@", TAG, e); }
+    return orig_utWRFDCH(self, _cmd, request, body, handler ? wrapComp(handler) : handler);
+}
+
+static NSData *(*orig_ssr)(id, SEL, id, id *, id *);
+static NSData *hook_ssr(id self, SEL _cmd, id request, id *respOut, id *errOut) {
+    NSData *d = orig_ssr(self, _cmd, request, respOut, errOut);
+    @try {
+        logV5Request(request);
+        if (respOut && *respOut) logV5Response(*respOut, d, errOut ? *errOut : nil);
+    } @catch (NSException *e) { NSLog(@"%@ v5d: %@", TAG, e); }
+    return d;
+}
+
+static void (*orig_sar)(id, SEL, id, id, id);
+static void hook_sar(id self, SEL _cmd, id request, id queue, id handler) {
+    @try { logV5Request(request); } @catch (NSException *e) { NSLog(@"%@ v5e: %@", TAG, e); }
+    orig_sar(self, _cmd, request, queue, handler ? wrapComp(handler) : handler);
+}
+
+static void installV5(void) {
+    @try {
+        gBlockInvokes = [NSMutableDictionary new];
+        Class sess = objc_getClass("NSURLSession");
+        Class conn = objc_getClass("NSURLConnection");
+        int ok = 0;
+        ok += swizzleOne(sess, @"dataTaskWithRequest:completionHandler:", (IMP)hook_dtWRCH, (IMP *)&orig_dtWRCH);
+        ok += swizzleOne(sess, @"dataTaskWithRequest:",                   (IMP)hook_dtWR,   (IMP *)&orig_dtWR);
+        ok += swizzleOne(sess, @"uploadTaskWithRequest:fromData:completionHandler:", (IMP)hook_utWRFDCH, (IMP *)&orig_utWRFDCH);
+        ok += swizzleOne(conn, @"sendSynchronousRequest:returningResponse:error:",   (IMP)hook_ssr, (IMP *)&orig_ssr);
+        ok += swizzleOne(conn, @"sendAsynchronousRequest:queue:completionHandler:",  (IMP)hook_sar, (IMP *)&orig_sar);
+        dfpAppend([NSString stringWithFormat:@"[%@] [v5] installed %d network hooks", nowStr(), ok]);
+        NSLog(@"%@ v5 installed %d", TAG, ok);
+    } @catch (NSException *e) {
+        NSLog(@"%@ installV5: %@", TAG, e);
+    }
+}
+
 // ---------- 侦察：SAKGuard/指纹相关类清单（hook 落空时的情报） ----------
 static void dumpFpClasses(void) {
     @try {
@@ -886,6 +1053,8 @@ __attribute__((constructor)) static void dfphook_ctor(void) {
 
         dfpAppend([NSString stringWithFormat:@"[%@] [boot] DfpHook ready, hooks=%d/5", nowStr(), ok]);
         NSLog(@"%@ ready hooks=%d/5", TAG, ok);
+
+        installV5();          // v5：网络层观测（启动期请求即生效，必须早装）
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             [NSThread sleepForTimeInterval:6.0];
