@@ -57,7 +57,7 @@ static void writeResult(NSString *tag, NSString *api, NSString *text) {
     NSData *jd = [NSJSONSerialization dataWithJSONObject:rec options:NSJSONWritingWithoutEscapingSlashes error:nil];
     if (!jd) return;
     NSString *p = [docsDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"xy_res_%@.json", tag ?: @"last"]];
-    [jd writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [jd writeToFile:p options:NSDataWritingAtomic error:nil];
 }
 
 static void dumpCookiesTo(NSString *label) {
