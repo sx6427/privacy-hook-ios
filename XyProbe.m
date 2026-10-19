@@ -250,9 +250,9 @@ static NSMutableDictionary *gOrigImps = nil;
 static long gMtopCount = 0;
 static void (*orig_async_call_del)(id, SEL, id, id);
 static void (*orig_async_call_del_sf)(id, SEL, id, id, id);
-static void (*orig_sync_call)(id, SEL, id);
-static void (*orig_sync_call_v)(id, SEL, id, id);
-static void (*orig_sync_call_biz)(id, SEL, id, id, id);
+static id (*orig_sync_call)(id, SEL, id);
+static id (*orig_sync_call_v)(id, SEL, id, id);
+static id (*orig_sync_call_biz)(id, SEL, id, id, id);
 
 static void MLOG(NSString *fmt, ...) {
     va_list ap;
