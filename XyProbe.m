@@ -302,17 +302,17 @@ static void my_async2(id self, SEL _cmd, id a, id b, id c) {
     logMtopReq(a);
     orig_async_call_del_sf(self, _cmd, a, b, c);
 }
-static void my_sync_call(id self, SEL _cmd, id req) {
+static id my_sync_call(id self, SEL _cmd, id req) {
     logMtopReq(req);
-    orig_sync_call(self, _cmd, req);
+    return orig_sync_call(self, _cmd, req);
 }
-static void my_sync_call_v(id self, SEL _cmd, id a, id b) {
+static id my_sync_call_v(id self, SEL _cmd, id a, id b) {
     logMtopReq(a);
-    orig_sync_call_v(self, _cmd, a, b);
+    return orig_sync_call_v(self, _cmd, a, b);
 }
-static void my_sync_call_biz(id self, SEL _cmd, id a, id b, id c) {
+static id my_sync_call_biz(id self, SEL _cmd, id a, id b, id c) {
     logMtopReq(a);
-    orig_sync_call_biz(self, _cmd, a, b, c);
+    return orig_sync_call_biz(self, _cmd, a, b, c);
 }
 
 static void swizzleMtopService(void) {
