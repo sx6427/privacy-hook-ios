@@ -1,21 +1,27 @@
 //
-//  XyProbe.m — 闲鱼桥侦察 v3：枚举桥类方法 + 全量捕获 WindVane 回调
+//  XyProbe.m — 闲鱼指令执行器 v4（不越狱自动化核心）
 //
-//  v2 已验证：ObjC swizzle 在 TrollFools 注入下存活。
-//  v3 目标：
-//    1. 枚举 WVIdleFishApi / MtopWVPlugin 的全部实例方法（找真实 callMtop selector）
-//    2. 全量捕获 evaluateJavaScript 里的 window.__windvane__.onSuccess 回调
-//       （用户在鱼塘里点任务时，响应会带 API 结果流经这里）
-//    输出：Documents/xy_bridge.log（独立大文件）+ xy_probe.log（摘要）
+//  架构（= 高德 sg_drive 的原生版）：
+//    PC --WebDAV(Filza)--> Documents/xy_cmd.json   （指令）
+//    dylib 轮询指令 -> [MtopWVPlugin send:...] 原生桥（真机签名）-> 响应
+//    响应(evaluateJavaScript onSuccess) swizzle 捕获 -> Documents/xy_result.log
+//    PC 读结果。全程无需代理/越狱。
+//
+//  用户需打开一次鱼塘页面，让 WKWebView/桥处于活跃状态。
 //
 
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
-static NSMutableString *gLog = nil;   // 摘要 → xy_probe.log
-static NSMutableString *gBridge = nil; // 全量 → xy_bridge.log
+static NSMutableString *gLog = nil;     // 摘要 → xy_probe.log
+static NSMutableString *gBridge = nil;  // 全量桥流量 → xy_bridge.log
+static WKWebView *gWebView = nil;       // 活跃 webview（send 需要）
+static NSMutableDictionary *gPending;   // cbId -> tag
+static long long gLastCmdAt = 0;
+static long gCmdSeq = 0;
 
 static void W(NSString *fmt, ...) {
     va_list ap;
@@ -24,12 +30,7 @@ static void W(NSString *fmt, ...) {
     va_end(ap);
     if (!gLog) gLog = [NSMutableString new];
     [gLog appendFormat:@"%@\n", s];
-}
-
-static void flushLog(void) {
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    [gLog writeToFile:[dir stringByAppendingPathComponent:@"xy_probe.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [gBridge writeToFile:[dir stringByAppendingPathComponent:@"xy_bridge.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (gLog.length > 300000) gLog = [NSMutableString new];
 }
 
 static void B(NSString *fmt, ...) {
@@ -39,50 +40,84 @@ static void B(NSString *fmt, ...) {
     va_end(ap);
     if (!gBridge) gBridge = [NSMutableString new];
     [gBridge appendFormat:@"%@\n", s];
+    if (gBridge.length > 2000000) gBridge = [NSMutableString new];
 }
 
-static NSString *b64(NSData *d) { return [d base64EncodedStringWithOptions:0]; }
-
-// ---------- 桥类方法枚举 ----------
-static void enumClass(NSString *name) {
-    Class c = NSClassFromString(name);
-    W(@"=== CLASS %@ = %@", name, c ? @"YES" : @"no");
-    if (!c) return;
-    unsigned int cnt = 0;
-    Method *ms = class_copyMethodList(c, &cnt);
-    W(@"  instance methods: %u", cnt);
-    for (unsigned int i = 0; i < cnt; i++) {
-        SEL s = method_getName(ms[i]);
-        unsigned int argc = method_getNumberOfArguments(ms[i]);
-        W(@"  M -[%@ %@] argc=%d", name, NSStringFromSelector(s), (int)argc - 2);
-    }
-    free(ms);
-    unsigned int ccnt = 0;
-    Method *cms = class_copyMethodList(object_getClass(c), &ccnt);
-    for (unsigned int i = 0; i < ccnt; i++) {
-        SEL s = method_getName(cms[i]);
-        NSString *n = NSStringFromSelector(s);
-        if ([n hasPrefix:@"_"] || [n hasPrefix:@"initialize"]) continue;
-        W(@"  M +[%@ %@]", name, n);
-    }
-    free(cms);
+static NSString *docsDir(void) {
+    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
 
-// ---------- evaluateJavaScript swizzle ----------
+static void flushLogs(void) {
+    [gLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_probe.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [gBridge writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_bridge.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void appendResult(NSString *line) {
+    NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_result.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) {
+        [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+
+static void dumpCookiesTo(NSString *label) {
+    NSMutableString *s = [NSMutableString new];
+    for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies]) {
+        [s appendFormat:@"COOKIE\t%@\t%@=%@\n", c.domain, c.name, c.value];
+    }
+    NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cookies.txt"];
+    [s writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    W(@"cookies dumped (%@)", label);
+}
+
+// ---------- evaluateJavaScript swizzle：捕获 WindVane 响应 ----------
 static NSInteger gEvalCount = 0;
 static void (*orig_eval)(id, SEL, NSString *, void (^)(id, NSError *));
 
 static void my_eval(id self, SEL _cmd, NSString *js, void (^cb)(id, NSError *)) {
     @autoreleasepool {
         gEvalCount++;
+        if (!gWebView) {
+            if ([self isKindOfClass:NSClassFromString(@"WKWebView")]) {
+                gWebView = self;
+                W(@"webview captured");
+            }
+        }
         if ([js containsString:@"__windvane__"]) {
-            // 完整记录 WindVane 回调（API 响应全在这）
             B(@"[EVAL %ld] %@", (long)gEvalCount, js);
-            if (gBridge.length > 800000) { /* 防爆 */ }
-            flushLog();
-        } else if (gEvalCount <= 20) {
-            NSString *s = [js length] > 120 ? [js substringToIndex:120] : js;
-            B(@"[EVAL %ld|other] %@", (long)gEvalCount, s);
+            // 解析 onSuccess('$cbId', payload)
+            NSRange r = [js rangeOfString:@"onSuccess("];
+            if (r.location != NSNotFound) {
+                NSString *rest = [js substringFromIndex:r.location + 10];
+                NSRange q1 = [rest rangeOfString:@"'"];
+                if (q1.location != NSNotFound) {
+                    NSString *after = [rest substringFromIndex:q1.location + 1];
+                    NSRange q2 = [after rangeOfString:@"'"];
+                    if (q2.location != NSNotFound) {
+                        NSString *cbId = [after substringToIndex:q2.location];
+                        NSRange comma = [after rangeOfString:@","];
+                        if (comma.location != NSNotFound) {
+                            NSString *payload = [after substringFromIndex:comma.location + 1];
+                            // 去掉尾部 ",false)" 或 ")"
+                            NSRange tail = [payload rangeOfString:@",false)" options:NSBackwardsSearch];
+                            if (tail.location != NSNotFound) payload = [payload substringToIndex:tail.location];
+                            NSRange tail2 = [payload rangeOfString:@")" options:NSBackwardsSearch];
+                            if (tail2.location != NSNotFound && tail.location == NSNotFound) payload = [payload substringToIndex:tail2.location];
+                            // 找到对应 tag（若有）
+                            NSString *tag = gPending[cbId] ?: @"";
+                            if (tag.length) [gPending removeObjectForKey:cbId];
+                            NSString *line = [NSString stringWithFormat:@"{\"cb\":\"%@\",\"tag\":\"%@\",\"at\":%lld,\"payload\":%@}",
+                                              cbId, tag, (long long)([[NSDate date] timeIntervalSince1970] * 1000), payload];
+                            appendResult(line);
+                            if (tag.length) W(@"cmd result captured: %@ -> %lu bytes", tag, (unsigned long)payload.length);
+                        }
+                    }
+                }
+            }
         }
     }
     orig_eval(self, _cmd, js, cb);
@@ -99,35 +134,54 @@ static void doSwizzle(void) {
     W(@"SWIZZLE evaluateJavaScript OK");
 }
 
-// ---------- 旧版数据采集（沿用） ----------
-static void dumpKeychainClass(CFTypeRef cls, NSString *label) {
-    NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)cls,
-                        (__bridge id)kSecReturnAttributes: @YES,
-                        (__bridge id)kSecReturnData: @YES,
-                        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll};
-    CFTypeRef res = NULL;
-    OSStatus s = SecItemCopyMatching((__bridge CFDictionaryRef)q, &res);
-    W(@"=== KEYCHAIN %@ (status=%d) ===", label, (int)s);
-    if (s != errSecSuccess || !res) return;
-    NSArray *arr = (__bridge_transfer NSArray *)res;
-    if (![arr isKindOfClass:[NSArray class]]) { arr = @[arr]; }
-    for (NSDictionary *item in arr) {
-        NSData *dat = item[(__bridge id)kSecValueData];
-        NSString *txt = @"";
-        if ([dat isKindOfClass:[NSData class]]) {
-            txt = [[NSString alloc] initWithData:dat encoding:NSUTF8StringEncoding] ?: b64(dat);
-        }
-        W(@"KC\t%@\t%@\t%@\t%@",
-          item[(__bridge id)kSecAttrService] ?: @"",
-          item[(__bridge id)kSecAttrAccount] ?: @"",
-          item[(__bridge id)kSecAttrAccessGroup] ?: @"", txt);
-    }
+// ---------- 指令执行 ----------
+static void execCall(NSDictionary *cmd) {
+    NSString *api = cmd[@"api"];
+    if (!api.length) return;
+    NSString *v = cmd[@"v"] ?: @"1.0";
+    id data = cmd[@"data"] ?: @{};
+    NSString *tag = cmd[@"tag"] ?: @"";
+    NSDictionary *req = @{@"api": api, @"v": v, @"data": data,
+                          @"type": @"originaljson", @"dataType": @"json",
+                          @"needLogin": @YES, @"ecode": @1, @"timeout": @20000};
+    NSString *cbId = [NSString stringWithFormat:@"$xy%ld", ++gCmdSeq];
+    if (tag.length) gPending[cbId] = tag;
+    Class plugin = NSClassFromString(@"MtopWVPlugin");
+    id inst = [plugin performSelector:@selector(instance)];
+    WKWebView *wv = gWebView;
+    if (!inst) { W(@"no plugin instance"); return; }
+    SEL sel = @selector(send:withCallback:withWebView:withViewController:);
+    if (![inst respondsToSelector:sel]) { W(@"plugin no send sel"); return; }
+    W(@"EXEC %@ v=%@ tag=%@ cb=%@ webview=%@", api, v, tag, cbId, wv ? @"yes" : @"nil");
+    flushLogs();
+    ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(inst, sel, req, cbId, wv, nil);
+    // 30s 后若仍 pending，清理
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gPending[cbId]) { [gPending removeObjectForKey:cbId]; W(@"cmd timeout %@", tag); flushLogs(); }
+    });
 }
 
-static void dumpCookies(void) {
-    W(@"=== COOKIES ===");
-    for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies]) {
-        W(@"COOKIE\t%@\t%@=%@", c.domain, c.name, c.value);
+static void pollCmd(void) {
+    @autoreleasepool {
+        NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
+        NSData *d = [NSData dataWithContentsOfFile:p];
+        if (!d) return;
+        id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![obj isKindOfClass:[NSDictionary class]]) return;
+        long long at = [obj[@"at"] longLongValue];
+        if (at <= gLastCmdAt) return;
+        gLastCmdAt = at;
+        NSString *mode = obj[@"mode"] ?: @"";
+        W(@"CMD mode=%@ at=%lld", mode, at);
+        if ([mode isEqualToString:@"call"]) {
+            execCall(obj);
+        } else if ([mode isEqualToString:@"cookies"]) {
+            dumpCookiesTo(@"cmd");
+        } else if ([mode isEqualToString:@"ping"]) {
+            W(@"ping ok");
+        }
+        flushLogs();
     }
 }
 
@@ -136,22 +190,20 @@ static void xyprobe_init(void) {
     @autoreleasepool {
         gLog = [NSMutableString new];
         gBridge = [NSMutableString new];
+        gPending = [NSMutableDictionary new];
         doSwizzle();
-        W(@"---- probe v3 at %@ ----", [NSDate date]);
+        W(@"---- executor v4 at %@ ----", [NSDate date]);
         W(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
-        enumClass(@"WVIdleFishApi");
-        enumClass(@"MtopWVPlugin");
-        dumpCookies();
-        flushLog();
-        dumpKeychainClass(kSecClassGenericPassword, @"generic");
-        flushLog();
-        W(@"---- v3 ready, waiting bridge traffic ----");
-        flushLog();
-        // 周期落盘：让桥流量持续可见
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            W(@"---- alive 20s, evalCount=%ld ----", (long)gEvalCount);
-            flushLog();
+        dumpCookiesTo(@"boot");
+        flushLogs();
+        // 主线程定时器：轮询指令 + 周期落盘
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+                pollCmd();
+                if (gEvalCount % 1 == 0) flushLogs();
+            }];
+            W(@"poll timer started");
+            flushLogs();
         });
     }
 }
