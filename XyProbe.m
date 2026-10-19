@@ -48,8 +48,11 @@ static NSString *docsDir(void) {
 }
 
 static void flushLogs(void) {
+    if (!gLogLock) gLogLock = [NSLock new];
+    [gLogLock lock];
     [gLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_probe.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [gBridge writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_bridge.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [gLogLock unlock];
 }
 
 static void writeResult(NSString *tag, NSString *api, NSString *text) {
@@ -249,16 +252,22 @@ static void (*orig_async_call_del_sf)(id, SEL, id, id, id);
 static void (*orig_sync_call)(id, SEL, id);
 static void (*orig_sync_call_v)(id, SEL, id, id);
 static void (*orig_sync_call_biz)(id, SEL, id, id, id);
+static NSLock *gLogLock = nil;
 
 static void MLOG(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    if (!gMtopLog) gMtopLog = [NSMutableString new];
-    [gMtopLog appendFormat:@"%@\n", s];
-    if (gMtopLog.length > 500000) gMtopLog = [NSMutableString new];
-    [gMtopLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_mtop.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (!gLogLock) gLogLock = [NSLock new];
+    [gLogLock lock];
+    @try {
+        if (!gMtopLog) gMtopLog = [NSMutableString new];
+        [gMtopLog appendFormat:@"%@\n", s];
+        if (gMtopLog.length > 500000) gMtopLog = [NSMutableString new];
+        [gMtopLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_mtop.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (id e) {}
+    [gLogLock unlock];
 }
 
 static void logMtopReq(id req) {
