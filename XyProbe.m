@@ -19,6 +19,7 @@
 static NSMutableString *gLog = nil;     // 摘要 → xy_probe.log
 static NSMutableString *gBridge = nil;  // 全量桥流量 → xy_bridge.log
 static WKWebView *gWebView = nil;       // 活跃 webview（send 需要）
+static NSLock *gLogLock = nil;
 static NSMutableDictionary *gPending;   // cbId -> tag
 static long long gLastCmdAt = 0;
 static long gCmdSeq = 0;
@@ -252,7 +253,6 @@ static void (*orig_async_call_del_sf)(id, SEL, id, id, id);
 static void (*orig_sync_call)(id, SEL, id);
 static void (*orig_sync_call_v)(id, SEL, id, id);
 static void (*orig_sync_call_biz)(id, SEL, id, id, id);
-static NSLock *gLogLock = nil;
 
 static void MLOG(NSString *fmt, ...) {
     va_list ap;
