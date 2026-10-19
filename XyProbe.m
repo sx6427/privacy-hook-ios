@@ -52,16 +52,12 @@ static void flushLogs(void) {
     [gBridge writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_bridge.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-static void appendResult(NSString *line) {
-    NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_result.log"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-    if (!fh) {
-        [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        return;
-    }
-    [fh seekToEndOfFile];
-    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh closeFile];
+static void writeResult(NSString *tag, NSString *api, NSString *text) {
+    NSDictionary *rec = @{@"tag": tag ?: @"", @"api": api ?: @"", @"at": @((long long)([[NSDate date] timeIntervalSince1970] * 1000)), @"payload": text ?: @""};
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:rec options:NSJSONWritingWithoutEscapingSlashes error:nil];
+    if (!jd) return;
+    NSString *p = [docsDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"xy_res_%@.json", tag ?: @"last"]];
+    [jd writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 static void dumpCookiesTo(NSString *label) {
@@ -112,7 +108,7 @@ static void my_eval(id self, SEL _cmd, NSString *js, void (^cb)(id, NSError *)) 
                             if (tag.length) [gPending removeObjectForKey:cbId];
                             NSString *line = [NSString stringWithFormat:@"{\"cb\":\"%@\",\"tag\":\"%@\",\"at\":%lld,\"payload\":%@}",
                                               cbId, tag, (long long)([[NSDate date] timeIntervalSince1970] * 1000), payload];
-                            appendResult(line);
+                            if (tag.length) writeResult(tag, @"", [NSString stringWithFormat:@"%@", payload]);
                             if (tag.length) W(@"cmd result captured: %@ -> %lu bytes", tag, (unsigned long)payload.length);
                         }
                     }
@@ -164,21 +160,26 @@ static void execCall(NSDictionary *cmd) {
                 flushLogs();
                 return;
             }
-            // 序列化响应
+            // 序列化响应：优先 data 属性
             NSString *payload = nil;
-            if ([resp isKindOfClass:[NSDictionary class]] || [resp isKindOfClass:[NSArray class]]) {
-                NSData *jd = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+            id d = nil;
+            @try { d = [resp valueForKey:@"data"]; } @catch (id e) { d = nil; }
+            if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
+                NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+                payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
+            }
+            if (!payload) {
+                NSData *jd = nil;
+                if ([resp isKindOfClass:[NSDictionary class]] || [resp isKindOfClass:[NSArray class]]) {
+                    jd = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+                }
                 payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
             }
             if (!payload) {
                 payload = [NSString stringWithFormat:@"%@", resp ?: @"(nil)"];
             }
-            if (payload.length > 200000) payload = [payload substringToIndex:200000];
-            NSString *line = [NSString stringWithFormat:@"{\"tag\":\"%@\",\"api\":\"%@\",\"at\":%lld,\"payload\":%@}",
-                              tag, api, (long long)([[NSDate date] timeIntervalSince1970] * 1000),
-                              ([payload hasPrefix:@"{"] || [payload hasPrefix:@"["]) ? payload :
-                              [NSString stringWithFormat:@"%@", [[payload stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"] stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""]]];
-            appendResult(line);
+            if (payload.length > 300000) payload = [payload substringToIndex:300000];
+            writeResult(tag, api, payload);
             W(@"MS-DONE tag=%@ respLen=%lu", tag, (unsigned long)payload.length);
             flushLogs();
         }
