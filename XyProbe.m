@@ -185,6 +185,59 @@ static void execCall(NSDictionary *cmd) {
     });
 }
 
+// ---------- v4.2 运行时类扫描 ----------
+static void appendScan(NSString *line) {
+    NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_scan.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    [fh seekToEndOfFile];
+    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+
+static BOOL nameMatches(NSString *n) {
+    NSString *l = n.lowercaseString;
+    if ([l containsString:@"mtop"]) return YES;
+    if ([l containsString:@"amnet"]) return YES;
+    return NO;
+}
+
+static BOOL selInteresting(NSString *n) {
+    NSString *l = n.lowercaseString;
+    NSArray *kw = @[@"send", @"request", @"call", @"post", @"get", @"sign", @"wua", @"submit"];
+    for (NSString *k in kw) if ([l containsString:k]) return YES;
+    return NO;
+}
+
+static void scanClasses(void) {
+    W(@"SCAN start");
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    appendScan([NSString stringWithFormat:@"==== scan %@ total=%u ====", [NSDate date], count]);
+    int matched = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        Class c = classes[i];
+        NSString *n = NSStringFromClass(c);
+        if (!nameMatches(n)) continue;
+        matched++;
+        appendScan([NSString stringWithFormat:@"--- CLASS %@ ---", n]);
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        BOOL printAll = (mc <= 40);
+        for (unsigned int j = 0; j < mc; j++) {
+            NSString *mn = NSStringFromSelector(method_getName(ms[j]));
+            if (printAll || selInteresting(mn)) {
+                appendScan([NSString stringWithFormat:@"  -[%@ %@] argc=%d", n, mn, (int)method_getNumberOfArguments(ms[j]) - 2]);
+            }
+        }
+        free(ms);
+    }
+    free(classes);
+    appendScan([NSString stringWithFormat:@"==== scan done matched=%d ====", matched]);
+    W(@"SCAN done matched=%d", matched);
+    flushLogs();
+}
+
 static void pollCmd(void) {
     @autoreleasepool {
         NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
