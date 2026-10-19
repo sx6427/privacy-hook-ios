@@ -320,49 +320,6 @@ static void swizzleMtopService(void) {
     }
 }
 
-// WKScriptMessageHandler：全类 swizzle
-static IMP getOrigImp(id self) {
-    return [[gOrigImps objectForKey:NSStringFromClass([self class])] pointerValue];
-}
-static void my_didReceive(id self, SEL _cmd, id ucc, id msg) {
-    @autoreleasepool {
-        @try {
-            NSString *name = [msg valueForKey:@"name"] ?: @"";
-            id body = [msg valueForKey:@"body"];
-            NSString *bs = nil;
-            if ([body isKindOfClass:[NSString class]]) bs = body;
-            else { NSData *jd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil]; bs = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : [body description]; }
-            if (bs.length > 3000) bs = [bs substringToIndex:3000];
-            MLOG(@"[MSG %@] %@", name, bs);
-        } @catch (id e) {}
-    }
-    IMP orig = getOrigImp(self);
-    if (orig) ((void (*)(id, SEL, id, id))orig)(self, _cmd, ucc, msg);
-}
-
-static void swizzleMessageHandlers(void) {
-    SEL sel = @selector(userContentController:didReceiveScriptMessage:);
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    int n = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        NSString *cn = NSStringFromClass(c);
-        if ([cn hasPrefix:@"_"] || [cn containsString:@"WebKit"]) continue;
-        IMP orig = method_getImplementation(m);
-        if (!gOrigImps) gOrigImps = [NSMutableDictionary new];
-        if (gOrigImps[cn]) continue;
-        [gOrigImps setObject:[NSValue valueWithPointer:orig] forKey:cn];
-        method_setImplementation(m, (IMP)my_didReceive);
-        n++;
-        if (n > 60) break;
-    }
-    free(classes);
-    W(@"v5 message handlers swizzled: %d", n);
-}
-
 static void pollCmd(void) {
     @autoreleasepool {
         NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
@@ -399,7 +356,6 @@ static void xyprobe_init(void) {
         gPending = [NSMutableDictionary new];
         doSwizzle();
         swizzleMtopService();
-        swizzleMessageHandlers();
         W(@"---- executor v4 at %@ ----", [NSDate date]);
         W(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         dumpCookiesTo(@"boot");
