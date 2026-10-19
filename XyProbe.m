@@ -274,9 +274,23 @@ static void logMtopReq(id req) {
     @try {
         gMtopCount++;
         MLOG(@"---- REQ #%ld class=%@", gMtopCount, NSStringFromClass([req class]));
-        NSString *desc = [req description];
-        if (desc.length > 1200) desc = [desc substringToIndex:1200];
-        MLOG(@"%@", desc);
+        Class c = [req class];
+        unsigned int pc = 0;
+        objc_property_t *props = class_copyPropertyList(c, &pc);
+        for (unsigned int i = 0; i < pc; i++) {
+            const char *pn = property_getName(props[i]);
+            @try {
+                id v = [req valueForKey:@(pn)];
+                NSString *vs = nil;
+                if ([v isKindOfClass:[NSString class]]) vs = v;
+                else if (v) { NSData *jd = [NSJSONSerialization dataWithJSONObject:v options:0 error:nil]; vs = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : [v description]; }
+                if (vs.length > 2000) vs = [vs substringToIndex:2000];
+                MLOG(@"  %@ = %@", @(pn), vs ?: @"(nil)");
+            } @catch (id e) {
+                MLOG(@"  %@ = (KVC fail)", @(pn));
+            }
+        }
+        if (pc) free(props);
     } @catch (id e) {}
 }
 
