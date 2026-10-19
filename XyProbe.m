@@ -346,6 +346,8 @@ static void pollCmd(void) {
         if ([mode isEqualToString:@"call"]) {
             if (![obj[@"arm"] boolValue]) { W(@"call not armed, skip"); return; }
             execCall(obj);
+        } else if ([mode isEqualToString:@"swizzle"]) {
+            swizzleMtopService();
         } else if ([mode isEqualToString:@"scan"]) {
             scanClasses();
         } else if ([mode isEqualToString:@"cookies"]) {
@@ -364,7 +366,6 @@ static void xyprobe_init(void) {
         gBridge = [NSMutableString new];
         gPending = [NSMutableDictionary new];
         doSwizzle();
-        swizzleMtopService();
         W(@"---- executor v4 at %@ ----", [NSDate date]);
         W(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         dumpCookiesTo(@"boot");
