@@ -135,123 +135,53 @@ static void doSwizzle(void) {
 }
 
 // ---------- 指令执行 ----------
-static void sendViaPlugin(NSDictionary *req, NSString *cbId) {
-    Class plugin = NSClassFromString(@"MtopWVPlugin");
-    id inst = [plugin performSelector:@selector(instance)];
-    WKWebView *wv = gWebView;
-    if (!inst) { W(@"no plugin instance"); return; }
-    SEL sel = @selector(send:withCallback:withWebView:withViewController:);
-    if (![inst respondsToSelector:sel]) { W(@"plugin no send sel"); return; }
-    @try {
-        W(@"SEND-START api=%@ dataClass=%@", req[@"api"], NSStringFromClass([req[@"data"] class]));
-        flushLogs();
-        ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(inst, sel, req, cbId, wv, nil);
-        W(@"SEND-OK");
-    } @catch (NSException *e) {
-        W(@"SEND-EXCEPTION %@: %@", e.name, e.reason);
-    }
-    flushLogs();
-}
-
-// ---------- v4.2 运行时类扫描 ----------
-static void appendScan(NSString *line) {
-    NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_scan.log"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-    if (!fh) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
-    [fh seekToEndOfFile];
-    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh closeFile];
-}
-
-static BOOL nameMatches(NSString *n) {
-    NSString *l = n.lowercaseString;
-    if ([l containsString:@"mtop"]) return YES;
-    if ([l containsString:@"amnet"]) return YES;
-    if ([l containsString:@"windvane"] && [l containsString:@"api"]) return YES;
-    return NO;
-}
-
-static BOOL selInteresting(NSString *n) {
-    NSString *l = n.lowercaseString;
-    NSArray *kw = @[@"send", @"request", @"call", @"post", @"get", @"sign", @"wua", @"submit"];
-    for (NSString *k in kw) if ([l containsString:k]) return YES;
-    return NO;
-}
-
-static void scanClasses(void) {
-    W(@"SCAN start");
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    appendScan([NSString stringWithFormat:@"==== scan %@ total=%u ====", [NSDate date], count]);
-    int matched = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        NSString *n = NSStringFromClass(c);
-        if (!nameMatches(n)) continue;
-        matched++;
-        appendScan([NSString stringWithFormat:@"--- CLASS %@ ---", n]);
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        BOOL printAll = (mc <= 40);
-        for (unsigned int j = 0; j < mc; j++) {
-            NSString *mn = NSStringFromSelector(method_getName(ms[j]));
-            if (printAll || selInteresting(mn)) {
-                appendScan([NSString stringWithFormat:@"  -[%@ %@] argc=%d", n, mn, (int)method_getNumberOfArguments(ms[j]) - 2]);
-            }
-        }
-        free(ms);
-        unsigned int cc = 0;
-        Method *cms = class_copyMethodList(object_getClass(c), &cc);
-        for (unsigned int j = 0; j < cc; j++) {
-            NSString *mn = NSStringFromSelector(method_getName(cms[j]));
-            if (printAll || selInteresting(mn)) {
-                appendScan([NSString stringWithFormat:@"  +[%@ %@]", n, mn]);
-            }
-        }
-        free(cms);
-    }
-    free(classes);
-    appendScan([NSString stringWithFormat:@"==== scan done matched=%d ====", matched]);
-    W(@"SCAN done matched=%d", matched);
-    flushLogs();
-}
-
 static void execCall(NSDictionary *cmd) {
     NSString *api = cmd[@"api"];
     if (!api.length) return;
     NSString *v = cmd[@"v"] ?: @"1.0";
     NSString *tag = cmd[@"tag"] ?: @"";
-    id rawData = cmd[@"data"] ?: @{};
-    NSString *dataStr = nil;
-    if ([rawData isKindOfClass:[NSString class]]) dataStr = rawData;
-    else { NSData *jd = [NSJSONSerialization dataWithJSONObject:rawData options:0 error:nil]; dataStr = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}"; }
+    id data = cmd[@"data"] ?: @{};
+    NSString *site = cmd[@"site"] ?: @"xianyu";
 
-    NSString *cbId = [NSString stringWithFormat:@"$xy%ld", ++gCmdSeq];
-    if (tag.length) gPending[cbId] = tag;
-
-    // 尝试 1：data 为字典
-    NSDictionary *req1 = @{@"api": api, @"v": v, @"data": rawData,
-                           @"type": @"originaljson", @"dataType": @"json",
-                           @"needLogin": @YES, @"ecode": @1, @"timeout": @20000};
-    sendViaPlugin(req1, cbId);
-    if (!gPending[cbId]) { W(@"call done (dict) tag=%@", tag); flushLogs(); return; }
-
-    // 尝试 2：data 为 JSON 字符串
-    NSDictionary *req2 = @{@"api": api, @"v": v, @"data": dataStr,
-                           @"type": @"originaljson", @"dataType": @"json",
-                           @"needLogin": @YES, @"ecode": @1, @"timeout": @20000};
-    W(@"retry with data-as-string");
-    sendViaPlugin(req2, cbId);
-    if (!gPending[cbId]) { W(@"call done (string) tag=%@", tag); flushLogs(); return; }
-
-    // 尝试 3：极简字段
-    NSDictionary *req3 = @{@"api": api, @"v": v, @"data": dataStr};
-    W(@"retry minimal");
-    sendViaPlugin(req3, cbId);
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (gPending[cbId]) { [gPending removeObjectForKey:cbId]; W(@"cmd timeout %@", tag); flushLogs(); }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            W(@"MS-CALL %@ v=%@ site=%@ tag=%@", api, v, site, tag);
+            flushLogs();
+            Class ms = NSClassFromString(@"MtopService");
+            if (!ms) { W(@"no MtopService"); flushLogs(); return; }
+            SEL gs = @selector(getInstanceWithAccountSite:);
+            if (![ms respondsToSelector:gs]) { W(@"no getInstanceWithAccountSite"); flushLogs(); return; }
+            id inst = ((id (*)(id, SEL, id))objc_msgSend)(ms, gs, site);
+            if (!inst) { W(@"no MtopService instance"); flushLogs(); return; }
+            SEL call = @selector(sync_call:apiVersion:bizParameters:);
+            if (![inst respondsToSelector:call]) { W(@"no sync_call sel"); flushLogs(); return; }
+            id resp = nil;
+            @try {
+                resp = ((id (*)(id, SEL, id, id, id))objc_msgSend)(inst, call, api, v, data);
+                W(@"MS-RESP class=%@", NSStringFromClass([resp class]));
+            } @catch (NSException *e) {
+                W(@"MS-EXCEPTION %@: %@", e.name, e.reason);
+                flushLogs();
+                return;
+            }
+            // 序列化响应
+            NSString *payload = nil;
+            if ([resp isKindOfClass:[NSDictionary class]] || [resp isKindOfClass:[NSArray class]]) {
+                NSData *jd = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+                payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
+            }
+            if (!payload) {
+                payload = [NSString stringWithFormat:@"%@", resp ?: @"(nil)"];
+            }
+            if (payload.length > 200000) payload = [payload substringToIndex:200000];
+            NSString *line = [NSString stringWithFormat:@"{\"tag\":\"%@\",\"api\":\"%@\",\"at\":%lld,\"payload\":%@}",
+                              tag, api, (long long)([[NSDate date] timeIntervalSince1970] * 1000),
+                              ([payload hasPrefix:@"{"] || [payload hasPrefix:@"["]) ? payload :
+                              [NSString stringWithFormat:@"%@", [[payload stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"] stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""]]];
+            appendResult(line);
+            W(@"MS-DONE tag=%@ respLen=%lu", tag, (unsigned long)payload.length);
+            flushLogs();
+        }
     });
 }
 
