@@ -1,16 +1,15 @@
 //
-//  XyProbe.m — 闲鱼会话探针（裸 dylib，仅读取，不 hook）
+//  XyProbe.m — 闲鱼存活测试 v2：裸 dylib + ObjC swizzle 验证
 //
-//  用途：TrollFools 注入 com.taobao.fleamarket 后，把进程内可见的
-//        cookie / keychain / NSUserDefaults 里的登录态写到 App 容器
-//        Documents/xy_probe.log，供 Filza 读出。
-//
-//  形态约束：不 swizzle、不 hook、不改代码页 —— 符合 TrollFools 对
-//  加密 App Store 应用「只支持裸动态库」的限制。
+//  目的：验证在 TrollFools 注入（加密 App）环境下，ObjC method swizzle
+//        不会触发完整性校验/闪退 —— 为「指令执行器」开路。
+//  同时保留：cookie/keychain dump（写 xy_probe.log）
 //
 
 #import <Foundation/Foundation.h>
+#import <WebKit/WebKit.h>
 #import <Security/Security.h>
+#import <objc/runtime.h>
 
 static NSMutableString *gLog = nil;
 
@@ -30,17 +29,7 @@ static void flush(void) {
     [gLog writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-static NSString *b64(NSData *d) {
-    return [d base64EncodedStringWithOptions:0];
-}
-
-static void dumpCookies(void) {
-    W(@"=== COOKIES ===");
-    NSHTTPCookieStorage *st = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-    for (NSHTTPCookie *c in [st cookies]) {
-        W(@"COOKIE\t%@\t%@=%@", c.domain, c.name, c.value);
-    }
-}
+static NSString *b64(NSData *d) { return [d base64EncodedStringWithOptions:0]; }
 
 static void dumpKeychainClass(CFTypeRef cls, NSString *label) {
     NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)cls,
@@ -66,33 +55,60 @@ static void dumpKeychainClass(CFTypeRef cls, NSString *label) {
     }
 }
 
-static void dumpDefaults(void) {
-    W(@"=== DEFAULTS ===");
-    NSArray *keys = [[[NSUserDefaults standardUserDefaults] dictionaryRepresentation] allKeys];
-    NSArray *kws = @[@"login", @"sid", @"token", @"cookie", @"user", @"account", @"session", @"unb", @"utdid"];
-    for (NSString *k in keys) {
-        NSString *lk = k.lowercaseString;
-        for (NSString *kw in kws) {
-            if ([lk containsString:kw]) {
-                id v = [[NSUserDefaults standardUserDefaults] objectForKey:k];
-                W(@"DEF\t%@\t%@", k, [v description]);
-                break;
-            }
+static void dumpCookies(void) {
+    W(@"=== COOKIES ===");
+    for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies]) {
+        W(@"COOKIE\t%@\t%@=%@", c.domain, c.name, c.value);
+    }
+}
+
+static void dumpClasses(void) {
+    W(@"=== BRIDGE CLASSES ===");
+    NSArray *names = @[@"WVIdleFishApi", @"MtopWVPlugin", @"WVPluginManager",
+                       @"TMWindVaneBridge", @"MTOPRequest", @"TMNetworkClient",
+                       @"TVMTOPRequest", @"WVBJContext", @"KunJSBridge"];
+    for (NSString *n in names) {
+        Class c = NSClassFromString(n);
+        W(@"CLASS %@ = %@", n, c ? @"YES" : @"no");
+        if (c) {
+            W(@"  instancesRespond callMtop: %@", [c instancesRespondToSelector:@selector(callMtop:)] ? @"YES" : @"no");
         }
     }
 }
 
+// ---------- swizzle ----------
+static NSInteger gEvalCount = 0;
+static void (*orig_eval)(id, SEL, NSString *, void (^)(id, NSError *));
+
+static void my_eval(id self, SEL _cmd, NSString *js, void (^cb)(id, NSError *)) {
+    gEvalCount++;
+    if (gEvalCount <= 30) {
+        NSString *s = [js length] > 300 ? [js substringToIndex:300] : js;
+        W(@"EVAL#%d %@", gEvalCount, [s length] ? s : @"(empty)");
+        flush();
+    }
+    orig_eval(self, _cmd, js, cb);
+}
+
+static void doSwizzle(void) {
+    Class cls = NSClassFromString(@"WKWebView");
+    SEL sel = @selector(evaluateJavaScript:completionHandler:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { W(@"SWIZZLE target missing"); return; }
+    Method orig = class_getInstanceMethod(cls, sel);
+    orig_eval = (void (*)(id, SEL, NSString *, void (^)(id, NSError *)))method_getImplementation(orig);
+    method_setImplementation(orig, (IMP)my_eval);
+    W(@"SWIZZLE evaluateJavaScript OK");
+}
+
 static void dumpAll(void) {
     @autoreleasepool {
-        W(@"---- probe at %@ ----", [NSDate date]);
-        W(@"bundle=%@  executable=%@", [[NSBundle mainBundle] bundleIdentifier], [[NSBundle mainBundle] executablePath]);
+        W(@"---- probe v2 at %@ ----", [NSDate date]);
+        W(@"bundle=%@ executable=%@", [[NSBundle mainBundle] bundleIdentifier], [[NSBundle mainBundle] executablePath]);
+        dumpClasses();
         dumpCookies();
         flush();
         dumpKeychainClass(kSecClassGenericPassword, @"generic");
-        dumpKeychainClass(kSecClassInternetPassword, @"internet");
-        dumpDefaults();
-        flush();
-        W(@"---- done, bytes=%lu ----", (unsigned long)gLog.length);
         flush();
     }
 }
@@ -100,8 +116,17 @@ static void dumpAll(void) {
 __attribute__((constructor))
 static void xyprobe_init(void) {
     @autoreleasepool {
+        gLog = [NSMutableString new];
+        doSwizzle();          // ★ 关键验证点：swizzle 后是否存活
         dumpAll();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ dumpAll(); });
+        W(@"---- swizzle done, alive ----");
+        flush();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                W(@"---- alive-check 15s: evalCount=%ld ----", (long)gEvalCount);
+                flush();
+            }
+        });
     }
 }
