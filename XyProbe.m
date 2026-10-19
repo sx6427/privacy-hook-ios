@@ -239,6 +239,125 @@ static void scanClasses(void) {
     flushLogs();
 }
 
+
+// ---------- v5: MtopService 全请求日志 + WKScriptMessage 全量捕获 ----------
+static NSMutableString *gMtopLog = nil;
+static NSMutableDictionary *gOrigImps = nil;
+static long gMtopCount = 0;
+
+static void MLOG(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!gMtopLog) gMtopLog = [NSMutableString new];
+    [gMtopLog appendFormat:@"%@\n", s];
+    if (gMtopLog.length > 500000) gMtopLog = [NSMutableString new];
+    [gMtopLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_mtop.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void logMtopReq(id req) {
+    @try {
+        gMtopCount++;
+        MLOG(@"---- REQ #%ld class=%@", gMtopCount, NSStringFromClass([req class]));
+        NSString *desc = [req description];
+        if (desc.length > 1200) desc = [desc substringToIndex:1200];
+        MLOG(@"%@", desc);
+    } @catch (id e) {}
+}
+
+static void my_async_call_del(id self, SEL _cmd, id req, id dlg) {
+    logMtopReq(req);
+    orig_async_call_del(self, _cmd, req, dlg);
+}
+static void my_async2(id self, SEL _cmd, id a, id b, id c) {
+    logMtopReq(a);
+    orig_async_call_del_sf(self, _cmd, a, b, c);
+}
+static void my_sync_call(id self, SEL _cmd, id req) {
+    logMtopReq(req);
+    orig_sync_call(self, _cmd, req);
+}
+static void my_sync_call_v(id self, SEL _cmd, id a, id b) {
+    logMtopReq(a);
+    orig_sync_call_v(self, _cmd, a, b);
+}
+static void my_sync_call_biz(id self, SEL _cmd, id a, id b, id c) {
+    logMtopReq(a);
+    orig_sync_call_biz(self, _cmd, a, b, c);
+}
+
+static void swizzleMtopService(void) {
+    Class c = NSClassFromString(@"MtopService");
+    if (!c) { W(@"v5: no MtopService"); return; }
+    gOrigImps = [NSMutableDictionary new];
+    struct { SEL sel; IMP *store; const char *types; } items[] = {
+        {@selector(async_call:delegate:), &orig_async_call_del, "v@:@@"},
+        {@selector(async_call:delegate:startFilter:), &orig_async_call_del_sf, "v@:@@@"},
+        {@selector(sync_call:), &orig_sync_call, "v@:@"},
+        {@selector(sync_call:apiVersion:), &orig_sync_call_v, "v@:@@"},
+        {@selector(sync_call:apiVersion:bizParameters:), &orig_sync_call_biz, "v@:@@@"},
+    };
+    for (int i = 0; i < 5; i++) {
+        Method m = class_getInstanceMethod(c, items[i].sel);
+        if (!m) continue;
+        IMP orig = method_getImplementation(m);
+        if (items[i].store) *items[i].store = orig;
+        NSString *key = NSStringFromSelector(items[i].sel);
+        [gOrigImps setObject:[NSValue valueWithPointer:orig] forKey:key];
+        IMP newImp = NULL;
+        if (sel_isEqual(items[i].sel, @selector(async_call:delegate:))) newImp = (IMP)my_async_call_del;
+        else if (sel_isEqual(items[i].sel, @selector(sync_call:))) newImp = (IMP)my_sync_call;
+        else if (sel_isEqual(items[i].sel, @selector(sync_call:apiVersion:))) newImp = (IMP)my_sync_call_v;
+        else if (sel_isEqual(items[i].sel, @selector(sync_call:apiVersion:bizParameters:))) newImp = (IMP)my_sync_call_biz;
+        else if (sel_isEqual(items[i].sel, @selector(async_call:delegate:startFilter:))) newImp = (IMP)my_async2;
+        if (newImp) { method_setImplementation(m, newImp); W(@"v5 swizzle %@", key); }
+    }
+}
+
+// WKScriptMessageHandler：全类 swizzle
+static IMP getOrigImp(id self) {
+    return [[gOrigImps objectForKey:NSStringFromClass([self class])] pointerValue];
+}
+static void my_didReceive(id self, SEL _cmd, id ucc, id msg) {
+    @autoreleasepool {
+        @try {
+            NSString *name = [msg valueForKey:@"name"] ?: @"";
+            id body = [msg valueForKey:@"body"];
+            NSString *bs = nil;
+            if ([body isKindOfClass:[NSString class]]) bs = body;
+            else { NSData *jd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil]; bs = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : [body description]; }
+            if (bs.length > 3000) bs = [bs substringToIndex:3000];
+            MLOG(@"[MSG %@] %@", name, bs);
+        } @catch (id e) {}
+    }
+    IMP orig = getOrigImp(self);
+    if (orig) ((void (*)(id, SEL, id, id))orig)(self, _cmd, ucc, msg);
+}
+
+static void swizzleMessageHandlers(void) {
+    SEL sel = @selector(userContentController:didReceiveScriptMessage:);
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    int n = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        Class c = classes[i];
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        NSString *cn = NSStringFromClass(c);
+        if ([cn hasPrefix:@"_"] || [cn containsString:@"WebKit"]) continue;
+        IMP orig = method_getImplementation(m);
+        if (!gOrigImps) gOrigImps = [NSMutableDictionary new];
+        if (gOrigImps[cn]) continue;
+        [gOrigImps setObject:[NSValue valueWithPointer:orig] forKey:cn];
+        method_setImplementation(m, (IMP)my_didReceive);
+        n++;
+        if (n > 60) break;
+    }
+    free(classes);
+    W(@"v5 message handlers swizzled: %d", n);
+}
+
 static void pollCmd(void) {
     @autoreleasepool {
         NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
@@ -274,6 +393,8 @@ static void xyprobe_init(void) {
         gBridge = [NSMutableString new];
         gPending = [NSMutableDictionary new];
         doSwizzle();
+        swizzleMtopService();
+        swizzleMessageHandlers();
         W(@"---- executor v4 at %@ ----", [NSDate date]);
         W(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         dumpCookiesTo(@"boot");
