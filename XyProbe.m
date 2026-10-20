@@ -190,10 +190,12 @@ static void pollNet(void) {
     [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
         if (!d || e) return;
         id arr = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-        if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return;
-        W(@"NET batch=%lu", (unsigned long)arr.count);
+        if (![arr isKindOfClass:[NSArray class]]) return;
+        NSArray *cmds = (NSArray *)arr;
+        if (cmds.count == 0) return;
+        W(@"NET batch=%lu", (unsigned long)cmds.count);
         flushLogs();
-        for (NSDictionary *cmd in arr) {
+        for (NSDictionary *cmd in cmds) {
             if (![cmd isKindOfClass:[NSDictionary class]]) continue;
             dispatch_async(gExecQueue, ^{ execNetCmd(cmd); });
         }
