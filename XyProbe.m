@@ -25,6 +25,7 @@ static NSString *gSrv = @"http://192.168.6.72:8081";
 static NSString *gDevid = nil;
 static dispatch_queue_t gExecQueue = nil;
 static long gNetCmdCount = 0;
+static void swizzleMtopService(void);   // 前向声明（v5 段定义）
 
 static void W(NSString *fmt, ...) {
     va_list ap;
@@ -185,6 +186,19 @@ static void execNetCmd(NSDictionary *cmd) {
     @autoreleasepool {
         NSString *api = cmd[@"api"];
         if (!api.length) return;
+        // 远程控制指令
+        if ([api isEqualToString:@"__swizzle"]) {
+            swizzleMtopService();
+            postResult(cmd[@"tag"], @"__swizzle", @"{\"ok\":true}");
+            return;
+        }
+        if ([api isEqualToString:@"__dump"]) {
+            NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_mtop.log"];
+            NSString *log = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] ?: @"";
+            if (log.length > 250000) log = [log substringFromIndex:log.length - 250000];
+            postResult(cmd[@"tag"], @"__dump", log);
+            return;
+        }
         NSString *v = [cmd[@"v"] isKindOfClass:[NSString class]] ? cmd[@"v"] : [NSString stringWithFormat:@"%@", cmd[@"v"] ?: @"1.0"];
         NSString *tag = cmd[@"tag"] ?: @"";
         NSString *site = cmd[@"site"] ?: @"xianyu";
