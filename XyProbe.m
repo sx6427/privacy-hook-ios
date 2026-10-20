@@ -155,10 +155,22 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
 }
 
 // ---------- v6 网络指令通道 ----------
+static NSString *loginUid(void) {
+    // 当前登录账号：优先 uid，其次 unb；值可能带引号
+    for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies]) {
+        if ([c.name isEqualToString:@"uid"] || [c.name isEqualToString:@"unb"]) {
+            NSString *v = [c.value stringByReplacingOccurrencesOfString:@"\"" withString:@""];
+            if (v.length >= 6) return v;
+        }
+    }
+    return @"";
+}
+
 static void postResult(NSString *tag, NSString *api, NSString *payload) {
     @try {
         NSDictionary *rec = @{@"tag": tag ?: @"", @"api": api ?: @"",
-                              @"payload": payload ?: @"", @"devid": gDevid ?: @""};
+                              @"payload": payload ?: @"", @"devid": gDevid ?: @"",
+                              @"uid": loginUid() ?: @""};
         NSData *jd = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
         if (!jd) return;
         NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[gSrv stringByAppendingString:@"/res"]]];
@@ -185,7 +197,9 @@ static void execNetCmd(NSDictionary *cmd) {
 }
 
 static void pollNet(void) {
-    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[gSrv stringByAppendingString:@"/cmd"]]];
+    NSString *uid = loginUid() ?: @"";
+    NSString *url = [gSrv stringByAppendingString:[NSString stringWithFormat:@"/cmd?uid=%@", uid]];
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     rq.timeoutInterval = 8;
     [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
         if (!d || e) return;
@@ -193,7 +207,7 @@ static void pollNet(void) {
         if (![arr isKindOfClass:[NSArray class]]) return;
         NSArray *cmds = (NSArray *)arr;
         if (cmds.count == 0) return;
-        W(@"NET batch=%lu", (unsigned long)cmds.count);
+        W(@"NET batch=%lu uid=%@", (unsigned long)cmds.count, uid);
         flushLogs();
         for (NSDictionary *cmd in cmds) {
             if (![cmd isKindOfClass:[NSDictionary class]]) continue;
@@ -410,8 +424,8 @@ static void xyprobe_init(void) {
         gDevid = [[NSUUID UUID] UUIDString];
         gExecQueue = dispatch_queue_create("xy.exec.v6", DISPATCH_QUEUE_SERIAL);
         doSwizzle();
-        W(@"---- executor v6 at %@ ----", [NSDate date]);
-        W(@"bundle=%@ srv=%@ devid=%@", [[NSBundle mainBundle] bundleIdentifier], gSrv, gDevid);
+        W(@"---- executor v6.1 (multi-account) at %@ ----", [NSDate date]);
+        W(@"bundle=%@ srv=%@ devid=%@ uid=%@", [[NSBundle mainBundle] bundleIdentifier], gSrv, gDevid, loginUid());
         dumpCookiesTo(@"boot");
         flushLogs();
         dispatch_async(dispatch_get_main_queue(), ^{
