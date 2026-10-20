@@ -1,15 +1,11 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v4（不越狱自动化核心）
+//  XyProbe.m — 闲鱼指令执行器 v6（网络直连通道）
 //
-//  架构（= 高德 sg_drive 的原生版）：
-//    PC --WebDAV(Filza)--> Documents/xy_cmd.json   （指令）
-//    dylib 轮询指令 -> [MtopWVPlugin send:...] 原生桥（真机签名）-> 响应
-//    响应(evaluateJavaScript onSuccess) swizzle 捕获 -> Documents/xy_result.log
-//    PC 读结果。全程无需代理/越狱。
+//  架构：
+//    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
+//      dylib 每 2s GET /cmd 拉批量指令 -> MtopService.sync_call（真机签名）逐条执行
+//      结果 POST /res 回传；Filza 文件通道保留为后备。
 //
-//  用户需打开一次鱼塘页面，让 WKWebView/桥处于活跃状态。
-//
-
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
 #import <Security/Security.h>
@@ -18,11 +14,17 @@
 
 static NSMutableString *gLog = nil;     // 摘要 → xy_probe.log
 static NSMutableString *gBridge = nil;  // 全量桥流量 → xy_bridge.log
-static WKWebView *gWebView = nil;       // 活跃 webview（send 需要）
+static WKWebView *gWebView = nil;       // 活跃 webview
 static NSLock *gLogLock = nil;
 static NSMutableDictionary *gPending;   // cbId -> tag
 static long long gLastCmdAt = 0;
 static long gCmdSeq = 0;
+
+// v6 网络通道
+static NSString *gSrv = @"http://192.168.6.72:8081";
+static NSString *gDevid = nil;
+static dispatch_queue_t gExecQueue = nil;
+static long gNetCmdCount = 0;
 
 static void W(NSString *fmt, ...) {
     va_list ap;
@@ -89,35 +91,6 @@ static void my_eval(id self, SEL _cmd, NSString *js, void (^cb)(id, NSError *)) 
         }
         if ([js containsString:@"__windvane__"]) {
             B(@"[EVAL %ld] %@", (long)gEvalCount, js);
-            // 解析 onSuccess('$cbId', payload)
-            NSRange r = [js rangeOfString:@"onSuccess("];
-            if (r.location != NSNotFound) {
-                NSString *rest = [js substringFromIndex:r.location + 10];
-                NSRange q1 = [rest rangeOfString:@"'"];
-                if (q1.location != NSNotFound) {
-                    NSString *after = [rest substringFromIndex:q1.location + 1];
-                    NSRange q2 = [after rangeOfString:@"'"];
-                    if (q2.location != NSNotFound) {
-                        NSString *cbId = [after substringToIndex:q2.location];
-                        NSRange comma = [after rangeOfString:@","];
-                        if (comma.location != NSNotFound) {
-                            NSString *payload = [after substringFromIndex:comma.location + 1];
-                            // 去掉尾部 ",false)" 或 ")"
-                            NSRange tail = [payload rangeOfString:@",false)" options:NSBackwardsSearch];
-                            if (tail.location != NSNotFound) payload = [payload substringToIndex:tail.location];
-                            NSRange tail2 = [payload rangeOfString:@")" options:NSBackwardsSearch];
-                            if (tail2.location != NSNotFound && tail.location == NSNotFound) payload = [payload substringToIndex:tail2.location];
-                            // 找到对应 tag（若有）
-                            NSString *tag = gPending[cbId] ?: @"";
-                            if (tag.length) [gPending removeObjectForKey:cbId];
-                            NSString *line = [NSString stringWithFormat:@"{\"cb\":\"%@\",\"tag\":\"%@\",\"at\":%lld,\"payload\":%@}",
-                                              cbId, tag, (long long)([[NSDate date] timeIntervalSince1970] * 1000), payload];
-                            if (tag.length) writeResult(tag, @"", [NSString stringWithFormat:@"%@", payload]);
-                            if (tag.length) W(@"cmd result captured: %@ -> %lu bytes", tag, (unsigned long)payload.length);
-                        }
-                    }
-                }
-            }
         }
     }
     orig_eval(self, _cmd, js, cb);
@@ -134,58 +107,111 @@ static void doSwizzle(void) {
     W(@"SWIZZLE evaluateJavaScript OK");
 }
 
-// ---------- 指令执行 ----------
+// ---------- mtop 执行核心（文件通道与网络通道共用） ----------
+// 返回 payload 文本（描述文本，内含 http body JSON）；失败返回错误说明
+static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NSString *tag) {
+    if (!site.length) site = @"xianyu";
+    W(@"MS-CALL %@ v=%@ site=%@ tag=%@", api, v, site, tag);
+    flushLogs();
+    Class ms = NSClassFromString(@"MtopService");
+    if (!ms) { W(@"no MtopService"); flushLogs(); return @"{\"error\":\"no MtopService\"}"; }
+    SEL gs = @selector(getInstanceWithAccountSite:);
+    if (![ms respondsToSelector:gs]) { W(@"no getInstanceWithAccountSite"); flushLogs(); return @"{\"error\":\"no getInstanceWithAccountSite\"}"; }
+    id inst = ((id (*)(id, SEL, id))objc_msgSend)(ms, gs, site);
+    if (!inst) { W(@"no MtopService instance"); flushLogs(); return @"{\"error\":\"no MtopService instance\"}"; }
+    SEL call = @selector(sync_call:apiVersion:bizParameters:);
+    if (![inst respondsToSelector:call]) { W(@"no sync_call sel"); flushLogs(); return @"{\"error\":\"no sync_call sel\"}"; }
+    id resp = nil;
+    @try {
+        resp = ((id (*)(id, SEL, id, id, id))objc_msgSend)(inst, call, api, v, data);
+        W(@"MS-RESP class=%@", NSStringFromClass([resp class]));
+    } @catch (NSException *e) {
+        W(@"MS-EXCEPTION %@: %@", e.name, e.reason);
+        flushLogs();
+        return [NSString stringWithFormat:@"{\"error\":\"exception\",\"name\":\"%@\",\"reason\":\"%@\"}", e.name, e.reason];
+    }
+    // 序列化响应：优先 data 属性，其次整体 JSON，最后 description
+    NSString *payload = nil;
+    id d = nil;
+    @try { d = [resp valueForKey:@"data"]; } @catch (id e) { d = nil; }
+    if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+        payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
+    }
+    if (!payload) {
+        NSData *jd = nil;
+        if ([resp isKindOfClass:[NSDictionary class]] || [resp isKindOfClass:[NSArray class]]) {
+            jd = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+        }
+        payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
+    }
+    if (!payload) {
+        payload = [NSString stringWithFormat:@"%@", resp ?: @"(nil)"];
+    }
+    if (payload.length > 300000) payload = [payload substringToIndex:300000];
+    W(@"MS-DONE tag=%@ respLen=%lu", tag, (unsigned long)payload.length);
+    flushLogs();
+    return payload;
+}
+
+// ---------- v6 网络指令通道 ----------
+static void postResult(NSString *tag, NSString *api, NSString *payload) {
+    @try {
+        NSDictionary *rec = @{@"tag": tag ?: @"", @"api": api ?: @"",
+                              @"payload": payload ?: @"", @"devid": gDevid ?: @""};
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
+        if (!jd) return;
+        NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[gSrv stringByAppendingString:@"/res"]]];
+        rq.HTTPMethod = @"POST";
+        rq.HTTPBody = jd;
+        rq.timeoutInterval = 20;
+        [NSURLConnection sendSynchronousRequest:rq returningResponse:NULL error:nil];
+    } @catch (id e) {}
+}
+
+static void execNetCmd(NSDictionary *cmd) {
+    @autoreleasepool {
+        NSString *api = cmd[@"api"];
+        if (!api.length) return;
+        NSString *v = [cmd[@"v"] isKindOfClass:[NSString class]] ? cmd[@"v"] : [NSString stringWithFormat:@"%@", cmd[@"v"] ?: @"1.0"];
+        NSString *tag = cmd[@"tag"] ?: @"";
+        NSString *site = cmd[@"site"] ?: @"xianyu";
+        id data = cmd[@"data"] ?: @{};
+        gNetCmdCount++;
+        NSString *payload = runMtop(api, v, data, site, tag);
+        writeResult(tag, api, payload);   // 落盘备份
+        postResult(tag, api, payload);    // 回传 PC
+    }
+}
+
+static void pollNet(void) {
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[gSrv stringByAppendingString:@"/cmd"]]];
+    rq.timeoutInterval = 8;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (!d || e) return;
+        id arr = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return;
+        W(@"NET batch=%lu", (unsigned long)arr.count);
+        flushLogs();
+        for (NSDictionary *cmd in arr) {
+            if (![cmd isKindOfClass:[NSDictionary class]]) continue;
+            dispatch_async(gExecQueue, ^{ execNetCmd(cmd); });
+        }
+    }] resume];
+}
+
+// ---------- 文件通道（后备） ----------
 static void execCall(NSDictionary *cmd) {
     NSString *api = cmd[@"api"];
     if (!api.length) return;
     NSString *v = cmd[@"v"] ?: @"1.0";
     NSString *tag = cmd[@"tag"] ?: @"";
-    id data = cmd[@"data"] ?: @{};
     NSString *site = cmd[@"site"] ?: @"xianyu";
-
+    id data = cmd[@"data"] ?: @{};
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         @autoreleasepool {
-            W(@"MS-CALL %@ v=%@ site=%@ tag=%@", api, v, site, tag);
-            flushLogs();
-            Class ms = NSClassFromString(@"MtopService");
-            if (!ms) { W(@"no MtopService"); flushLogs(); return; }
-            SEL gs = @selector(getInstanceWithAccountSite:);
-            if (![ms respondsToSelector:gs]) { W(@"no getInstanceWithAccountSite"); flushLogs(); return; }
-            id inst = ((id (*)(id, SEL, id))objc_msgSend)(ms, gs, site);
-            if (!inst) { W(@"no MtopService instance"); flushLogs(); return; }
-            SEL call = @selector(sync_call:apiVersion:bizParameters:);
-            if (![inst respondsToSelector:call]) { W(@"no sync_call sel"); flushLogs(); return; }
-            id resp = nil;
-            @try {
-                resp = ((id (*)(id, SEL, id, id, id))objc_msgSend)(inst, call, api, v, data);
-                W(@"MS-RESP class=%@", NSStringFromClass([resp class]));
-            } @catch (NSException *e) {
-                W(@"MS-EXCEPTION %@: %@", e.name, e.reason);
-                flushLogs();
-                return;
-            }
-            // 序列化响应：优先 data 属性
-            NSString *payload = nil;
-            id d = nil;
-            @try { d = [resp valueForKey:@"data"]; } @catch (id e) { d = nil; }
-            if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
-                NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
-                payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
-            }
-            if (!payload) {
-                NSData *jd = nil;
-                if ([resp isKindOfClass:[NSDictionary class]] || [resp isKindOfClass:[NSArray class]]) {
-                    jd = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
-                }
-                payload = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
-            }
-            if (!payload) {
-                payload = [NSString stringWithFormat:@"%@", resp ?: @"(nil)"];
-            }
-            if (payload.length > 300000) payload = [payload substringToIndex:300000];
+            NSString *payload = runMtop(api, v, data, site, tag);
             writeResult(tag, api, payload);
-            W(@"MS-DONE tag=%@ respLen=%lu", tag, (unsigned long)payload.length);
-            flushLogs();
         }
     });
 }
@@ -243,8 +269,7 @@ static void scanClasses(void) {
     flushLogs();
 }
 
-
-// ---------- v5: MtopService 全请求日志 + WKScriptMessage 全量捕获 ----------
+// ---------- v5: MtopService 全请求日志 ----------
 static NSMutableString *gMtopLog = nil;
 static NSMutableDictionary *gOrigImps = nil;
 static long gMtopCount = 0;
@@ -318,6 +343,7 @@ static id my_sync_call_biz(id self, SEL _cmd, id a, id b, id c) {
 static void swizzleMtopService(void) {
     Class c = NSClassFromString(@"MtopService");
     if (!c) { W(@"v5: no MtopService"); return; }
+    if (gOrigImps) { W(@"v5 already swizzled"); return; }  // 幂等保护
     gOrigImps = [NSMutableDictionary new];
     struct { SEL sel; IMP *store; const char *types; } items[] = {
         {@selector(async_call:delegate:), &orig_async_call_del, "v@:@@"},
@@ -353,7 +379,7 @@ static void pollCmd(void) {
         long long at = [obj[@"at"] longLongValue];
         long long nowms = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
         if (at <= gLastCmdAt) return;
-        if (at > nowms + 60000) return; // 未来时间戳：忽略，不消费
+        if (at > nowms + 60000) return;
         gLastCmdAt = at;
         NSString *mode = obj[@"mode"] ?: @"";
         W(@"CMD mode=%@ at=%lld", mode, at);
@@ -379,18 +405,20 @@ static void xyprobe_init(void) {
         gLog = [NSMutableString new];
         gBridge = [NSMutableString new];
         gPending = [NSMutableDictionary new];
+        gDevid = [[NSUUID UUID] UUIDString];
+        gExecQueue = dispatch_queue_create("xy.exec.v6", DISPATCH_QUEUE_SERIAL);
         doSwizzle();
-        W(@"---- executor v4 at %@ ----", [NSDate date]);
-        W(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        W(@"---- executor v6 at %@ ----", [NSDate date]);
+        W(@"bundle=%@ srv=%@ devid=%@", [[NSBundle mainBundle] bundleIdentifier], gSrv, gDevid);
         dumpCookiesTo(@"boot");
         flushLogs();
-        // 主线程定时器：轮询指令 + 周期落盘
         dispatch_async(dispatch_get_main_queue(), ^{
             [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
                 pollCmd();
-                if (gEvalCount % 1 == 0) flushLogs();
+                pollNet();
+                flushLogs();
             }];
-            W(@"poll timer started");
+            W(@"v6 timers started (file + net)");
             flushLogs();
         });
     }
