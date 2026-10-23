@@ -432,7 +432,11 @@ static NSData *xySilentWav(void) {
     [d appendBytes:&ba length:2];
     [d appendBytes:&bps length:2];
     put("data", dataSize);
-    [d appendData:[NSMutableData dataWithLength:dataSize]];   // 全 0 = 静音
+    // 不用全 0：填 ±1 LSB（约 -90dB，人耳听不到），避免被系统按“纯静音”判定
+    NSMutableData *pcm = [NSMutableData dataWithLength:dataSize];
+    int16_t *sp = (int16_t *)pcm.mutableBytes;
+    for (uint32_t i = 0; i < dataSize / 2; i++) sp[i] = (i % 2) ? 1 : -1;
+    [d appendData:pcm];
     return d;
 }
 
@@ -452,7 +456,7 @@ static void xyStartKeepAlive(NSString *why) {
         [s setActive:YES error:&e2];
         gKaPlayer = [[AVAudioPlayer alloc] initWithData:xySilentWav() error:nil];
         gKaPlayer.numberOfLoops = -1;
-        gKaPlayer.volume = 0.0;
+        gKaPlayer.volume = 0.05;
         [gKaPlayer prepareToPlay];
         BOOL ok = [gKaPlayer play];
         W(@"v7 keepalive[%@] play=%d playing=%d cat_err=%@ act_err=%@",
