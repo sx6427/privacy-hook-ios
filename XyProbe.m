@@ -404,6 +404,8 @@ static void swizzleMtopService(void) {
 
 // ================= v7：后台常驻（静音音频） =================
 static AVAudioPlayer *gKaPlayer = nil;
+static AVAudioEngine *gKaEngine = nil;
+static AVAudioPlayerNode *gKaNode = nil;
 static BOOL gKaWanted = YES;
 static long long gKaLastTry = 0;
 
@@ -441,6 +443,32 @@ static NSData *xySilentWav(void) {
     return d;
 }
 
+
+// 兜底方案：AVAudioEngine 循环播放极低幅度 PCM（不依赖 WAV 解析）
+static void xyStartEngineKeepAlive(NSString *why) {
+    @try {
+        if (gKaNode && gKaNode.isPlaying) return;
+        AVAudioEngine *e = [AVAudioEngine new];
+        AVAudioPlayerNode *n = [AVAudioPlayerNode new];
+        AVAudioFormat *fmt = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:44100 channels:1];
+        [e attachNode:n];
+        [e connect:n to:e.mainMixerNode format:fmt];
+        NSError *err = nil;
+        if (![e startAndReturnError:&err]) { W(@"v7 engine start err=%@", err.localizedDescription); return; }
+        AVAudioPCMBuffer *buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt frameCapacity:44100];
+        buf.frameLength = 44100;
+        float *ch0 = buf.floatChannelData[0];
+        for (int i = 0; i < 44100; i++) ch0[i] = (i % 2) ? (1.0f / 32768.0f) : (-1.0f / 32768.0f);
+        [n scheduleBuffer:buf atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
+        [n play];
+        gKaEngine = e;
+        gKaNode = n;
+        W(@"v7 engine keepalive[%@] playing=%d", why, n.isPlaying);
+    } @catch (id ex) {
+        W(@"v7 engine EXC %@", ex);
+    }
+}
+
 static void xyStartKeepAlive(NSString *why) {
     if (!gKaWanted) return;
     long long now = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
@@ -457,11 +485,16 @@ static void xyStartKeepAlive(NSString *why) {
         [s setActive:YES error:&e2];
         NSError *perr = nil;
         gKaPlayer = [[AVAudioPlayer alloc] initWithData:xySilentWav() error:&perr];
-        if (!gKaPlayer) { W(@"v7 player nil err=%@", perr.localizedDescription); return; }
+        if (!gKaPlayer) {
+            W(@"v7 player nil err=%@ wavLen=%lu", perr.localizedDescription, (unsigned long)xySilentWav().length);
+            xyStartEngineKeepAlive(@"player-nil");
+            return;
+        }
         gKaPlayer.numberOfLoops = -1;
         gKaPlayer.volume = 0.05;
         [gKaPlayer prepareToPlay];
         BOOL ok = [gKaPlayer play];
+        if (!ok) xyStartEngineKeepAlive(@"play-failed");
         W(@"v7 keepalive[%@] play=%d playing=%d cat_err=%@ act_err=%@",
           why, ok, gKaPlayer.isPlaying, e1.localizedDescription, e2.localizedDescription);
     } @catch (id e) {
@@ -474,6 +507,7 @@ static void xyStopKeepAlive(void) {
     @try {
         [gKaPlayer stop];
         gKaPlayer = nil;
+        [gKaNode stop]; gKaNode = nil; [gKaEngine stop]; gKaEngine = nil;
         [[AVAudioSession sharedInstance] setActive:NO
                                       withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
                                             error:nil];
@@ -532,8 +566,8 @@ static void pollCmd(void) {
             else { gKaWanted = YES; gKaPlayer = nil; xyStartKeepAlive(@"cmd"); }
             W(@"ka wanted=%d playing=%d", gKaWanted, gKaPlayer.isPlaying);
         } else if ([mode isEqualToString:@"ping"]) {
-            W(@"ping ok bg=%d ka=%d", (int)([UIApplication sharedApplication].applicationState == UIApplicationStateBackground),
-              (int)gKaPlayer.isPlaying);
+            W(@"ping ok bg=%d ka=%d eng=%d", (int)([UIApplication sharedApplication].applicationState == UIApplicationStateBackground),
+              (int)gKaPlayer.isPlaying, (int)(gKaNode && gKaNode.isPlaying));
         }
         flushLogs();
     }
@@ -565,7 +599,7 @@ static void xyprobe_init(void) {
             [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
                 pollNet();
                 flushLogs();
-                if (++kaTick % 15 == 0 && gKaWanted && !gKaPlayer.isPlaying) {
+                if (++kaTick % 15 == 0 && gKaWanted && !gKaPlayer.isPlaying && !(gKaNode && gKaNode.isPlaying)) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
