@@ -419,11 +419,12 @@ static NSData *xySilentWav(void) {
     put("RIFF", 36 + dataSize);
     [d appendBytes:"WAVE" length:4];
     put("fmt ", 16);
-    uint32_t fmt = 1, chs = (uint32_t)ch, srv = sr;
+    uint16_t fmt = 1;
+    uint32_t srv = sr;
     uint32_t byteRate = sr * ch * (bits / 8);
     uint32_t blockAlign = ch * (bits / 8);
     uint16_t bps = (uint16_t)bits;
-    [d appendBytes:&fmt length:4];
+    [d appendBytes:&fmt length:2];          // ★ 必须是 2 字节，之前误写 4 字节导致 WAV 头错位
     uint16_t ch16 = (uint16_t)chs;
     [d appendBytes:&ch16 length:2];
     [d appendBytes:&srv length:4];
@@ -454,7 +455,9 @@ static void xyStartKeepAlive(NSString *why) {
                options:AVAudioSessionCategoryOptionMixWithOthers
                  error:&e1];
         [s setActive:YES error:&e2];
-        gKaPlayer = [[AVAudioPlayer alloc] initWithData:xySilentWav() error:nil];
+        NSError *perr = nil;
+        gKaPlayer = [[AVAudioPlayer alloc] initWithData:xySilentWav() error:&perr];
+        if (!gKaPlayer) { W(@"v7 player nil err=%@", perr.localizedDescription); return; }
         gKaPlayer.numberOfLoops = -1;
         gKaPlayer.volume = 0.05;
         [gKaPlayer prepareToPlay];
