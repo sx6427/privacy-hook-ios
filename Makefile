@@ -5,6 +5,7 @@ CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 -fobjc-ar
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=14.0 \
           -dynamiclib -framework Foundation -framework Security \
+          -framework AVFoundation -framework UIKit \
           -install_name @executable_path/XyProbe.dylib \
           -Xlinker -no_fixup_chains
 
