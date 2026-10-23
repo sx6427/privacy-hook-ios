@@ -1,5 +1,5 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v6（网络直连通道）
+//  XyProbe.m — 闲鱼指令执行器 v7（网络直连 + 后台静音保活）
 //
 //  架构：
 //    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
@@ -8,6 +8,8 @@
 //
 #import <Foundation/Foundation.h>
 #import <WebKit/WebKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -399,6 +401,102 @@ static void swizzleMtopService(void) {
     }
 }
 
+
+// ================= v7：后台常驻（静音音频） =================
+static AVAudioPlayer *gKaPlayer = nil;
+static BOOL gKaWanted = YES;
+static long long gKaLastTry = 0;
+
+static NSData *xySilentWav(void) {
+    uint32_t sr = 8000, ch = 1, bits = 16;
+    uint32_t dataSize = sr * ch * (bits / 8);
+    NSMutableData *d = [NSMutableData data];
+    void (^put)(const char *, uint32_t) = ^(const char *tag, uint32_t v) {
+        [d appendBytes:tag length:4];
+        uint32_t le = v;
+        [d appendBytes:&le length:4];
+    };
+    put("RIFF", 36 + dataSize);
+    [d appendBytes:"WAVE" length:4];
+    put("fmt ", 16);
+    uint32_t fmt = 1, chs = (uint32_t)ch, srv = sr;
+    uint32_t byteRate = sr * ch * (bits / 8);
+    uint32_t blockAlign = ch * (bits / 8);
+    uint16_t bps = (uint16_t)bits;
+    [d appendBytes:&fmt length:4];
+    uint16_t ch16 = (uint16_t)chs;
+    [d appendBytes:&ch16 length:2];
+    [d appendBytes:&srv length:4];
+    [d appendBytes:&byteRate length:4];
+    uint16_t ba = (uint16_t)blockAlign;
+    [d appendBytes:&ba length:2];
+    [d appendBytes:&bps length:2];
+    put("data", dataSize);
+    [d appendData:[NSMutableData dataWithLength:dataSize]];   // 全 0 = 静音
+    return d;
+}
+
+static void xyStartKeepAlive(NSString *why) {
+    if (!gKaWanted) return;
+    long long now = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
+    if (gKaPlayer && gKaPlayer.isPlaying) return;
+    if (now - gKaLastTry < 3000) return;      // 3s 内不重复尝试
+    gKaLastTry = now;
+    @try {
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        NSError *e1 = nil, *e2 = nil;
+        [s setCategory:AVAudioSessionCategoryPlayback
+                  mode:AVAudioSessionModeDefault
+               options:AVAudioSessionCategoryOptionMixWithOthers
+                 error:&e1];
+        [s setActive:YES error:&e2];
+        gKaPlayer = [[AVAudioPlayer alloc] initWithData:xySilentWav() error:nil];
+        gKaPlayer.numberOfLoops = -1;
+        gKaPlayer.volume = 0.0;
+        [gKaPlayer prepareToPlay];
+        BOOL ok = [gKaPlayer play];
+        W(@"v7 keepalive[%@] play=%d playing=%d cat_err=%@ act_err=%@",
+          why, ok, gKaPlayer.isPlaying, e1.localizedDescription, e2.localizedDescription);
+    } @catch (id e) {
+        W(@"v7 keepalive EXC %@", e);
+    }
+}
+
+static void xyStopKeepAlive(void) {
+    gKaWanted = NO;
+    @try {
+        [gKaPlayer stop];
+        gKaPlayer = nil;
+        [[AVAudioSession sharedInstance] setActive:NO
+                                      withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                            error:nil];
+    } @catch (id e) {}
+    W(@"v7 keepalive stopped");
+}
+
+static void xyInstallKeepAliveHooks(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) {
+        NSInteger t = [n.userInfo[AVAudioSessionInterruptionTypeKey] integerValue];
+        if (t == AVAudioSessionInterruptionTypeEnded) {
+            gKaPlayer = nil;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ xyStartKeepAlive(@"interruption-end"); });
+        } else {
+            W(@"v7 audio interrupted");
+        }
+    }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) {
+        W(@"v7 entered background -> keepalive");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ xyStartKeepAlive(@"bg"); });
+    }];
+    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) { W(@"v7 entered foreground"); }];
+}
+
 static void pollCmd(void) {
     @autoreleasepool {
         NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
@@ -422,8 +520,13 @@ static void pollCmd(void) {
             scanClasses();
         } else if ([mode isEqualToString:@"cookies"]) {
             dumpCookiesTo(@"cmd");
+        } else if ([mode isEqualToString:@"ka"]) {
+            if (obj[@"on"] && ![obj[@"on"] boolValue]) { xyStopKeepAlive(); }
+            else { gKaWanted = YES; gKaPlayer = nil; xyStartKeepAlive(@"cmd"); }
+            W(@"ka wanted=%d playing=%d", gKaWanted, gKaPlayer.isPlaying);
         } else if ([mode isEqualToString:@"ping"]) {
-            W(@"ping ok");
+            W(@"ping ok bg=%d ka=%d", (int)([UIApplication sharedApplication].applicationState == UIApplicationStateBackground),
+              (int)gKaPlayer.isPlaying);
         }
         flushLogs();
     }
@@ -443,12 +546,23 @@ static void xyprobe_init(void) {
         dumpCookiesTo(@"boot");
         flushLogs();
         dispatch_async(dispatch_get_main_queue(), ^{
-            [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+            xyInstallKeepAliveHooks();
+            xyStartKeepAlive(@"boot");
+            // 文件通道：0.5s 一次，指令响应快
+            [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
                 pollCmd();
-                pollNet();
                 flushLogs();
             }];
-            W(@"v6 timers started (file + net)");
+            // 网络通道 + 保活看门狗：2s 一次（避免请求过密）
+            __block long kaTick = 0;
+            [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+                pollNet();
+                flushLogs();
+                if (++kaTick % 15 == 0 && gKaWanted && !gKaPlayer.isPlaying) {
+                    xyStartKeepAlive(@"watchdog");
+                }
+            }];
+            W(@"v7 timers started (file 0.5s + net 2s + keepalive)");
             flushLogs();
         });
     }
