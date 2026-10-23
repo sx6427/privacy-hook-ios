@@ -425,7 +425,7 @@ static NSData *xySilentWav(void) {
     uint32_t blockAlign = ch * (bits / 8);
     uint16_t bps = (uint16_t)bits;
     [d appendBytes:&fmt length:2];          // ★ 必须是 2 字节，之前误写 4 字节导致 WAV 头错位
-    uint16_t ch16 = (uint16_t)chs;
+    uint16_t ch16 = (uint16_t)ch;
     [d appendBytes:&ch16 length:2];
     [d appendBytes:&srv length:4];
     [d appendBytes:&byteRate length:4];
