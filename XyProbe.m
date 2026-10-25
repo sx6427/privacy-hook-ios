@@ -1,5 +1,5 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v7（网络直连 + 后台静音保活）
+//  XyProbe.m — 闲鱼指令执行器 v7.4（网络直连 + 后台静音保活 + 日志线程安全）
 //
 //  架构：
 //    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
@@ -29,14 +29,38 @@ static dispatch_queue_t gExecQueue = nil;
 static long gNetCmdCount = 0;
 static void swizzleMtopService(void);   // 前向声明（v5 段定义）
 
+static BOOL gLogDirty = NO;
+static double gLastFlush = 0;
+
+// ★ v7.4：日志缓冲区加锁 —— 之前 W()/B() 在 MTOP 回调线程无锁 append，
+//   主线程 flushLogs 同时读取/替换指针，导致 EXC_BAD_ACCESS（Runner 闪退）
+static void wlogAppend(NSString *s, BOOL bridge) {
+    if (!s) return;
+    if (!gLogLock) gLogLock = [NSLock new];
+    [gLogLock lock];
+    NSMutableString *buf = bridge ? gBridge : gLog;
+    if (!buf) {
+        buf = [NSMutableString new];
+        if (bridge) gBridge = buf; else gLog = buf;
+    }
+    [buf appendString:s];
+    [buf appendString:@"\n"];
+    NSUInteger cap = bridge ? 1000000 : 250000;
+    NSUInteger keep = bridge ? 500000 : 120000;
+    if (buf.length > cap) {
+        // 原地删头，绝不换指针（换指针会让正在写盘的线程 use-after-free）
+        [buf deleteCharactersInRange:NSMakeRange(0, keep)];
+    }
+    gLogDirty = YES;
+    [gLogLock unlock];
+}
+
 static void W(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    if (!gLog) gLog = [NSMutableString new];
-    [gLog appendFormat:@"%@\n", s];
-    if (gLog.length > 300000) gLog = [NSMutableString new];
+    wlogAppend(s, NO);
 }
 
 static void B(NSString *fmt, ...) {
@@ -44,9 +68,7 @@ static void B(NSString *fmt, ...) {
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    if (!gBridge) gBridge = [NSMutableString new];
-    [gBridge appendFormat:@"%@\n", s];
-    if (gBridge.length > 2000000) gBridge = [NSMutableString new];
+    wlogAppend(s, YES);
 }
 
 static NSString *docsDir(void) {
@@ -55,10 +77,29 @@ static NSString *docsDir(void) {
 
 static void flushLogs(void) {
     if (!gLogLock) gLogLock = [NSLock new];
+    // 1.5s 内最多写一次盘，避免 0.5s 一次全量重写拖慢主线程
+    double now = [[NSDate date] timeIntervalSince1970];
+    if (now - gLastFlush < 1.5) return;
+    NSString *a = nil, *b = nil;
     [gLogLock lock];
-    [gLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_probe.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [gBridge writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_bridge.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (!gLogDirty) { [gLogLock unlock]; return; }
+    gLogDirty = NO;
+    gLastFlush = now;
+    a = gLog ? [gLog copy] : nil;      // 拷贝在锁内，写盘在锁外
+    b = gBridge ? [gBridge copy] : nil;
     [gLogLock unlock];
+    @try {
+        if (a.length) {
+            [a writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_probe.log"]
+                atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        if (b.length) {
+            [b writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_bridge.log"]
+                atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    } @catch (NSException *e) {
+        // 写盘失败不能把 App 带走
+    }
 }
 
 static void writeResult(NSString *tag, NSString *api, NSString *text) {
@@ -603,7 +644,7 @@ static void xyprobe_init(void) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
-            W(@"v7 timers started (file 0.5s + net 2s + keepalive)");
+            W(@"v7.4 timers started (file 0.5s + net 2s + keepalive + log-lock)");
             flushLogs();
         });
     }
