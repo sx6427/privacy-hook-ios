@@ -1,5 +1,5 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v7.4（网络直连 + 后台静音保活 + 日志线程安全）
+//  XyProbe.m — 闲鱼指令执行器 v7.5（v7.4 修闪退 + 请求参数抓取开关 reqdump）
 //
 //  架构：
 //    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
@@ -30,6 +30,7 @@ static long gNetCmdCount = 0;
 static void swizzleMtopService(void);   // 前向声明（v5 段定义）
 
 static BOOL gLogDirty = NO;
+static BOOL gReqDump = NO;   // 只在排查时打开：把请求对象 description + ivar 全打出来
 static double gLastFlush = 0;
 
 // ★ v7.4：日志缓冲区加锁 —— 之前 W()/B() 在 MTOP 回调线程无锁 append，
@@ -389,6 +390,23 @@ static void logMtopReq(id req) {
             }
         }
         if (pc) free(props);
+        if (gReqDump) {
+            MLOG(@"  DESC = %@", [req description]);
+            unsigned int ic = 0;
+            Ivar *ivs = class_copyIvarList(c, &ic);
+            for (unsigned int i = 0; i < ic; i++) {
+                const char *in = ivar_getName(ivs[i]);
+                NSString *ns = @(in ?: "");
+                if (![ns.lowercaseString containsString:@"api"] &&
+                    ![ns.lowercaseString containsString:@"request"] &&
+                    ![ns.lowercaseString containsString:@"data"]) continue;
+                @try {
+                    id v = object_getIvar(req, ivs[i]);
+                    MLOG(@"  IVAR %@ = %@", ns, v ? [v description] : @"(nil)");
+                } @catch (id e) { MLOG(@"  IVAR %@ = (fail)", ns); }
+            }
+            if (ic) free(ivs);
+        }
     } @catch (id e) {}
 }
 
@@ -598,6 +616,10 @@ static void pollCmd(void) {
             execCall(obj);
         } else if ([mode isEqualToString:@"swizzle"]) {
             swizzleMtopService();
+        } else if ([mode isEqualToString:@"reqdump"]) {
+            gReqDump = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
+            if (gReqDump) swizzleMtopService();
+            W(@"reqdump=%d", gReqDump);
         } else if ([mode isEqualToString:@"scan"]) {
             scanClasses();
         } else if ([mode isEqualToString:@"cookies"]) {
@@ -644,7 +666,7 @@ static void xyprobe_init(void) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
-            W(@"v7.4 timers started (file 0.5s + net 2s + keepalive + log-lock)");
+            W(@"v7.5 timers started (file 0.5s + net 2s + keepalive + log-lock + reqdump)");
             flushLogs();
         });
     }
