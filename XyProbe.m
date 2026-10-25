@@ -1,5 +1,5 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v7.5（v7.4 修闪退 + 请求参数抓取开关 reqdump）
+//  XyProbe.m — 闲鱼指令执行器 v7.6（修闪退 + reqdump + mrequest 里的 api/data）
 //
 //  架构：
 //    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
@@ -406,6 +406,31 @@ static void logMtopReq(id req) {
                 } @catch (id e) { MLOG(@"  IVAR %@ = (fail)", ns); }
             }
             if (ic) free(ivs);
+            // ★ v7.6：api/data 在 mrequest（TBSDKRequest）里，单独挖一层
+            @try {
+                Ivar miv = class_getInstanceVariable(c, "mrequest");
+                id mr = miv ? object_getIvar(req, miv) : nil;
+                if (mr) {
+                    MLOG(@"  MREQ class=%@ desc=%@", NSStringFromClass([mr class]), [mr description]);
+                    unsigned int pc2 = 0;
+                    objc_property_t *p2 = class_copyPropertyList([mr class], &pc2);
+                    for (unsigned int j = 0; j < pc2; j++) {
+                        const char *pn = property_getName(p2[j]);
+                        @try {
+                            id v = [mr valueForKey:@(pn)];
+                            NSString *vs = nil;
+                            if ([v isKindOfClass:[NSString class]]) vs = v;
+                            else if (v) {
+                                NSData *jd = [NSJSONSerialization dataWithJSONObject:v options:0 error:nil];
+                                vs = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : [v description];
+                            }
+                            if (vs.length > 1500) vs = [vs substringToIndex:1500];
+                            MLOG(@"    %@ = %@", @(pn), vs ?: @"(nil)");
+                        } @catch (id e2) { MLOG(@"    %@ = (KVC fail)", @(pn)); }
+                    }
+                    if (pc2) free(p2);
+                }
+            } @catch (id e3) {}
         }
     } @catch (id e) {}
 }
@@ -666,7 +691,7 @@ static void xyprobe_init(void) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
-            W(@"v7.5 timers started (file 0.5s + net 2s + keepalive + log-lock + reqdump)");
+            W(@"v7.6 timers started (file 0.5s + net 2s + keepalive + log-lock + reqdump + mrequest)");
             flushLogs();
         });
     }
