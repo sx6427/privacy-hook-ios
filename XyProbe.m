@@ -1,5 +1,5 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v7.6（修闪退 + reqdump + mrequest 里的 api/data）
+//  XyProbe.m — 闲鱼指令执行器 v7.7（日志批量落盘，修卡顿/闪退）
 //
 //  架构：
 //    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
@@ -46,8 +46,8 @@ static void wlogAppend(NSString *s, BOOL bridge) {
     }
     [buf appendString:s];
     [buf appendString:@"\n"];
-    NSUInteger cap = bridge ? 1000000 : 250000;
-    NSUInteger keep = bridge ? 500000 : 120000;
+    NSUInteger cap = bridge ? 600000 : 120000;
+    NSUInteger keep = bridge ? 300000 : 60000;
     if (buf.length > cap) {
         // 原地删头，绝不换指针（换指针会让正在写盘的线程 use-after-free）
         [buf deleteCharactersInRange:NSMakeRange(0, keep)];
@@ -80,7 +80,7 @@ static void flushLogs(void) {
     if (!gLogLock) gLogLock = [NSLock new];
     // 1.5s 内最多写一次盘，避免 0.5s 一次全量重写拖慢主线程
     double now = [[NSDate date] timeIntervalSince1970];
-    if (now - gLastFlush < 1.5) return;
+    if (now - gLastFlush < 3.0) return;
     NSString *a = nil, *b = nil;
     [gLogLock lock];
     if (!gLogDirty) { [gLogLock unlock]; return; }
@@ -353,6 +353,11 @@ static id (*orig_sync_call)(id, SEL, id);
 static id (*orig_sync_call_v)(id, SEL, id, id);
 static id (*orig_sync_call_biz)(id, SEL, id, id, id);
 
+static BOOL gMtopDirty = NO;
+static double gMtopLastFlush = 0;
+
+// ★ v7.7：以前每写一行日志都把整块（最多 500KB）重写到磁盘，
+//   主线程编码大字符串 → 卡顿 + SIGKILL/崩溃。改成“攒着 + 定时增量落盘”
 static void MLOG(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -363,10 +368,46 @@ static void MLOG(NSString *fmt, ...) {
     @try {
         if (!gMtopLog) gMtopLog = [NSMutableString new];
         [gMtopLog appendFormat:@"%@\n", s];
-        if (gMtopLog.length > 500000) gMtopLog = [NSMutableString new];
-        [gMtopLog writeToFile:[docsDir() stringByAppendingPathComponent:@"xy_mtop.log"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        if (gMtopLog.length > 200000) {
+            [gMtopLog deleteCharactersInRange:NSMakeRange(0, 100000)];   // 原地删头
+        }
+        gMtopDirty = YES;
     } @catch (id e) {}
     [gLogLock unlock];
+}
+
+// 由 2 秒定时器调用：把这段时间的日志追加到文件（不清空历史）
+static void mlogFlush(void) {
+    if (!gLogLock) gLogLock = [NSLock new];
+    double now = [[NSDate date] timeIntervalSince1970];
+    if (now - gMtopLastFlush < 3.0) return;
+    NSString *copy = nil;
+    [gLogLock lock];
+    if (!gMtopDirty) { [gLogLock unlock]; return; }
+    gMtopDirty = NO;
+    gMtopLastFlush = now;
+    copy = gMtopLog ? [gMtopLog copy] : nil;
+    [gMtopLog setString:@""];
+    [gLogLock unlock];
+    if (!copy.length) return;
+    @try {
+        NSString *path = [docsDir() stringByAppendingPathComponent:@"xy_mtop.log"];
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        unsigned long long sz = [attr fileSize];
+        if (sz > 1500000) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+        }
+        NSData *d = [copy dataUsingEncoding:NSUTF8StringEncoding];
+        if (d.length) {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            [fh closeFile];
+        }
+    } @catch (id e) {}
 }
 
 static void logMtopReq(id req) {
@@ -687,11 +728,12 @@ static void xyprobe_init(void) {
             [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
                 pollNet();
                 flushLogs();
+                mlogFlush();
                 if (++kaTick % 15 == 0 && gKaWanted && !gKaPlayer.isPlaying && !(gKaNode && gKaNode.isPlaying)) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
-            W(@"v7.6 timers started (file 0.5s + net 2s + keepalive + log-lock + reqdump + mrequest)");
+            W(@"v7.7 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch)");
             flushLogs();
         });
     }
