@@ -2397,10 +2397,12 @@ static void initPrivacyHook(void) {
         // 不同克隆之间互不相同（服务端无法据此串联）。
         @try {
             g_bootOffset = [getPersistent(@"BdD1.bo", ^{
-                return @((long long)(3600 + arc4random_uniform(6 * 86400)));
+                return [NSString stringWithFormat:@"%lld",
+                        (long long)(3600 + arc4random_uniform(6 * 86400))];
             }) longLongValue];
             g_diskDelta = [getPersistent(@"BdD1.dd", ^{
-                return @((long long)((1 + arc4random_uniform(12)) * 1024LL * 1024LL * 1024LL));
+                return [NSString stringWithFormat:@"%lld",
+                        (long long)((1 + arc4random_uniform(12)) * 1024LL * 1024LL * 1024LL)];
             }) longLongValue];
         } @catch (id e) {}
 
