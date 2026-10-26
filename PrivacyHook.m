@@ -110,6 +110,24 @@
 //              新增诊断 KC-IDENTITY-SYNTH 便于下轮核对
 //           2) mtFakeDeviceUUID 前缀不再硬编码原版的 011F，改随机 4 位 hex
 //              （同前缀 = 给服务端留一个「同批次」聚类锚点）
+//   v77   ★ 设备聚类信号封堵（2026-10-26，修「隔天又被检测到」）★
+//         实测时间线：v72 的 D10 于 9-21 下单成功，**隔天即被拦**。
+//         新身份第一天干净 → 说明服务端过夜后把该克隆关联回了同一台
+//         物理机。v72 已堵 DeviceCheck / 剪贴板 / WiFi BSSID / keychain
+//         关键字，剩下四条「同机完全一致且跨天不变」的信号此前全裸奔：
+//           1) kern.boottime / -[NSProcessInfo systemUptime]
+//              开机时刻精确到秒，同机所有 App 完全相同 → 最强聚类锚点
+//           2) -[NSProcessInfo hostName]
+//              真实设备名（如「张三的iPhone」），v70 只改了 UIDevice.name
+//           3) 磁盘总容量 NSFileSystemSize
+//              硬件属性，同机一致；按克隆偏移 1~12GB
+//           4) LSApplicationWorkspace 枚举
+//              私有 API 能列出本机全部 bundle id → BdD1…BdD10 / BdE1…
+//              / BdT1… 一览无余 = 多开实锤 → 整机拉黑（连原版）
+//         修法：1~3 每克隆持久化随机值（同克隆重启稳定、跨克隆不同）；
+//              4 枚举结果剔除所有 com.baidu.BaiduMobile.<后缀>，保留官方版。
+//         1 与 systemUptime 同步加偏移，保证 boottime/uptime 互相自洽。
+//
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -210,6 +228,24 @@ static const char *FAKE_PRODUCT   = "iPhone15,3";
 static const char *FAKE_MODELNUM  = "MQ9G3CH/A";         // 14 Pro Max 国行型号
 static const char *FAKE_UA_SUFFIX = "iPhone OS 17_6_1";  // UA 中的系统版本
 static const uint64_t FAKE_MEMSIZE = 6ULL * 1024 * 1024 * 1024; // 6GB
+
+// ============================================================
+// ★ v77 设备聚类信号（每克隆唯一，持久化）★
+//
+// 背景：v72 的 D10 在 9-21 下单成功，隔天又被拦 —— 新身份第一天干净、
+// 过夜后被服务端关联回同一台物理机。说明还有「稳定设备信号」在持续
+// 上报。以下三项都是同机所有 App 完全一致、且跨天不变的强聚类信号：
+//   · kern.boottime / systemUptime —— 精确到秒的开机时刻
+//   · 磁盘总容量                   —— 硬件属性
+//   · NSProcessInfo.hostName       —— 真实设备名
+// 加上「已安装应用枚举」（见 constructor 2f 段，能直接列出所有 BdDx/BdEx
+// 克隆 → 多开实锤），这四条是 v72 之后最可能被风控拿来串联设备的通道。
+//
+// 两个偏移量在构造函数最早期（装任何 hook 之前）算好，避免递归。
+// ============================================================
+static long long g_bootOffset = 0;   // 秒：伪造「本克隆专属开机时刻」的偏移
+static long long g_diskDelta  = 0;   // 字节：伪造磁盘总容量的偏移
+static BOOL      g_appsDiagLogged = NO;
 
 // ============================================================
 // fishhook 原函数指针
@@ -603,6 +639,24 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         }
         // kern.osproductversion / kern.osversion / kern.osrelease /
         // hw.memsize 全部透传真值 —— 与 12 Pro Max 人格自洽（6GB/同系统区间）
+
+        // v77: kern.boottime ★设备聚类信号★
+        // 同一台机器上所有 App / 所有克隆读到的开机时刻精确到秒完全相同，
+        // 是风控串联「这些包跑在同一台物理机」最省事的锚点。给每克隆一个
+        // 持久化偏移（1 小时 ~ 6 天），并与 -[NSProcessInfo systemUptime]
+        // 同步加同样偏移，保证两条通道互相自洽（uptime = now - boottime）。
+        if (name && strcmp(name, "kern.boottime") == 0 &&
+            g_bootOffset > 0 && oldp && oldlenp) {
+            struct timeval tv;
+            size_t sz = sizeof(tv);
+            if (orig_sysctlbyname(name, &tv, &sz, NULL, 0) == 0) {
+                tv.tv_sec -= (time_t)g_bootOffset;
+                size_t n = (*oldlenp < sizeof(tv)) ? *oldlenp : sizeof(tv);
+                memcpy(oldp, &tv, n);
+                *oldlenp = n;
+                return 0;
+            }
+        }
     }
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
@@ -2274,6 +2328,48 @@ static void diagDumpConnRequest(NSURLRequest *req, NSString *tag) {
 }
 
 // ============================================================
+// v77: 已安装应用枚举过滤 ★多开检测核心★
+//
+// 百度主二进制引用了 LSApplicationWorkspace（私有框架 MobileCoreServices）。
+// 通过 -allInstalledApplications 可以拿到本机**全部** App 的 bundle id ——
+// 我们的克隆是 com.baidu.BaiduMobile.BdD1 … .BdD10 / .BdE1 … .BdE10 /
+// .BdT1 …，一眼就是「同一台机装了 20+ 个百度多开」。
+// 服务端拿到这份名单 → 直接判定设备多开 → 整机拉黑（连原版一起）。
+//
+// 这个信号完美解释「新克隆第一天能下单、隔天全灭」：名单是静态的，
+// 首次上报可能随日活/结算批次走，过夜后才被风控消化。
+//
+// 处理：枚举结果里剔掉所有 com.baidu.BaiduMobile.<后缀> 克隆，
+// 只保留官方原版 com.baidu.BaiduMobile（如果装了）与系统 App。
+// 不伪造 bundleIdentifier 本身，避免 v60 那种 NSBundle 递归风险。
+// ============================================================
+static BOOL isOurCloneBundleID(NSString *bid) {
+    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) return NO;
+    if ([bid isEqualToString:@"com.baidu.BaiduMobile"]) return NO;   // 官方原版保留
+    return [bid hasPrefix:@"com.baidu.BaiduMobile."];
+}
+
+static NSArray *filterCloneApps(NSArray *arr) {
+    if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return arr;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    for (id app in arr) {
+        NSString *bid = nil;
+        @try { bid = [app valueForKey:@"bundleIdentifier"]; } @catch (id e) {}
+        if (isOurCloneBundleID(bid)) continue;
+        [out addObject:app];
+    }
+    if (!g_appsDiagLogged) {
+        g_appsDiagLogged = YES;
+        @try {
+            diagAppend([NSString stringWithFormat:
+                @"\n[APPS] installed=%lu afterFilter=%lu (clone entries hidden)\n",
+                (unsigned long)arr.count, (unsigned long)out.count]);
+        } @catch (id e) {}
+    }
+    return (out.count == arr.count) ? arr : out;
+}
+
+// ============================================================
 // Constructor — v58
 // ============================================================
 // v72: UIPasteboard 私有化 —— 保存 pasteboardWithNamespace: 原始 IMP + 防自递归标记
@@ -2294,6 +2390,19 @@ static void initPrivacyHook(void) {
         //      NSBundle 读到的就是官方包名了，出口消毒必须用这个快照值。
         g_cloneBundleID = [realBundleIdentifier() copy];
         (void)cloneTag();
+
+        // ---- 0b. v77: 设备聚类偏移量（必须在装 hook 之前算好）----
+        // 每个克隆一组持久化随机值：开机时刻偏移 + 磁盘容量偏移。
+        // 同克隆重启/升级都是同一组值（伪造的「设备」保持稳定）；
+        // 不同克隆之间互不相同（服务端无法据此串联）。
+        @try {
+            g_bootOffset = [getPersistent(@"BdD1.bo", ^{
+                return @((long long)(3600 + arc4random_uniform(6 * 86400)));
+            }) longLongValue];
+            g_diskDelta = [getPersistent(@"BdD1.dd", ^{
+                return @((long long)((1 + arc4random_uniform(12)) * 1024LL * 1024LL * 1024LL));
+            }) longLongValue];
+        } @catch (id e) {}
 
         // ---- 1. v59: 首启只清 Cookie ----
         // ★ 教训：此前这里 SecItemDelete 删「所有类别」的 keychain 项，
@@ -2407,6 +2516,90 @@ static void initPrivacyHook(void) {
                         return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdD1.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3a-2. v77: 设备聚类信号 ★P0★ ----
+        // 四条同机完全一致、跨天稳定的信号，v72 之前一条都没堵：
+        //   1) systemUptime / kern.boottime —— 开机时刻精确到秒
+        //   2) NSProcessInfo.hostName       —— 真实设备名
+        //   3) 磁盘总容量                   —— 硬件属性
+        //   4) 已安装 App 枚举              —— 能直接列出所有 BdDx/BdEx 克隆
+        @try {
+            // 1) + 2) NSProcessInfo
+            Class pic = objc_getClass("NSProcessInfo");
+            if (pic) {
+                Method um = class_getInstanceMethod(pic, @selector(systemUptime));
+                if (um) {
+                    IMP ou = method_getImplementation(um);
+                    IMP iu = imp_implementationWithBlock(^NSTimeInterval(id s) {
+                        NSTimeInterval t = ((NSTimeInterval (*)(id, SEL))ou)(s, @selector(systemUptime));
+                        return t + (NSTimeInterval)g_bootOffset;
+                    });
+                    class_replaceMethod(pic, @selector(systemUptime), iu, method_getTypeEncoding(um));
+                }
+                Method hm = class_getInstanceMethod(pic, @selector(hostName));
+                if (hm) {
+                    IMP ih = imp_implementationWithBlock(^NSString *(id s) {
+                        NSString *n = getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
+                        return n ?: @"iPhone";
+                    });
+                    class_replaceMethod(pic, @selector(hostName), ih, method_getTypeEncoding(hm));
+                }
+            }
+
+            // 3) 磁盘总容量（只改总量，不动可用空间 —— 避免影响 App 的空间判断）
+            Class fmc = objc_getClass("NSFileManager");
+            SEL fsel = @selector(attributesOfFileSystemForPath:error:);
+            Method fmm = class_getInstanceMethod(fmc, fsel);
+            if (fmm) {
+                IMP of = method_getImplementation(fmm);
+                IMP iff = imp_implementationWithBlock(^NSDictionary *(id s, NSString *path, NSError **err) {
+                    NSDictionary *d = ((NSDictionary *(*)(id, SEL, NSString *, NSError **))of)(s, fsel, path, err);
+                    if (!d || g_diskDelta <= 0) return d;
+                    NSNumber *sz = d[@"NSFileSystemSize"];
+                    if (![sz isKindOfClass:[NSNumber class]]) return d;
+                    long long nv = [sz longLongValue] - g_diskDelta;
+                    if (nv <= 0) return d;
+                    NSMutableDictionary *md = [d mutableCopy];
+                    md[@"NSFileSystemSize"] = @(nv);
+                    return md;
+                });
+                class_replaceMethod(fmc, fsel, iff, method_getTypeEncoding(fmm));
+            }
+
+            // 4) 已安装 App 枚举 —— 剔除所有 com.baidu.BaiduMobile.<克隆后缀>
+            Class lsw = objc_getClass("LSApplicationWorkspace");
+            if (!lsw) {
+                // 构造函数执行时该私有类可能尚未加载；MobileCoreServices 是
+                // 百度自己也会用的系统私有框架，主动加载不构成异常特征。
+                dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+                lsw = objc_getClass("LSApplicationWorkspace");
+            }
+            if (lsw) {
+                for (NSString *sn in @[@"allInstalledApplications",
+                                       @"allApplications",
+                                       @"installedApplications"]) {
+                    SEL sl = NSSelectorFromString(sn);
+                    Method m = class_getInstanceMethod(lsw, sl);
+                    if (!m) continue;
+                    IMP o = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSArray *(id s) {
+                        NSArray *a = ((NSArray *(*)(id, SEL))o)(s, sl);
+                        return filterCloneApps(a);
+                    });
+                    class_replaceMethod(lsw, sl, imp, method_getTypeEncoding(m));
+                }
+                SEL qs = NSSelectorFromString(@"applicationsForBundleIdentifier:");
+                Method qm = class_getInstanceMethod(lsw, qs);
+                if (qm) {
+                    IMP oq = method_getImplementation(qm);
+                    IMP impq = imp_implementationWithBlock(^NSArray *(id s, NSString *bid) {
+                        if (isOurCloneBundleID(bid)) return @[];
+                        return ((NSArray *(*)(id, SEL, NSString *))oq)(s, qs, bid);
+                    });
+                    class_replaceMethod(lsw, qs, impq, method_getTypeEncoding(qm));
                 }
             }
         } @catch (id e) {}
