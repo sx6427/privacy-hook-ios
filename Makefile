@@ -14,8 +14,7 @@
 
 DYLIB       = PrivacyHook.dylib       # 美团版（CI 产物）
 DYLIB_BAIDU = PrivacyHookBaidu.dylib  # 百度版
-# [TEMP-DFPHOOK] 构建完成后由本脚本自动还原
-SRC   = DfpHook.m
+SRC   = PrivacyHook.m fishhook.c
 
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
@@ -34,7 +33,7 @@ all: $(DYLIB) $(DYLIB_BAIDU)
 # 美团多开：MT_CLONE=1 禁用百度专属 hook（WKWebView UA / NSMutableURLRequest UA 补段等）
 # 内嵌名约定为 MtKit.dylib（镜像隐藏表按 MT_CLONE 同步切换）
 $(DYLIB): $(SRC)
-	clang $(CFLAGS) -DMT_CLONE=1 $(LDFLAGS) -o $@ $^
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@echo "=== [MT] Patching LC_BUILD_VERSION ==="
 	vtool -set-build-version ios 14.0 17.0 -output $@.tmp $@ && mv $@.tmp $@
 	@echo "=== [MT] Verifying ==="
