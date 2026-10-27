@@ -707,7 +707,8 @@ static void xyOpenNext(double gap) {
     NSString *u = gOpenQueue.firstObject;
     [gOpenQueue removeObjectAtIndex:0];
     BOOL ok = xyOpenOne(u);
-    W(@"openurl %@ ok=%d left=%lu", [u scheme], (int)ok, (unsigned long)gOpenQueue.count);
+    W(@"openurl %@ ok=%d left=%lu", [u substringToIndex:MIN((NSUInteger)28, u.length)],
+      (int)ok, (unsigned long)gOpenQueue.count);
     flushLogs();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ xyOpenNext(gap); });
