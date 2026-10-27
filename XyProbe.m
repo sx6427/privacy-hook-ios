@@ -1,5 +1,5 @@
 //
-//  XyProbe.m — 闲鱼指令执行器 v7.7（日志批量落盘，修卡顿/闪退）
+//  XyProbe.m — 闲鱼指令执行器 v7.8（新增 openurl 批量跳转）
 //
 //  架构：
 //    PC(cmd_server.py :8081)  <--HTTP-->  dylib（TrollFools 注入，常驻闲鱼进程）
@@ -663,6 +663,56 @@ static void xyInstallKeepAliveHooks(void) {
                 usingBlock:^(NSNotification *n) { W(@"v7 entered foreground"); }];
 }
 
+// ★ v7.8：批量跳转（二三方跳转任务用）。
+//   走 LSApplicationWorkspace 私有 API，不受"必须前台"限制；
+//   批量时每隔 gap 秒自动换下一个 App。
+static NSMutableArray *gOpenQueue = nil;
+
+@interface LSApplicationWorkspace : NSObject
++ (instancetype)defaultWorkspace;
+- (BOOL)openURL:(NSURL *)url;
+- (BOOL)openSensitiveURL:(NSURL *)url withOptions:(NSDictionary *)options;
+@end
+
+static BOOL xyOpenOne(NSString *us) {
+    NSURL *u = [NSURL URLWithString:us];
+    if (!u) return NO;
+    BOOL ok = NO;
+    @try {
+        Class c = NSClassFromString(@"LSApplicationWorkspace");
+        id ws = c ? [c performSelector:@selector(defaultWorkspace)] : nil;
+        if (ws) {
+            if ([ws respondsToSelector:@selector(openSensitiveURL:withOptions:)])
+                ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, @selector(openSensitiveURL:withOptions:), u, @{});
+            else if ([ws respondsToSelector:@selector(openURL:)])
+                ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, @selector(openURL:), u);
+        }
+    } @catch (id e) {}
+    if (!ok) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+        });
+        return NO;
+    }
+    return YES;
+}
+
+static void xyOpenNext(double gap) {
+    if (!gOpenQueue || gOpenQueue.count == 0) {
+        W(@"openurl queue done");
+        gOpenQueue = nil;
+        flushLogs();
+        return;
+    }
+    NSString *u = gOpenQueue.firstObject;
+    [gOpenQueue removeObjectAtIndex:0];
+    BOOL ok = xyOpenOne(u);
+    W(@"openurl %@ ok=%d left=%lu", [u scheme], (int)ok, (unsigned long)gOpenQueue.count);
+    flushLogs();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ xyOpenNext(gap); });
+}
+
 static void pollCmd(void) {
     @autoreleasepool {
         NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
@@ -694,6 +744,19 @@ static void pollCmd(void) {
             if (obj[@"on"] && ![obj[@"on"] boolValue]) { xyStopKeepAlive(); }
             else { gKaWanted = YES; gKaPlayer = nil; xyStartKeepAlive(@"cmd"); }
             W(@"ka wanted=%d playing=%d", gKaWanted, gKaPlayer.isPlaying);
+        } else if ([mode isEqualToString:@"openurl"]) {
+            NSArray *us = obj[@"urls"];
+            id gv = obj[@"gap"];
+            double gap = gv ? [gv doubleValue] : 14.0;
+            if (gap < 5) gap = 5;
+            gOpenQueue = [NSMutableArray array];
+            for (id x in us) {
+                if ([x isKindOfClass:[NSString class]] && [(NSString *)x length] > 6)
+                    [gOpenQueue addObject:x];
+            }
+            W(@"openurl n=%lu gap=%.0f fg=%d", (unsigned long)gOpenQueue.count, gap,
+              (int)([UIApplication sharedApplication].applicationState == UIApplicationStateActive));
+            xyOpenNext(gap);
         } else if ([mode isEqualToString:@"ping"]) {
             W(@"ping ok bg=%d ka=%d eng=%d", (int)([UIApplication sharedApplication].applicationState == UIApplicationStateBackground),
               (int)gKaPlayer.isPlaying, (int)(gKaNode && gKaNode.isPlaying));
@@ -733,7 +796,7 @@ static void xyprobe_init(void) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
-            W(@"v7.7 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch)");
+            W(@"v7.8 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl)");
             flushLogs();
         });
     }
