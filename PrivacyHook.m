@@ -238,7 +238,27 @@ static BOOL g_inUDHook = NO;
 //   实测已证明百度风控认 cuid 不认硬件指纹（D1 与原版同机均可下单）。
 // 下方 FAKE_* 常量仅被未启用的 uname/sysctl hook 引用，保留备查。
 // ============================================================
-static const char *FAKE_MACHINE   = "iPhone13,4";        // v71: 12 Pro Max —— 与真机 13 Pro Max 同屏 428×926/1284×2778、同 6GB 内存，透传值零矛盾
+// ------------------------------------------------------------
+// ★ v80：三个「机型」字段必须分开，不能共用一个字符串 ★
+//
+// 真机实测（v79 PROFILE，iPhone 13 Pro Max / iOS 16.1.2）：
+//   sysctlbyname("hw.machine") = "iphone14,3"   ← 全小写
+//   sysctlbyname("hw.model")   = "D64AP"        ← 主板代号，6 字符
+//   MGCopyAnswer("ProductType")= "iPhone14,3"   ← 大写 I
+//
+// v71~v79 把 hw.machine / hw.model / HardwareModel 全部回 FAKE_MACHINE
+// （"iPhone13,4"），于是：
+//   · hw.model 返回一台真机绝不会出现的值（真机此处永远是主板代号）
+//   · hw.machine 大小写也与真机不符
+// 任何读到一次 hw.model 的代码都能 100% 判定「设备信息被篡改」。
+// 这不是「检测到本机」，是「检测到你在伪装」，比不伪装更糟。
+//
+// 人格仍沿用 iPhone13,4（12 Pro Max）：与真机 13 Pro Max 同为
+// 1284×2778 / 6GB / 6 核，屏幕与内存零矛盾（v71 选它的原意）。
+// ------------------------------------------------------------
+static const char *FAKE_MACHINE    = "iPhone13,4";       // MobileGestalt ProductType（真机此处大写）
+static const char *FAKE_MACHINE_LC = "iphone13,4";       // sysctl hw.machine / uname.machine（真机全小写）
+static const char *FAKE_HWMODEL    = "D54pAP";           // hw.model / HardwareModel（12 Pro Max 主板代号）
 static const char *FAKE_OSVER     = "17.6.1";            // 系统版本
 static const char *FAKE_DARWIN    = "23.6.0";            // 对应 Darwin 内核版本
 static const char *FAKE_PRODUCT   = "iPhone15,3";
@@ -665,9 +685,12 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         //      与真机 13 Pro Max 同屏 1284×2778 同 6GB）—— v70 用 iPhone13,2
         //      被农场识破：请求里 cua@1284_2778/statusbar-height 等真屏幕参数
         //      与 iPhone12 的 1170×2532 矛盾，物理不存在的组合。
-        if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
-            return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
-        }
+        // v80 ★P0★ hw.machine 与 hw.model 必须分开返回 —— 见文件头三个常量。
+        //   v71~v79 两者共用 FAKE_MACHINE，导致 hw.model = "iPhone13,4"，
+        //   而真机该字段恒为主板代号（本例 D64AP）。这是格式级硬伤：
+        //   不是「像不像 12 Pro Max」，而是「这个值在 iOS 上不可能存在」。
+        if (strcmp(name, "hw.machine") == 0) return hook_return_cstr(FAKE_MACHINE_LC, oldp, oldlenp);
+        if (strcmp(name, "hw.model")   == 0) return hook_return_cstr(FAKE_HWMODEL,    oldp, oldlenp);
         // kern.osproductversion / kern.osversion / kern.osrelease /
         // hw.memsize 全部透传真值 —— 与 12 Pro Max 人格自洽（6GB/同系统区间）
 
@@ -728,8 +751,9 @@ static int hook_uname(struct utsname *u) {
     // v70: 只覆盖 nodename（防真实设备名泄漏）和 machine（机型人格）。
     // sysname/release/version 保留真实值 —— 与 sysctlbyname 的
     // kern.osrelease（透传真值）保持自洽，不能再用写死的 FAKE_DARWIN。
-    strlcpy(u->nodename, "iPhone",      sizeof(u->nodename));
-    strlcpy(u->machine,  FAKE_MACHINE,  sizeof(u->machine));
+    strlcpy(u->nodename, "iPhone",          sizeof(u->nodename));
+    // v80: 跟随真机格式（真机 uname/sysctl 均为全小写 iphone14,3）
+    strlcpy(u->machine,  FAKE_MACHINE_LC,   sizeof(u->machine));
     return 0;
 }
 
@@ -749,9 +773,10 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
         return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     }
     const int a = name[0], b = name[1];
-    if (a == 6 && (b == 1 || b == 2)) {          // HW_MACHINE / HW_MODEL
-        return hook_return_cstr(FAKE_MACHINE, oldp, oldlenp);
-    }
+    // v80: 与 sysctlbyname 严格同口径 —— HW_MACHINE(1) 小写、
+    //      HW_MODEL(2) 主板代号。两者此前共用 FAKE_MACHINE 是同一处硬伤。
+    if (a == 6 && b == 1) return hook_return_cstr(FAKE_MACHINE_LC, oldp, oldlenp);  // HW_MACHINE
+    if (a == 6 && b == 2) return hook_return_cstr(FAKE_HWMODEL,    oldp, oldlenp);  // HW_MODEL
     if (a == 1) {                                 // CTL_KERN
         if (b == 1)  return hook_return_cstr("Darwin",      oldp, oldlenp);
         if (b == 2)  return hook_return_cstr(FAKE_DARWIN,   oldp, oldlenp);
@@ -839,11 +864,13 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_MACHINE];
         }
-        // v70: PhysicalMachineModel（硬件板型号）同样归人格，防止与 machine 矛盾
+        // v80 ★P0★ 主板代号字段 → D54pAP。此前与 ProductType 共用
+        //   "iPhone13,4"，而 MobileGestalt 这两个键在真机上恒为主板代号
+        //   （真机实测 HardwareModel 与 sysctl hw.model 同为 D64AP）。
         if (CFStringCompare(key, CFSTR("PhysicalMachineModel"), 0) == 0 ||
             CFStringCompare(key, CFSTR("HardwareModel"), 0) == 0) {
             g_inMGHook = NO;
-            return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_MACHINE];
+            return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_HWMODEL];
         }
         // ---- v58: ProductType / ModelNumber / ProductVersion / BuildVersion
         //      不再伪造 —— 硬件人格跟真机，避免「XS 假报 Pro Max」的矛盾。
@@ -3369,7 +3396,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v79 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v80 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -3380,8 +3407,41 @@ static void initPrivacyHook(void) {
                     [m appendFormat:@"  %-30s r=%d sz=%2zu hex=%@\n", pk[i], r, sz, hex];
                 }
                 [m appendFormat:@"  GPU_REAL     = %@\n", g_realGPUName ?: @"(null)"];
-                [m appendFormat:@"  FAKE_MACHINE = %s\n", FAKE_MACHINE];
+                [m appendFormat:@"  FAKE_MACHINE = %s (MG ProductType)\n", FAKE_MACHINE];
+                [m appendFormat:@"  FAKE_MACH_LC = %s (sysctl/uname)\n", FAKE_MACHINE_LC];
+                [m appendFormat:@"  FAKE_HWMODEL = %s (board)\n", FAKE_HWMODEL];
                 [m appendFormat:@"  bootOffset   = %lld s\n", g_bootOffset];
+
+                // v80: 真机 MobileGestalt 各字段原始值 —— 用 orig 指针绕过本 hook，
+                //   用来确认 ProductType / HardwareModel 在真机上的真实格式，
+                //   下一版按真机格式对齐（这三个键历史上被混用过）。
+                if (orig_MGCopyAnswer) {
+                    NSArray *mgk = @[@"ProductType", @"HardwareModel",
+                                     @"PhysicalMachineModel", @"ProductVersion",
+                                     @"BuildVersion", @"DeviceName",
+                                     @"UniqueDeviceID", @"SerialNumber"];
+                    for (NSString *k in mgk) {
+                        @try {
+                            CFTypeRef v = orig_MGCopyAnswer((__bridge CFStringRef)k, NULL);
+                            if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+                                [m appendFormat:@"  MG %-20@ = %@\n", k, (__bridge NSString *)v];
+                            } else {
+                                [m appendFormat:@"  MG %-20@ = (non-string/null)\n", k];
+                            }
+                        } @catch (id e2) {}
+                    }
+                }
+                // v80: uname 四字段真值 —— 确认 nodename/machine 的真机格式与大小写
+                if (orig_uname) {
+                    struct utsname uu;
+                    memset(&uu, 0, sizeof(uu));
+                    if (orig_uname(&uu) == 0) {
+                        [m appendFormat:@"  uname sysname  = %s\n", uu.sysname];
+                        [m appendFormat:@"  uname nodename = %s\n", uu.nodename];
+                        [m appendFormat:@"  uname release  = %s\n", uu.release];
+                        [m appendFormat:@"  uname machine  = %s\n", uu.machine];
+                    }
+                }
                 diagAppend(m);
             } @catch (id e) {}
 
