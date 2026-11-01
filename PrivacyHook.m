@@ -262,6 +262,7 @@ static const uint64_t FAKE_MEMSIZE = 6ULL * 1024 * 1024 * 1024; // 6GB
 // ============================================================
 static long long g_bootOffset = 0;   // 秒：伪造「本克隆专属开机时刻」的偏移
 static long long g_diskDelta  = 0;   // 字节：伪造磁盘总容量的偏移
+static NSString *g_realGPUName = nil; // v79: 真机 Metal 设备名（伪装前抓取，供诊断）
 static BOOL      g_appsDiagLogged = NO;
 
 // ============================================================
@@ -642,6 +643,18 @@ static int hook_return_cstr(const char *val, void *oldp, size_t *oldlenp) {
     return 0;
 }
 
+// v79: 整型 sysctl 返回（hw.optional.arm.FEAT_* / hw.ncpu 等均为 int）
+static int hook_return_int(int val, void *oldp, size_t *oldlenp) {
+    size_t need = sizeof(int);
+    if (oldlenp) {
+        if (oldp && *oldlenp >= need) {
+            memcpy(oldp, &val, need);
+        }
+        *oldlenp = need;
+    }
+    return 0;
+}
+
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name) {
         // 序列号/UUID 清空（应用本来无权限，返回空不算异常）
@@ -657,6 +670,15 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         }
         // kern.osproductversion / kern.osversion / kern.osrelease /
         // hw.memsize 全部透传真值 —— 与 12 Pro Max 人格自洽（6GB/同系统区间）
+
+        // ★ v79: ARM 特性位 —— 直接把 SoC 世代写在脸上 ★
+        // 实证：主二进制字符串池里有 hw.optional.arm.FEAT_DotProd /
+        //       hw.optional.arm.FEAT_I8MM（TalosPro 没有，主二进制有）。
+        // A14（iPhone13,4 = 12 Pro Max 人格）不支持 I8MM；真机是 A15，支持。
+        // 于是同一台机器上报：机型 iPhone13,4（A14）+ 特性位 I8MM=1（A15）
+        // —— 又是「一个指标两个值」。这两条必须跟人格走。
+        if (strcmp(name, "hw.optional.arm.FEAT_I8MM") == 0)    return hook_return_int(0, oldp, oldlenp);
+        if (strcmp(name, "hw.optional.arm.FEAT_DotProd") == 0) return hook_return_int(1, oldp, oldlenp);
 
         // v77: kern.boottime ★设备聚类信号★
         // 同一台机器上所有 App / 所有克隆读到的开机时刻精确到秒完全相同，
@@ -2772,6 +2794,32 @@ static void initPrivacyHook(void) {
         } @catch (id e) {}
 #endif // !MT_CLONE
 
+        // ---- 3d. v79: Metal 设备名 —— SoC 世代的第二条硬证据 ----
+        // 实证：主二进制导入 _MTLCreateSystemDefaultDevice，渲染框架 TalosPro
+        //       全程走 Metal。真机 [MTLDevice name] 返回 "Apple A15 GPU"，
+        //       而机型人格是 iPhone13,4（A14）—— 机型说 A14、GPU 说 A15，
+        //       和 v77 那个「磁盘两条通道两个值」是同一类自伤。
+        // 做法：拿到默认设备后，把它所属具体类（AGX*Device）的 -name 改成
+        //       与人格一致的值。用 dlsym 取函数，不引入 Metal 链接依赖。
+        @try {
+            typedef id (*CreateDevFn)(void);
+            CreateDevFn createDev = (CreateDevFn)dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+            if (createDev) {
+                id dev = createDev();
+                if (dev && [dev respondsToSelector:@selector(name)]) {
+                    g_realGPUName = [[dev name] copy];
+                    Class devCls = object_getClass(dev);
+                    Method nm = class_getInstanceMethod(devCls, @selector(name));
+                    if (nm) {
+                        IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                            return @"Apple A14 GPU";
+                        });
+                        class_replaceMethod(devCls, @selector(name), imp, method_getTypeEncoding(nm));
+                    }
+                }
+            }
+        } @catch (id e) {}
+
         // ---- 4. NSUserDefaults hooks — 设备 ID 伪造 + v64 按键精准隔离 ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
@@ -3304,6 +3352,38 @@ static void initPrivacyHook(void) {
 
             // 7b. 注册 dyld 回调（动态加载的框架也覆盖，用全局 C 函数）
             _dyld_register_func_for_add_image(hook_new_image);
+
+            // ---- 8. v79: 真机画像落盘（把「哪一条读到本机」变成可核对的数据）----
+            // 目的不是改，而是记：真机在每条通道上的原始值到底是什么。
+            // 有了这张表才能判断「人格 / 特性位 / GPU / 开机时刻」是否真自洽，
+            // 而不是继续靠猜。
+            @try {
+                static const char *pk[] = {
+                    "hw.machine", "hw.model", "hw.cputype", "hw.cpusubtype",
+                    "hw.memsize", "hw.ncpu", "hw.physicalcpu",
+                    "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_I8MM",
+                    "kern.osversion", "kern.boottime", "kern.hostname"
+                };
+                int (*realSysctl)(const char *, void *, size_t *, void *, size_t) =
+                    orig_sysctlbyname ? orig_sysctlbyname
+                                      : (int (*)(const char *, void *, size_t *, void *, size_t))
+                                        dlsym(RTLD_DEFAULT, "sysctlbyname");
+                NSMutableString *m = [NSMutableString stringWithFormat:
+                    @"\n===== v79 PROFILE %@ =====\n", [NSDate date]];
+                for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
+                    unsigned char buf[256];
+                    memset(buf, 0, sizeof(buf));
+                    size_t sz = sizeof(buf);
+                    int r = realSysctl ? realSysctl(pk[i], buf, &sz, NULL, 0) : -1;
+                    NSMutableString *hex = [NSMutableString string];
+                    for (size_t k = 0; k < sz && k < 24; k++) [hex appendFormat:@"%02x", buf[k]];
+                    [m appendFormat:@"  %-30s r=%d sz=%2zu hex=%@\n", pk[i], r, sz, hex];
+                }
+                [m appendFormat:@"  GPU_REAL     = %@\n", g_realGPUName ?: @"(null)"];
+                [m appendFormat:@"  FAKE_MACHINE = %s\n", FAKE_MACHINE];
+                [m appendFormat:@"  bootOffset   = %lld s\n", g_bootOffset];
+                diagAppend(m);
+            } @catch (id e) {}
 
             // ---- 7c/7d. v63 停用 → v74 恢复 7c（包标识伪装）----
             //
