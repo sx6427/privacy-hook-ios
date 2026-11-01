@@ -282,6 +282,12 @@ static const uint64_t FAKE_MEMSIZE = 6ULL * 1024 * 1024 * 1024; // 6GB
 // ============================================================
 static long long g_bootOffset = 0;   // 秒：伪造「本克隆专属开机时刻」的偏移
 static long long g_diskDelta  = 0;   // 字节：伪造磁盘总容量的偏移
+// v81: 统一假主机名。真机实测 gethostname/uname.nodename/sysctl kern.hostname
+//   三者同值（本例 "1-4"）。此前只有 ObjC 侧（NSProcessInfo.hostName /
+//   UIDevice.name）走 getPersistent，C 侧写死 "iPhone"，而
+//   sysctlbyname("kern.hostname") 干脆透传真值 —— 同一指标三个答案，
+//   既是矛盾也是真名泄漏。这里缓存一份，所有通道共用。
+static char      g_fakeHost[128] = {0};
 static NSString *g_realGPUName = nil; // v79: 真机 Metal 设备名（伪装前抓取，供诊断）
 static BOOL      g_appsDiagLogged = NO;
 
@@ -703,6 +709,13 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
         if (strcmp(name, "hw.optional.arm.FEAT_I8MM") == 0)    return hook_return_int(0, oldp, oldlenp);
         if (strcmp(name, "hw.optional.arm.FEAT_DotProd") == 0) return hook_return_int(1, oldp, oldlenp);
 
+        // v81 ★真名泄漏★ kern.hostname 此前未处理 → 透传真机设备名（本例 "1-4"）。
+        //   这是全机唯一一处「真实用户名」直接上网的通道（二进制实测引用 1 次），
+        //   而且与 gethostname/uname/NSProcessInfo.hostName 返回的假名互相矛盾。
+        if (strcmp(name, "kern.hostname") == 0) {
+            return hook_return_cstr(g_fakeHost[0] ? g_fakeHost : "iPhone", oldp, oldlenp);
+        }
+
         // v77: kern.boottime ★设备聚类信号★
         // 同一台机器上所有 App / 所有克隆读到的开机时刻精确到秒完全相同，
         // 是风控串联「这些包跑在同一台物理机」最省事的锚点。给每克隆一个
@@ -751,9 +764,12 @@ static int hook_uname(struct utsname *u) {
     // v70: 只覆盖 nodename（防真实设备名泄漏）和 machine（机型人格）。
     // sysname/release/version 保留真实值 —— 与 sysctlbyname 的
     // kern.osrelease（透传真值）保持自洽，不能再用写死的 FAKE_DARWIN。
-    strlcpy(u->nodename, "iPhone",          sizeof(u->nodename));
-    // v80: 跟随真机格式（真机 uname/sysctl 均为全小写 iphone14,3）
-    strlcpy(u->machine,  FAKE_MACHINE_LC,   sizeof(u->machine));
+    // v81: nodename 与 gethostname / sysctl kern.hostname 同值。
+    //      machine 跟真机实测格式 —— 真机 uname().machine = "iPhone14,3"（大写 I），
+    //      而 sysctl hw.machine = "iphone14,3"（全小写）。两条通道本就大小写不同，
+    //      v80 把两者都改成小写，反而与真机行为不符，这里按实测各自还原。
+    strlcpy(u->nodename, g_fakeHost[0] ? g_fakeHost : "iPhone", sizeof(u->nodename));
+    strlcpy(u->machine,  FAKE_MACHINE,                          sizeof(u->machine));
     return 0;
 }
 
@@ -779,8 +795,14 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
     if (a == 6 && b == 2) return hook_return_cstr(FAKE_HWMODEL,    oldp, oldlenp);  // HW_MODEL
     if (a == 1) {                                 // CTL_KERN
         if (b == 1)  return hook_return_cstr("Darwin",      oldp, oldlenp);
-        if (b == 2)  return hook_return_cstr(FAKE_DARWIN,   oldp, oldlenp);
-        if (b == 10) return hook_return_cstr("iPhone",      oldp, oldlenp);
+        // v81 ★修正★ KERN_OSRELEASE 改为透传。
+        //   这里此前返回 FAKE_DARWIN="23.6.0"（iOS 17.6 的内核），而
+        //   sysctlbyname("kern.osrelease") 与 kern.osversion 都是透传真值
+        //   （真机 22.1.0 / 20B82 = iOS 16.1）。同一指标两条通道两个值，
+        //   且 16.1 系统配 17.6 内核是不可能存在的组合 → 直接自曝。
+        //   人格本身就是 12 Pro Max 跑 iOS 16.1，真实值天然自洽。
+        if (b == 10) return hook_return_cstr(g_fakeHost[0] ? g_fakeHost : "iPhone",
+                                             oldp, oldlenp);
         // v78 ★P0★ KERN_BOOTTIME(21) —— 补齐第二条开机时刻通道。
         //   v77 只改了 sysctlbyname("kern.boottime")，但 sysctl() 是
         //   独立的系统调用路径（不经过 sysctlbyname 符号），拿到的是真值。
@@ -809,7 +831,7 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 static int hook_gethostname(char *name, size_t namelen) {
     if (!orig_gethostname) return -1;           // 防护：未绑定绝不能解引用
     if (!name || namelen == 0) return orig_gethostname(name, namelen);
-    const char *fake = "iPhone";   // 出厂默认主机名，与 uname.nodename 一致
+    const char *fake = g_fakeHost[0] ? g_fakeHost : "iPhone";  // v81: 与 uname/sysctl 同值
     // v57S: 任何分支都保证 '\0' 结尾 —— 截断后不留 '\0' 会让调用方
     // strlen() 越界读（EXC_BAD_ACCESS，且 @try 拦不住内存故障）
     size_t copy = strlen(fake);
@@ -2497,6 +2519,16 @@ static void initPrivacyHook(void) {
             //   （若要重启此功能，必须同时 hook statfs/statvfs 并保证
             //     与 NSFileManager 只扣减一次，不能两层各扣一遍。）
             g_diskDelta = 0;
+
+            // v81: 统一假主机名 —— ObjC 侧（NSProcessInfo.hostName /
+            //   UIDevice.name / MG DeviceName）与 C 侧（gethostname /
+            //   uname.nodename / sysctl kern.hostname）共用同一份持久化值。
+            @try {
+                NSString *dn = getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
+                const char *u = dn.length ? [dn UTF8String] : NULL;
+                if (u && u[0]) strlcpy(g_fakeHost, u, sizeof(g_fakeHost));
+            } @catch (id e) {}
+            if (!g_fakeHost[0]) strlcpy(g_fakeHost, "iPhone", sizeof(g_fakeHost));
         } @catch (id e) {}
 
         // ---- 1. v59: 首启只清 Cookie ----
@@ -3389,14 +3421,14 @@ static void initPrivacyHook(void) {
                     "hw.machine", "hw.model", "hw.cputype", "hw.cpusubtype",
                     "hw.memsize", "hw.ncpu", "hw.physicalcpu",
                     "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_I8MM",
-                    "kern.osversion", "kern.boottime", "kern.hostname"
+                    "kern.osversion", "kern.osrelease", "kern.boottime", "kern.hostname"
                 };
                 int (*realSysctl)(const char *, void *, size_t *, void *, size_t) =
                     orig_sysctlbyname ? orig_sysctlbyname
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v80 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v81 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -3410,6 +3442,7 @@ static void initPrivacyHook(void) {
                 [m appendFormat:@"  FAKE_MACHINE = %s (MG ProductType)\n", FAKE_MACHINE];
                 [m appendFormat:@"  FAKE_MACH_LC = %s (sysctl/uname)\n", FAKE_MACHINE_LC];
                 [m appendFormat:@"  FAKE_HWMODEL = %s (board)\n", FAKE_HWMODEL];
+                [m appendFormat:@"  FAKE_HOST    = %s (all C channels)\n", g_fakeHost];
                 [m appendFormat:@"  bootOffset   = %lld s\n", g_bootOffset];
 
                 // v80: 真机 MobileGestalt 各字段原始值 —— 用 orig 指针绕过本 hook，
@@ -3442,6 +3475,33 @@ static void initPrivacyHook(void) {
                         [m appendFormat:@"  uname machine  = %s\n", uu.machine];
                     }
                 }
+
+                // v81: 实效校验 —— 走上过 hook 的通道，看 App 真正读到的值。
+                //   上面那批是真值（orig_*），只能证明「真机是什么」；
+                //   这一段才能证明「我们伪装成了什么」，两者对不上就是 bug。
+                @try {
+                    static const char *vk[] = {"hw.machine", "hw.model",
+                                               "kern.hostname", "kern.osrelease",
+                                               "kern.osversion"};
+                    for (size_t i = 0; i < sizeof(vk)/sizeof(vk[0]); i++) {
+                        char bb[256];
+                        memset(bb, 0, sizeof(bb));
+                        size_t ss = sizeof(bb);
+                        int rr = sysctlbyname(vk[i], bb, &ss, NULL, 0);
+                        [m appendFormat:@"  OUT %-15s = %s (r=%d)\n", vk[i], bb, rr];
+                    }
+                    struct utsname uh;
+                    memset(&uh, 0, sizeof(uh));
+                    if (uname(&uh) == 0) {
+                        [m appendFormat:@"  OUT uname.machine = %s | nodename = %s\n",
+                                          uh.machine, uh.nodename];
+                    }
+                    char hn[160];
+                    memset(hn, 0, sizeof(hn));
+                    if (gethostname(hn, sizeof(hn)) == 0) {
+                        [m appendFormat:@"  OUT gethostname    = %s\n", hn];
+                    }
+                } @catch (id e3) {}
                 diagAppend(m);
             } @catch (id e) {}
 
