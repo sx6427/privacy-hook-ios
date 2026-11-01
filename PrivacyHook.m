@@ -128,6 +128,23 @@
 //              4 枚举结果剔除所有 com.baidu.BaiduMobile.<后缀>，保留官方版。
 //         1 与 systemUptime 同步加偏移，保证 boottime/uptime 互相自洽。
 //
+//   v78   ★ 通道自洽性修复（2026-11-01，修 v77 自伤）★
+//         现象：13 Pro Max 能进农场，点下单返回「下单人数过多」。
+//         该文案主二进制里不存在 → 服务端软性拒绝，风控降权的标准写法。
+//         根因不在伪装强度，而在 v77 把「同指标多通道」改成了互相打架：
+//           · kern.boottime 只拦了 sysctlbyname，没拦 sysctl(MIB)
+//             主二进制实测导入 _sysctl，一条老式调用就拿到真开机时刻
+//             → sysctlbyname 报假、sysctl 报真，比不伪装更像篡改
+//           · 磁盘只改了 NSFileManager，主二进制同时导入 _statfs/_statvfs
+//             → 容量两条通道两个答案，同样自曝
+//         修法：
+//           1) 绑回 sysctl(MIB)，拦 CTL_KERN/KERN_BOOTTIME 与
+//              CTL_HW/HW_MACHINE/HW_MODEL，口径与 sysctlbyname 完全一致
+//              （只拦 namelen==2 且 MIB 明确的调用，写操作/未知 MIB 透传）
+//           2) 磁盘伪装整体撤销，回到透传真值 —— 该信号聚类价值低
+//              （同型号同容量机器极多），而矛盾风险高，收益不划算
+//         原则：宁可不伪装，也绝不允许同一指标出现两个值。
+//
 //   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
 //         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
 //         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
@@ -583,8 +600,9 @@ static void installBundleIdentifierHooks(void) {
 // v72: 16 → 17 —— 新增 CNCopyCurrentNetworkInfo（WiFi 锚点返空，仅百度构建）
 // MT_CLONE=1 时该 rebind 不注册，表长回 16
 // v73: 新增 SCNetworkReachabilityGetFlags 诊断 rebind（两系都注册）
+// v78: 百度新增 sysctl(MIB) 绑定 —— 补 KERN_BOOTTIME / HW_MACHINE 通道
 #if !MT_CLONE
-#define REBIND_COUNT 18
+#define REBIND_COUNT 19
 #else
 #define REBIND_COUNT 17
 #endif
@@ -716,6 +734,27 @@ static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
         if (b == 1)  return hook_return_cstr("Darwin",      oldp, oldlenp);
         if (b == 2)  return hook_return_cstr(FAKE_DARWIN,   oldp, oldlenp);
         if (b == 10) return hook_return_cstr("iPhone",      oldp, oldlenp);
+        // v78 ★P0★ KERN_BOOTTIME(21) —— 补齐第二条开机时刻通道。
+        //   v77 只改了 sysctlbyname("kern.boottime")，但 sysctl() 是
+        //   独立的系统调用路径（不经过 sysctlbyname 符号），拿到的是真值。
+        //   于是同一台设备上：sysctlbyname 报「假开机时刻」、
+        //   sysctl 报「真开机时刻」—— 两条通道对不上，是比不伪装
+        //   更容易被判定篡改的特征。
+        if (b == 21) {
+            struct timeval tv;
+            size_t sz = sizeof(tv);
+            // 未绑定时原样透传，绝不返回自造的 -1（调用方会当成 ENOMEM）
+            if (!orig_sysctlbyname)
+                return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            if (orig_sysctlbyname("kern.boottime", &tv, &sz, NULL, 0) != 0)
+                return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            if (g_bootOffset > 0) tv.tv_sec -= (time_t)g_bootOffset;
+            if (oldlenp) {
+                if (oldp && *oldlenp >= sizeof(tv)) memcpy(oldp, &tv, sizeof(tv));
+                *oldlenp = sizeof(tv);
+            }
+            return 0;
+        }
     }
     return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
 }
@@ -2400,10 +2439,15 @@ static void initPrivacyHook(void) {
                 return [NSString stringWithFormat:@"%lld",
                         (long long)(3600 + arc4random_uniform(6 * 86400))];
             }) longLongValue];
-            g_diskDelta = [getPersistent(@"BdD1.dd", ^{
-                return [NSString stringWithFormat:@"%lld",
-                        (long long)((1 + arc4random_uniform(12)) * 1024LL * 1024LL * 1024LL)];
-            }) longLongValue];
+            // v78 ★撤销★ 磁盘容量伪装。
+            //   v77 只改了 NSFileManager 的 NSFileSystemSize，但主二进制
+            //   同时导入了 _statfs / _statvfs —— 一条系统调用就读到真容量。
+            //   结果是同机两条通道给出两个答案，属于自曝篡改。
+            //   而磁盘容量的聚类价值很低（同型号同容量机器成千上万），
+            //   收益远小于矛盾风险 → 回到透传真值，保持全通道自洽。
+            //   （若要重启此功能，必须同时 hook statfs/statvfs 并保证
+            //     与 NSFileManager 只扣减一次，不能两层各扣一遍。）
+            g_diskDelta = 0;
         } @catch (id e) {}
 
         // ---- 1. v59: 首启只清 Cookie ----
@@ -2566,6 +2610,14 @@ static void initPrivacyHook(void) {
                     if (nv <= 0) return d;
                     NSMutableDictionary *md = [d mutableCopy];
                     md[@"NSFileSystemSize"] = @(nv);
+                    // v78: 可用空间同步下调同样的量 —— total 与 free 一起平移，
+                    //   已用空间 (total-free) 保持不变。只改 total 会让
+                    //   「已用 > 总量」或「可用 > 总量」出现在某些调用方眼里。
+                    NSNumber *fr = d[@"NSFileSystemFreeSize"];
+                    if ([fr isKindOfClass:[NSNumber class]]) {
+                        long long nf = [fr longLongValue] - g_diskDelta;
+                        if (nf > 0 && nf <= nv) md[@"NSFileSystemFreeSize"] = @(nf);
+                    }
                     return md;
                 });
                 class_replaceMethod(fmc, fsel, iff, method_getTypeEncoding(fmm));
@@ -3225,6 +3277,13 @@ static void initPrivacyHook(void) {
             g_rebindings[16] = (struct rebinding){"SCNetworkReachabilityGetFlags",       (void *)hook_SCNetworkReachabilityGetFlags,          (void **)&orig_SCNetworkReachabilityGetFlags};
 #if !MT_CLONE
             g_rebindings[17] = (struct rebinding){"CNCopyCurrentNetworkInfo",            (void *)hook_CNCopyCurrentNetworkInfo,               (void **)&orig_CNCopyCurrentNetworkInfo};
+            // v78 ★P0★ 老式 sysctl(MIB) 绑回 —— 这是 hw.machine / hw.model /
+            //   KERN_BOOTTIME 的第二条读取通道。二进制实测 BaiduBoxApp 引用
+            //   sysctl 9 次、kern.boottime 字符串存在，不堵等于机型人格和
+            //   开机偏移都是单通道自说自话。
+            //   风险控制：hook_sysctl 只拦 namelen==2 且 MIB 明确的调用，
+            //   newp != NULL（写）与未知 MIB 全部原样透传。
+            g_rebindings[18] = (struct rebinding){"sysctl",                              (void *)hook_sysctl,                                 (void **)&orig_sysctl};
 #endif // !MT_CLONE
             // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
             // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};

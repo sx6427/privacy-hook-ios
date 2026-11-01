@@ -33,10 +33,10 @@ all: $(DYLIB) $(DYLIB_BAIDU)
 # 美团多开：MT_CLONE=1 禁用百度专属 hook（WKWebView UA / NSMutableURLRequest UA 补段等）
 # 内嵌名约定为 MtKit.dylib（镜像隐藏表按 MT_CLONE 同步切换）
 $(DYLIB): $(SRC)
-	clang $(CFLAGS) -DMT_CLONE=1 $(LDFLAGS) -o $@ $^
-	@echo "=== [MT] Patching LC_BUILD_VERSION ==="
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
+	@echo "=== [BAIDU-CI] Patching LC_BUILD_VERSION ==="
 	vtool -set-build-version ios 14.0 17.0 -output $@.tmp $@ && mv $@.tmp $@
-	@echo "=== [MT] Verifying ==="
+	@echo "=== [BAIDU-CI] Verifying ==="
 	@otool -l $@ | grep -A4 "LC_BUILD_VERSION"
 	@file $@
 
