@@ -877,7 +877,7 @@ static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef opti
         // DeviceName — 每克隆独立设备名
         if (CFStringCompare(key, CFSTR("wfiZJ9aJbL5A3hMOznwq7A"), 0) == 0 ||
             CFStringCompare(key, CFSTR("DeviceName"), 0) == 0) {
-            NSString *n = getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
+            NSString *n = getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
             g_inMGHook = NO;
             return (__bridge_retained CFPropertyListRef)n;
         }
@@ -1815,21 +1815,19 @@ static NSData *rewriteIdentityData(NSData *d) {
 static NSString *genUUIDStr(void) { return [[NSUUID UUID] UUIDString]; }
 
 static NSString *genDeviceName(void) {
-    NSArray *surnames = @[@"张", @"王", @"李", @"赵", @"刘", @"陈", @"杨", @"黄", @"周", @"吴",
-                          @"徐", @"孙", @"马", @"朱", @"胡", @"林", @"郭", @"何", @"高", @"罗",
-                          @"郑", @"梁", @"谢", @"宋", @"唐", @"许", @"韩", @"冯", @"邓", @"曹"];
-    NSArray *givenNames = @[@"伟", @"芳", @"娜", @"洋", @"杰", @"磊", @"敏", @"强", @"婷", @"明",
-                            @"超", @"丽", @"军", @"静", @"峰", @"威", @"鹏", @"勇", @"华", @"宇",
-                            @"辉", @"平", @"刚", @"桂英", @"秀兰", @"建国", @"志强", @"俊杰",
-                            @"雨涵", @"子轩", @"浩然", @"嘉怡"];
-    NSString *surname = surnames[arc4random_uniform((uint32_t)surnames.count)];
-    NSString *given = givenNames[arc4random_uniform((uint32_t)givenNames.count)];
-    NSArray *formats = @[
-        [NSString stringWithFormat:@"%@%@的 iPhone", surname, given],
-        [NSString stringWithFormat:@"%@%@的iPhone", surname, given],
-        @"iPhone"
-    ];
-    return formats[arc4random_uniform((uint32_t)formats.count)];
+    // v82 ★P0★ 设备名/主机名必须是纯 ASCII。
+    //
+    // 真机实测（v81 PROFILE，13 Pro Max）：
+    //     kern.hostname = uname.nodename = gethostname = "1-4"
+    //   不含中文、不含空格。v81 把「张伟的 iPhone」这类中文串喂给
+    //   uname.nodename / kern.hostname / gethostname，日志里 FAKE_HOST
+    //   变成 `ËÆ∏Â≥∞ÁöÑiPhone`（UTF-8 多重编码），而真机 hostname
+    //   永远不会长这样 —— 乱码本身就是「被人工篡改」的直接证据，
+    //   比不伪装更糟。
+    //
+    //   改用 iOS 出厂默认设备名 "iPhone"：真机默认值、纯 ASCII、
+    //   与 hostname 同形，且全球数千万台设备同名，不构成指纹。
+    return @"iPhone";
 }
 
 static NSString *genRandStr(NSUInteger len, NSString *cs) {
@@ -2524,7 +2522,7 @@ static void initPrivacyHook(void) {
             //   UIDevice.name / MG DeviceName）与 C 侧（gethostname /
             //   uname.nodename / sysctl kern.hostname）共用同一份持久化值。
             @try {
-                NSString *dn = getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
+                NSString *dn = getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
                 const char *u = dn.length ? [dn UTF8String] : NULL;
                 if (u && u[0]) strlcpy(g_fakeHost, u, sizeof(g_fakeHost));
             } @catch (id e) {}
@@ -2559,7 +2557,7 @@ static void initPrivacyHook(void) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
+                        return getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
@@ -2669,7 +2667,7 @@ static void initPrivacyHook(void) {
                 Method hm = class_getInstanceMethod(pic, @selector(hostName));
                 if (hm) {
                     IMP ih = imp_implementationWithBlock(^NSString *(id s) {
-                        NSString *n = getPersistent(@"BdD1.dn", ^{ return genDeviceName(); });
+                        NSString *n = getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
                         return n ?: @"iPhone";
                     });
                     class_replaceMethod(pic, @selector(hostName), ih, method_getTypeEncoding(hm));
@@ -3428,7 +3426,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v81 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v82 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -3501,6 +3499,25 @@ static void initPrivacyHook(void) {
                     if (gethostname(hn, sizeof(hn)) == 0) {
                         [m appendFormat:@"  OUT gethostname    = %s\n", hn];
                     }
+                    // v82: SoC 特性位实效 —— 必须与人格（iPhone13,4 / A14）一致
+                    int iv = -1; size_t is = sizeof(iv);
+                    if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &iv, &is, NULL, 0) == 0)
+                        [m appendFormat:@"  OUT FEAT_I8MM      = %d (A14=0)\n", iv];
+                    iv = -1; is = sizeof(iv);
+                    if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &iv, &is, NULL, 0) == 0)
+                        [m appendFormat:@"  OUT FEAT_DotProd   = %d (A14=1)\n", iv];
+                    // v82: GPU 名实效 —— 走 hook 后的 MTLCreateSystemDefaultDevice
+                    @try {
+                        void *hd = dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+                        if (hd) {
+                            id dev = ((id (*)(void))hd)();
+                            if (dev) {
+                                NSString *nm = [dev valueForKey:@"name"];
+                                [m appendFormat:@"  OUT GPU_NAME       = %@\n", nm ?: @"(nil)"];
+                            }
+                        }
+                    } @catch (id e4) {}
+                    [m appendFormat:@"  OUT FAKE_HOST_LEN  = %lu\n", (unsigned long)strlen(g_fakeHost)];
                 } @catch (id e3) {}
                 diagAppend(m);
             } @catch (id e) {}
