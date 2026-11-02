@@ -2578,6 +2578,22 @@ static NSFileHandle *diagFH(void) {
                 if ([fm fileExistsAtPath:p]) { path = p; break; }
             }
             if (!path) return;
+            // ★ v87: 按次轮转 —— 上一轮日志超 16MB 就改名挪走，重新开一个空文件。
+            // 避免单文件无限膨胀（v86 之前已经涨到 16MB），也保证每次启动
+            // 都能从干净的起点记录，不再被历史内容挤占配额。
+            @try {
+                NSDictionary *at = [fm attributesOfItemAtPath:path error:nil];
+                if ([[at objectForKey:NSFileSize] longLongValue] > 8LL * 1024 * 1024) {
+                    NSString *prev = [[path stringByDeletingLastPathComponent]
+                                        stringByAppendingPathComponent:@"bd_diag.prev.log"];
+                    [fm removeItemAtPath:prev error:nil];
+                    [fm moveItemAtPath:path toPath:prev error:nil];
+                    [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+            } @catch (id e) {}
+            if (![fm fileExistsAtPath:path]) {
+                [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
             fh = [NSFileHandle fileHandleForUpdatingAtPath:path];
             [fh seekToEndOfFile];
             NSString *hdr = [NSString stringWithFormat:
@@ -2596,7 +2612,11 @@ static void diagAppend(NSString *s) {
     if (!fh || !s) return;
     @try {
         @synchronized (fh) {
-            if (g_diagSize > 3LL * 1024 * 1024) return;
+            // ★ v87 ★P0★ 原为 3MB 上限：v86 启动 5 秒就打满（启动爆发 + 埋点洪水），
+            // 之后整场会话一条不写 —— 22:57:52 之后用户进商城/点下单全部丢日志，
+            // 导致「下单走 WebKit 独立进程」的错误结论。现放宽到 64MB，
+            // 同时在 diagFH 里做按次轮转（>16MB 转 bd_diag.prev.log）。
+            if (g_diagSize > 64LL * 1024 * 1024) return;
             NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
             if (!d) return;
             [fh seekToEndOfFile];
@@ -2624,6 +2644,15 @@ static BOOL diagInteresting(NSURL *u) {
     NSArray *cdn = @[@"bdstatic.com", @"bdimg.com", @"bcebos.com", @"baidubce.com",
                      @"bdurl.net", @"mipcdn.com", @"push", @"mtj", @"apoll"];
     for (NSString *c in cdn) {
+        if ([l rangeOfString:c].location != NSNotFound) return NO;
+    }
+    // ★ v87: 埋点/心跳洪水不再入库。
+    //   v86 实测：启动 5 秒内 ztbox(190) + k.gif/v.gif/j.gif(150) + 各类 gif
+    //   就吃掉 3MB 配额的绝大部分，真正要看的商城/下单请求被淹在后面。
+    //   这些通道不在身份链路上（cuid 一致性已单独验证过），直接排除。
+    NSArray *beacon = @[@"ztbox", @"/k.gif", @"/v.gif", @"/j.gif", @"/hm.gif",
+                        @"hm.baidu.com", @"nsclick", @"fclog.baidu.com", @"/log/jmy"];
+    for (NSString *c in beacon) {
         if ([l rangeOfString:c].location != NSNotFound) return NO;
     }
     return YES;
@@ -3799,7 +3828,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v86 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v87 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
