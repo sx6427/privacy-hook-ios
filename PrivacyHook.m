@@ -181,6 +181,7 @@
 #import <Security/Security.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
 #include <mach-o/dyld.h>
@@ -2251,6 +2252,75 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 }
 
 // ============================================================
+// ★ v85 ★P0★ WebKit 侧 cookie 对齐（WK-COOKIE-ALIGN）
+//
+// 2026-11-02 22:28:44 取证（13pm / D10 容器 6BEAEFDA）：
+//   Library/Cookies/Cookies.binarycookies 里 .baidu.com BAIDUID
+//   = 02CB8C58…:FG=1，而原生侧伪造值是 FBE4B00D…:FG=1 —— 同机两个设备 ID。
+//   原因：WKWebView 的请求跑在独立的 WebKit 网络进程里，dylib 注入不到，
+//   它只认自己 cookie 库里的值；而 App 的下单页正是 H5（日志里 22:26:07
+//   之后一条 REQ 都没有，NSURLSession/NSURLConnection/NSURLProtocol 三层
+//   全装也没抓到 → 请求根本没进本进程）。
+//
+// 做法：在 App 进程内（WKWebsiteDataStore 的 API 是可用的）读回 WebKit
+//   全部 cookie，把身份类条目按 getFakeID 覆写成与原生一致的假值再写回。
+//   只改值，不动 domain/path/expires，不碰 BDUSS/STOKEN 等会话凭证。
+// ============================================================
+static void alignWebKitCookieStore(void) {
+    static volatile int running = 0;
+    if (running) return;
+    running = 1;
+    @try {
+        Class wdsCls = NSClassFromString(@"WKWebsiteDataStore");
+        Class hcsCls = NSClassFromString(@"WKHTTPCookieStore");
+        if (!wdsCls || !hcsCls) { running = 0; return; }
+        id store = ((id (*)(id, SEL))objc_msgSend)(wdsCls,
+                        NSSelectorFromString(@"defaultDataStore"));
+        if (!store) { running = 0; return; }
+        id cs = ((id (*)(id, SEL))objc_msgSend)(store,
+                        NSSelectorFromString(@"httpCookieStore"));
+        SEL getAll = NSSelectorFromString(@"getAllCookies:");
+        SEL setOne = NSSelectorFromString(@"setCookie:completionHandler:");
+        if (!cs || ![cs respondsToSelector:getAll] || ![cs respondsToSelector:setOne]) {
+            running = 0; return;
+        }
+        ((void (*)(id, SEL, id))objc_msgSend)(cs, getAll, ^(NSArray *cookies) {
+            @try {
+                NSMutableArray *todo = [NSMutableArray array];
+                for (id obj in cookies) {
+                    if (![obj isKindOfClass:[NSHTTPCookie class]]) continue;
+                    NSHTTPCookie *c = (NSHTTPCookie *)obj;
+                    if (!isDeviceCookie(c.name)) continue;
+                    NSString *fake = getFakeID(c.name);
+                    if (!fake.length || [c.value isEqualToString:fake]) continue;
+                    NSMutableDictionary *p = [NSMutableDictionary dictionary];
+                    p[NSHTTPCookieName] = c.name;
+                    p[NSHTTPCookieValue] = fake;
+                    if (c.domain) p[NSHTTPCookieDomain] = c.domain;
+                    if (c.path) p[NSHTTPCookiePath] = c.path;
+                    if (c.expiresDate) p[NSHTTPCookieExpires] = c.expiresDate;
+                    p[NSHTTPCookieVersion] = @(c.version);
+                    if (c.secure) p[NSHTTPCookieSecure] = @YES;
+                    NSHTTPCookie *nc = [[NSHTTPCookie alloc] initWithProperties:p];
+                    if (nc) [todo addObject:nc];
+                }
+                for (NSHTTPCookie *nc in todo) {
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(cs, setOne, nc, nil);
+                }
+                diagAppend([NSString stringWithFormat:
+                    @"\n[%@] WK-COOKIE-ALIGN scanned=%lu fixed=%lu\n",
+                    [NSDate date], (unsigned long)cookies.count, (unsigned long)todo.count]);
+            } @catch (id e) {
+            } @finally {
+                running = 0;
+            }
+        });
+    } @catch (id e) {
+        running = 0;
+    }
+}
+
+// ============================================================
 // NSUserDefaults device key detection
 // ============================================================
 
@@ -3623,7 +3693,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v84 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v85 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -4005,6 +4075,22 @@ static void initPrivacyHook(void) {
                 } @catch (id e) {}
                 diagAppend(@"==== diag hooks v74 (conn/proto) installed ====\n");
             } @catch (id e) {}
+        } @catch (id e) {}
+
+        // ---- 9. v85: WebKit 侧 cookie 对齐 ----
+        // 启动后两次（2s/8s：等 WKWebView 网络进程就绪、等首屏落地），
+        // 之后每次回到前台再刷一次 —— 服务端可能刚下发新的 BAIDUID。
+        @try {
+            for (NSNumber *d in @[@2.0, @8.0]) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                        (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                        dispatch_get_main_queue(), ^{ alignWebKitCookieStore(); });
+            }
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:@"UIApplicationDidBecomeActiveNotification"
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *n) { alignWebKitCookieStore(); }];
         } @catch (id e) {}
     }
 }
