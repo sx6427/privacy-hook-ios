@@ -1791,9 +1791,51 @@ static NSString *swapKnownDeviceIDs(NSString *s) {
 }
 #endif
 
+// ★ v84: 出口旧值兜底 —— 磁盘/内存里任何一路漏出的历史 cuid，
+//   在请求离机前统一换成本克隆当前 cuid。
+//
+// 2026-11-02 实测：v83 已把 prefs 全部改成 CC558E35…，但 push SDK 的
+// bind 请求仍带着 `old_cuid=A71DA648…`（v83 之前的 tempCUID 真值）。
+// 服务端看到 old_cuid ≠ device_id，等于客户端自己声明「我换过设备 ID」，
+// 这是比 ID 本身更强的关联信号。该值不出现在任何 plist 里
+// （全容器 1362 个文件扫描，仅浏览历史 db 与个人中心 json 命中），
+// 只可能来自 keychain 加密项或 SDK 内存缓存 —— 出入口统一抹掉最稳。
+static NSString *swapLegacyCuidValues(NSString *s) {
+    if (!s || s.length < 20) return s;
+    static NSArray<NSString *> *legacy = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        legacy = @[
+            // v83 之前的 tempCUID / BIMPIMLogRegisterKeyCUID 真值
+            @"A71DA648AAEE97DFFB1AC3C736A7FD67D7B879526FLJNBFLEIB",
+            // BdD1.real.CUID_FAMILY（v57 时期捕获值）
+            @"33967FA4FB91506EBFB36D88DCBC44AB1C00385DPD129PU1D6E",
+            // 本机真实 cuid（百度地图/翻译共用值，绝不该出现在克隆请求里）
+            @"3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS",
+            // v57P~v83 的 69 位 b64url 假 cuid（错误格式，必须消失）
+            @"TV4-nInmlRIwIxgTxxfkMUdyfife7qqeL0Y0ATsaSp661tgu_AvyZ1MLxxSpIDoTvyMmA"
+        ];
+    });
+    NSString *fake = getFakeID(@"PLATCUID");
+    NSString *fakeLC = [fake lowercaseString];
+    for (NSString *v in legacy) {
+        if ([s rangeOfString:v].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:v withString:fake];
+            diagAppend([NSString stringWithFormat:@"\n[%@] CUID-LEGACY swapped (%@…)\n",
+                        [NSDate date], [v substringToIndex:8]]);
+        }
+        NSString *vl = [v lowercaseString];
+        if (![vl isEqualToString:v] && [s rangeOfString:vl].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:vl withString:fakeLC];
+        }
+    }
+    return s;
+}
+
 static NSString *rewriteIdentityString(NSString *s) {
     if (!s || s.length < 20) return s;
     @try {
+        s = swapLegacyCuidValues(s);
         NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
         if (rc.length >= 16 && [s rangeOfString:rc].location != NSNotFound) {
             s = [s stringByReplacingOccurrencesOfString:rc withString:getFakeID(@"BAIDUCUID")];
@@ -1937,6 +1979,7 @@ static BOOL isUALike(NSString *s) {
 //   = base64url(50字节) 67字符 + "mA" 2字符 = 69字符
 //   v57L 用逐字符随机 → 虽字面像 base64 但解码非法 → 百度校验即识破
 // ============================================================
+__attribute__((unused))
 static NSString *b64urlEncode(NSData *data) {
     NSString *s = [data base64EncodedStringWithOptions:0];
     s = [s stringByReplacingOccurrencesOfString:@"+" withString:@"-"];
@@ -1947,12 +1990,25 @@ static NSString *b64urlEncode(NSData *data) {
 }
 
 static NSString *genCUID(void) {
-    // cookie 层真机结构: base64url(50字节随机) + "mA"
-    // （v57M 抓的 cookie BAIDUCUID 样本，仅适用于 cookie 层；
-    //   NSUserDefaults/keychain 层的 cuid 是另一种格式，见 genPlatformCUID）
-    NSMutableData *raw = [NSMutableData dataWithLength:50];
-    arc4random_buf([raw mutableBytes], 50);
-    return [NSString stringWithFormat:@"%@mA", b64urlEncode(raw)];
+    // ★ v84 ★P0★ 纠正 v57M/v57P 的方向性错误 ★
+    //
+    // v57M 依据一个「cookie BAIDUCUID 是 69 位 b64url + mA」的样本，
+    // 认定 cookie 层 cuid 与平台层 cuid 是两套不同格式，于是 v57P 起
+    // 所有 BAIDUCUID/MAWEBCUID/CUID_FAMILY 都生成 69 位 b64url，
+    // 而 App 内部 cuid 仍是 51 位 —— 同一次请求里两个身份。
+    //
+    // 2026-11-02 真机实证（本机未 hook 的百度翻译 / 百度地图容器）：
+    //   翻译 .baidu.com  Cookie BAIDUCUID = 3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS (51位)
+    //   翻译 prefs      tempCUID        = 3ecbab9d9aa6a11172c115567ca774a95f5b9e38cfbhrsarbqs (同值小写)
+    //   地图 prefs      temCUID/BIMPIMLogKeyCUID/kBMSPLASH_BBACUID = 同一个 3ECBAB9D…（51位）
+    //   → 真机全机只有一个 cuid，格式 = 40位大写HEX + 11位大写字母数字，共 51 字符。
+    //   cookie 与 prefs 只差大小写，不存在 69 位 b64url 这一说。
+    //
+    // 因此 v84 起 genCUID 与 genPlatformCUID 完全同源同格式。
+    NSString *hexCS = @"0123456789ABCDEF";
+    NSString *tailCS = @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    return [NSString stringWithFormat:@"%@%@",
+            genRandStr(40, hexCS), genRandStr(11, tailCS)];
 }
 
 // ★ v67: 平台层 cuid（NSUserDefaults "cuid" 键 / keychain baidumobile.cuid 项）
@@ -1991,8 +2047,8 @@ static NSString *genFakeCookie(NSString *name) {
     // ★ v57P：先按「身份族」归一化，保证同族 cookie 拿到同一个值
     NSString *fam = canonicalCookieKey(name);
 
-    // —— CUID 族：BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid 全部同值 ——
-    if ([fam isEqualToString:@"CUID_FAMILY"])
+    // —— CUID 族：BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid / PLATCUID 全部同值 ——
+    if ([fam isEqualToString:@"CUID51"])
         return genCUID();
 
     // —— BAIDUID 族 ——
@@ -2075,7 +2131,23 @@ static NSString *genFakeCookie(NSString *name) {
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent([NSString stringWithFormat:@"BdD1.ck.%@", canonicalCookieKey(name)],
+    NSString *fam = canonicalCookieKey(name);
+
+    // ★ v84: 全部 cuid 共用同一份持久化值 —— 并且**沿用 v83 已用的
+    //   平台 cuid**（BdD1.ck.PLATCUID = CC558E35…），不再新造设备 ID。
+    //   当前账号已在这个 ID 下完成登录、农场可进，换新值等于又给账号
+    //   挂一台"新设备"；只把它接到 cookie 侧，是修正矛盾而不是换设备。
+    if ([fam isEqualToString:@"CUID51"]) {
+        static NSString *legacy = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            legacy = getPersistent(@"BdD1.ck.PLATCUID", ^{ return genPlatformCUID(); });
+            if (legacy.length != 51) legacy = genPlatformCUID();
+        });
+        return getPersistent(@"BdD1.ck.CUID51", ^{ return legacy; });
+    }
+
+    return getPersistent([NSString stringWithFormat:@"BdD1.ck.%@", fam],
                          ^{ return genFakeCookie(name); });
 }
 
@@ -2101,9 +2173,13 @@ static NSString *canonicalCookieKey(NSString *name) {
 
     // —— CUID 族：全部共用同一个 CUID（农场激活依赖此一致性）——
     // BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid / CUID / cuid_galaxy2
-    if ([u hasPrefix:@"BAIDUCUID"]) return @"CUID_FAMILY";
-    if ([u isEqualToString:@"MAWEBCUID"]) return @"CUID_FAMILY";
-    if ([u hasPrefix:@"CUID"]) return @"CUID_FAMILY";
+    // ★ v84: PLATCUID 也并入同一族 —— 真机只有一个 cuid，
+    //   cookie 与 prefs/keychain 必须拿到完全相同的字符串。
+    //   规范键改名 CUID51，避开磁盘上已存在的 BdD1.ck.CUID_FAMILY（69 位旧值）。
+    if ([u hasPrefix:@"BAIDUCUID"]) return @"CUID51";
+    if ([u isEqualToString:@"MAWEBCUID"]) return @"CUID51";
+    if ([u hasPrefix:@"CUID"]) return @"CUID51";
+    if ([u isEqualToString:@"PLATCUID"]) return @"CUID51";
 
     // —— BAIDUID 族（浏览器/账号侧 ID，非设备指纹）——
     if ([u hasPrefix:@"BAIDUID"]) return @"BAIDUID_FAMILY";
@@ -2219,15 +2295,17 @@ static BOOL isCuidValueKey(NSString *k) {
 static NSString *fakeIdentityValueForKey(NSString *key) {
     if (!isCuidValueKey(key)) return nil;
     NSString *lk = key.lowercaseString;
-    BOOL cookieStyle = [lk containsString:@"baiducuid"] ||
-                       [lk containsString:@"mawebcuid"] ||
-                       [lk containsString:@"cuid_family"] ||
-                       [lk containsString:@"cookie"];
     if (g_inUDHook) return nil;
     g_inUDHook = YES;
     __block NSString *v = nil;
     @try {
-        v = cookieStyle ? getFakeID(@"BAIDUCUID") : getFakeID(@"PLATCUID");
+        // ★ v84: 不再区分 cookie/平台两套值 —— 真机只有一个 cuid。
+        v = getFakeID(@"PLATCUID");
+        // 真机实证：prefs 里的 tempCUID 存的是小写，而 cookie / 请求参数
+        // 是大写。值相同、大小写不同，照抄真机形态。
+        if ([lk isEqualToString:@"tempcuid"] || [lk hasSuffix:@".tempcuid"]) {
+            v = [v lowercaseString];
+        }
     } @catch (id e) {
         v = nil;
     } @finally {
@@ -2263,6 +2341,15 @@ static void normalizeIdentityPrefs(void) {
             }
         }
         CFRelease(keys);
+
+        // v84: cuidDeviceInfo 形态校正。
+        // 真机实证（百度地图 / 百度翻译，均未 hook）：
+        //   com.baidu.baidumobile.cuidDeviceInfo = iPhone14,3  ← 大写 I
+        // 而 v80 起写成了小写 iphone13,4（sysctl hw.machine 才是小写）。
+        // 该键不参与 cuid 替换（被 isCuidValueKey 排除），单独校正。
+        CFPreferencesSetAppValue(CFSTR("com.baidu.baidumobile.cuidDeviceInfo"),
+                                 (__bridge CFStringRef)[NSString stringWithUTF8String:FAKE_MACHINE],
+                                 kCFPreferencesCurrentApplication);
         CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
     } @catch (id e) {}
 }
@@ -3536,7 +3623,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v82 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v84 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -3552,6 +3639,10 @@ static void initPrivacyHook(void) {
                 [m appendFormat:@"  FAKE_HWMODEL = %s (board)\n", FAKE_HWMODEL];
                 [m appendFormat:@"  FAKE_HOST    = %s (all C channels)\n", g_fakeHost];
                 [m appendFormat:@"  bootOffset   = %lld s\n", g_bootOffset];
+                // v84: 单一 cuid 核对点 —— 所有通道（cookie/prefs/keychain/
+                //   请求参数）都必须是这同一个 51 位值。
+                [m appendFormat:@"  CUID_FAKE    = %@ (all identity channels)\n",
+                 getFakeID(@"PLATCUID")];
 
                 // v80: 真机 MobileGestalt 各字段原始值 —— 用 orig 指针绕过本 hook，
                 //   用来确认 ProductType / HardwareModel 在真机上的真实格式，
