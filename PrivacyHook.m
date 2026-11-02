@@ -2321,6 +2321,112 @@ static void alignWebKitCookieStore(void) {
 }
 
 // ============================================================
+// ★ v86 ★P0★ WKWebView H5 探针（WK-H5-PROBE）
+//
+// 背景（2026-11-02 22:26 / 22:28 / 22:39 三次取证）：
+//   点「下单」后 bd_diag.log 一字不增（md5 三次完全相同），而 D10 容器的
+//   Cookies.binarycookies 里反复出现 22:28:44 / 22:37:42 的新 cookie。
+//   → 下单由 WKWebView 的独立网络进程发出，dylib 注入不到那个进程；
+//     证书代理方案在百度 SP-engine 下握手被客户端拒绝（不信任代理根证书），
+//     也走不通。
+//
+// 做法：不碰网络栈，直接给页面注入 JS。hook -[WKWebView initWithFrame:configuration:]，
+//   向该配置的 WKUserContentController 挂一段 documentStart 脚本，包装
+//   fetch / XMLHttpRequest，把命中「下单类」关键词的请求与响应体通过
+//   webkit.messageHandlers 回传到本进程，写进 bd_diag.log。
+//   JS 只做旁路复制（response.clone / 只读 responseText），不改原请求与返回值。
+// ============================================================
+static void diagAppend(NSString *s);   // 与文件内前置声明一致，重复声明合法
+
+static NSString *const kBDProbeHandlerName = @"bdprobe9x";
+
+static const char *kBDProbeJS =
+"(function(){"
+"if(window.__bdProbe)return;window.__bdProbe=1;"
+"function P(o){try{window.webkit.messageHandlers.bdprobe9x.postMessage(JSON.stringify(o));}catch(e){}}"
+"var F=/(order|trade|cashier|pay|nuomi|jrmall|dxm|submit|create|confirm|book)/i;"
+"function S(x,n){try{return String(x==null?'':x).slice(0,n||1200);}catch(e){return '';}}"
+"var of=window.fetch;"
+"if(of){window.fetch=function(req,opt){"
+"var u='',b='',m='GET';"
+"try{u=(typeof req==='string')?req:(req&&req.url)||'';b=(opt&&opt.body)||'';m=(opt&&opt.method)||'GET';}catch(e){}"
+"var hit=F.test(u);"
+"if(hit)P({t:'req',m:m,u:S(u,600),b:S(b,1200)});"
+"var p=of.apply(this,arguments);"
+"if(hit&&p&&p.then){p.then(function(r){try{var c=r.clone();c.text().then(function(t){P({t:'resp',u:S(u,600),s:r.status,b:S(t,2000)});}).catch(function(){});}catch(e){}return r;}).catch(function(){});}"
+"return p;};}"
+"var OO=XMLHttpRequest.prototype.open,OS=XMLHttpRequest.prototype.send;"
+"XMLHttpRequest.prototype.open=function(m,u){this.__u=u;this.__m=m;return OO.apply(this,arguments);};"
+"XMLHttpRequest.prototype.send=function(b){"
+"try{var u=this.__u||'';if(F.test(u)){P({t:'xreq',m:this.__m,u:S(u,600),b:S(b,1200)});"
+"var x=this;x.addEventListener('load',function(){try{P({t:'xresp',u:S(u,600),s:x.status,b:S(x.responseText,2000)});}catch(e){}});}}catch(e){}"
+"return OS.apply(this,arguments);};"
+"P({t:'init',u:S(location.href,600)});"
+"})();";
+
+@interface BDProbeHandler : NSObject
+@end
+@implementation BDProbeHandler
+- (void)userContentController:(id)ucc didReceiveScriptMessage:(id)msg {
+    @try {
+        NSString *body = nil;
+        @try { body = [msg valueForKey:@"body"]; } @catch (id e) {}
+        if (![body isKindOfClass:[NSString class]] || body.length == 0) return;
+        if (body.length > 2600) body = [body substringToIndex:2600];
+        diagAppend([NSString stringWithFormat:@"\n[%@] H5-PROBE %@\n", [NSDate date], body]);
+    } @catch (id e) {}
+}
+@end
+
+static BDProbeHandler *g_probeHandler = nil;
+
+static void installWKProbe(void) {
+    Class wk = NSClassFromString(@"WKWebView");
+    if (!wk) return;
+    static char kAssocKey;
+    SEL sel = @selector(initWithFrame:configuration:);
+    Method m = class_getInstanceMethod(wk, sel);
+    if (!m) { diagAppend(@"\nWK-H5-PROBE: WKWebView 不可用\n"); return; }
+    IMP orig = method_getImplementation(m);
+    IMP imp = imp_implementationWithBlock(^id(id s, CGRect f, id cfg) {
+        @try {
+            if (cfg && !objc_getAssociatedObject(cfg, &kAssocKey)) {
+                objc_setAssociatedObject(cfg, &kAssocKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                id ucc = nil;
+                @try { ucc = [cfg valueForKey:@"userContentController"]; } @catch (id e) {}
+                if (!ucc) {
+                    Class uccCls = NSClassFromString(@"WKUserContentController");
+                    if (uccCls) {
+                        ucc = [[uccCls alloc] init];
+                        @try { [cfg setValue:ucc forKey:@"userContentController"]; } @catch (id e) {}
+                    }
+                }
+                Class usCls = NSClassFromString(@"WKUserScript");
+                if (ucc && usCls) {
+                    NSString *src = [NSString stringWithUTF8String:kBDProbeJS];
+                    id script = ((id (*)(id, SEL, NSString *, NSInteger, BOOL))objc_msgSend)(
+                                    [usCls alloc],
+                                    NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:"),
+                                    src, (NSInteger)0 /* atDocumentStart */, (BOOL)NO);
+                    if (script) {
+                        @try { [ucc addUserScript:script]; } @catch (id e) {}
+                    }
+                    if (!g_probeHandler) g_probeHandler = [[BDProbeHandler alloc] init];
+                    @try {
+                        [ucc addScriptMessageHandler:g_probeHandler name:kBDProbeHandlerName];
+                    } @catch (id e) {}
+                    diagAppend([NSString stringWithFormat:
+                        @"\n[%@] WK-H5-PROBE installed (ucc=%s)\n",
+                        [NSDate date], ucc ? "yes" : "no"]);
+                }
+            }
+        } @catch (id e) {}
+        return ((id (*)(id, SEL, CGRect, id))orig)(s, sel, f, cfg);
+    });
+    method_setImplementation(m, imp);
+}
+
+// ============================================================
 // NSUserDefaults device key detection
 // ============================================================
 
@@ -3693,7 +3799,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v85 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v86 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -4092,5 +4198,9 @@ static void initPrivacyHook(void) {
                              queue:[NSOperationQueue mainQueue]
                         usingBlock:^(NSNotification *n) { alignWebKitCookieStore(); }];
         } @catch (id e) {}
+
+        // ---- 10. v86: WKWebView H5 探针 ----
+        // 必须在 App 创建任何 WKWebView 之前装好，否则首批 webview 挂不上脚本。
+        @try { installWKProbe(); } @catch (id e) {}
     }
 }
