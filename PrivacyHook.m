@@ -2764,9 +2764,19 @@ static void diagSwizzleNetDelegate(id d) {
             IMP imp = imp_implementationWithBlock(
                 ^(id selfdg, NSURLSession *session, NSURLSessionDataTask *task, NSData *data) {
                     @try {
-                        if (task && data) {
+                        if (task && data.length) {
                             NSString *tid = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
-                            [[diagTaskData() objectForKey:tid] appendData:data];
+                            // ★ v88 ★P0★ 原实现 [[dict objectForKey:tid] appendData:data]：
+                            //   缓冲区从未创建，objectForKey 返回 nil，[nil appendData:] 静默无操作
+                            //   → 640 条 delegate 响应正文全部丢失，下单回包「人数过多」的原因看不到。
+                            @synchronized (diagTaskData()) {
+                                NSMutableData *buf = [diagTaskData() objectForKey:tid];
+                                if (!buf) {
+                                    buf = [NSMutableData data];
+                                    [diagTaskData() setObject:buf forKey:tid];
+                                }
+                                [buf appendData:data];
+                            }
                         }
                     } @catch (id e) {}
                     ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))orig)(
@@ -2788,11 +2798,12 @@ static void diagSwizzleNetDelegate(id d) {
                             NSData *acc = [diagTaskData() objectForKey:tid];
                             [diagTaskData() removeObjectForKey:tid];
                             if (req) diagDumpRequest(req, @"DELEG-REQ");
-                            if (resp && [resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                            if (resp && [resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]
+                                && diagInteresting(resp.URL)) {
                                 NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] DELEG-RESP %ld %@\n",
                                                       [NSDate date], (long)resp.statusCode, resp.URL.absoluteString];
                                 if (acc) {
-                                    NSData *d2 = acc.length > 4000 ? [acc subdataWithRange:NSMakeRange(0, 4000)] : acc;
+                                    NSData *d2 = acc.length > 8000 ? [acc subdataWithRange:NSMakeRange(0, 8000)] : acc;
                                     NSString *bs = [[NSString alloc] initWithData:d2 encoding:NSUTF8StringEncoding];
                                     if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)acc.length];
                                     [m appendFormat:@"  BODY: %@\n", bs];
@@ -3828,7 +3839,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v87 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v88 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
