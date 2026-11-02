@@ -380,6 +380,7 @@ static NSString *getPersistent(NSString *key, NSString *(^gen)(void));
 static NSString *genUUIDStr(void);
 static NSString *genDeviceName(void);
 static NSString *getFakeID(NSString *name);
+static NSString *fakeIdentityValueForKey(NSString *key);   // v83: cuid 类键统一假值
 static BOOL isDeviceCookie(NSString *cookieName);
 static NSString *canonicalCookieKey(NSString *name);
 static BOOL isSessionCookie(NSString *cookieName);
@@ -1206,6 +1207,11 @@ static CFPropertyListRef sanitizePrefValueForKey(CFStringRef key, CFPropertyList
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
+    // v83 ★P0★ cuid 类键统一假值 —— 不管存在哪个域、存的是什么
+    if (key && CFGetTypeID(key) == CFStringGetTypeID()) {
+        NSString *fv83 = fakeIdentityValueForKey((__bridge NSString *)key);
+        if (fv83) return (__bridge_retained CFPropertyListRef)fv83;
+    }
     // v64: 只有身份键才改 appID（读本克隆私有域）；功能键保持原域，功能不受影响。
     CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
     CFPropertyListRef v = orig_CFPreferencesCopyAppValue(key, mapped ? mapped : appID);
@@ -1216,6 +1222,11 @@ static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStrin
 }
 
 static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
+    // v83 ★P0★ 同上
+    if (key && CFGetTypeID(key) == CFStringGetTypeID()) {
+        NSString *fv83 = fakeIdentityValueForKey((__bridge NSString *)key);
+        if (fv83) return (__bridge_retained CFPropertyListRef)fv83;
+    }
     CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
     CFPropertyListRef v = orig_CFPreferencesCopyValue(key, mapped ? mapped : appID, user, host);
     if (mapped) CFRelease(mapped);
@@ -2166,6 +2177,96 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 // ============================================================
 // NSUserDefaults device key detection
 // ============================================================
+
+// ============================================================
+// ★ v83 ★P0★ 身份统一（Identity Coherence）
+//
+// 2026-11-02 设备取证（13pm / D10 容器 6BEAEFDA）：
+//   App 私有域 com.baidu.BaiduMobile.BdD10.plist 里同时存在 5 套 cuid：
+//     BdD1.ck.CUID_FAMILY              = TV4-nInm… (69位, dylib cookie 层)
+//     BdD1.ck.PLATCUID                 = CC558E35… (51位, dylib 平台层)
+//     BdD1.real.CUID_FAMILY            = 33967FA4… (捕获的真值)
+//     com.baidu.baidumobile.tempCUID   = a71da648… (App 自己生成)
+//     BIMPIMLogRegisterKeyCUID         = A71DA648… (App 自己生成，上报用)
+//   而实际网络请求里：
+//     pim.baidu.com generate_lcm_token body  "cuid" = A71DA648…
+//     mbd.baidu.com/mapping/update      uid  = A71DA648…
+//     Cookie BAIDUCUID                       = TV4-nInm…
+//   → 同一次请求里 body 与 cookie 的 cuid 不同，服务端判定「设备身份不一致」。
+//
+// 根因：isStrictIdentityKeyStr 命中后只做「域重定向」，读的仍是私有域里
+//   App 自己写入的值；isDeviceKey 只做精确匹配（cuid/CUID/BAIDUCUID…），
+//   tempCUID / BIMPIMLogRegisterKeyCUID / BNPush_cuid 全部漏网。
+//
+// 修法：所有 cuid 语义的键在读层直接返回本克隆统一假值，不再看存储。
+//   cookie 族（BAIDUCUID/MAWEBCUID/CUID_FAMILY）→ 69 位 b64url
+//   平台族（tempCUID/PLATCUID/BNPush_cuid…） → 51 位 HEX+尾
+// ============================================================
+static BOOL isCuidValueKey(NSString *k) {
+    if (!k.length || [k hasPrefix:@"BdD1"]) return NO;      // 自建持久化键不动
+    NSString *lk = k.lowercaseString;
+    if ([lk containsString:@"seed"]) return NO;             // cuidsdkSeedid
+    if ([lk containsString:@"deviceinfo"]) return NO;       // cuidDeviceInfo
+    if ([lk containsString:@"sdk_version"]) return NO;
+    if ([lk isEqualToString:@"cuid"]) return YES;
+    if ([lk hasSuffix:@"cuid"]) return YES;                 // tempcuid/bnpush_cuid/…keycuid
+    if ([lk containsString:@"baiducuid"]) return YES;
+    if ([lk containsString:@"mawebcuid"]) return YES;
+    if ([lk containsString:@"cuid_family"]) return YES;
+    return NO;
+}
+
+static NSString *fakeIdentityValueForKey(NSString *key) {
+    if (!isCuidValueKey(key)) return nil;
+    NSString *lk = key.lowercaseString;
+    BOOL cookieStyle = [lk containsString:@"baiducuid"] ||
+                       [lk containsString:@"mawebcuid"] ||
+                       [lk containsString:@"cuid_family"] ||
+                       [lk containsString:@"cookie"];
+    if (g_inUDHook) return nil;
+    g_inUDHook = YES;
+    __block NSString *v = nil;
+    @try {
+        v = cookieStyle ? getFakeID(@"BAIDUCUID") : getFakeID(@"PLATCUID");
+    } @catch (id e) {
+        v = nil;
+    } @finally {
+        g_inUDHook = NO;
+    }
+    return v;
+}
+
+// 启动时校准：把私有域里历史遗留的 cuid 值全部改写成本克隆统一假值。
+// 走 CFPreferences 直接读改写，绕过 NSUserDefaults hook（防递归）。
+static void normalizeIdentityPrefs(void) {
+    @try {
+        CFArrayRef keys = CFPreferencesCopyKeyList(kCFPreferencesCurrentApplication,
+                                                   kCFPreferencesCurrentUser,
+                                                   kCFPreferencesAnyHost);
+        if (!keys) return;
+        CFIndex n = CFArrayGetCount(keys);
+        for (CFIndex i = 0; i < n; i++) {
+            CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+            if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+            NSString *key = (__bridge NSString *)k;
+            NSString *fv = fakeIdentityValueForKey(key);
+            if (!fv) continue;
+            CFPropertyListRef cur = CFPreferencesCopyAppValue(k, kCFPreferencesCurrentApplication);
+            BOOL need = YES;
+            if (cur && CFGetTypeID(cur) == CFStringGetTypeID()) {
+                if ([(__bridge NSString *)cur isEqualToString:fv]) need = NO;
+            }
+            if (cur) CFRelease(cur);
+            if (need) {
+                CFPreferencesSetAppValue(k, (__bridge CFStringRef)fv,
+                                         kCFPreferencesCurrentApplication);
+            }
+        }
+        CFRelease(keys);
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    } @catch (id e) {}
+}
+
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
     if ([key hasPrefix:@"BdD1"]) return NO;
@@ -2527,6 +2628,9 @@ static void initPrivacyHook(void) {
                 if (u && u[0]) strlcpy(g_fakeHost, u, sizeof(g_fakeHost));
             } @catch (id e) {}
             if (!g_fakeHost[0]) strlcpy(g_fakeHost, "iPhone", sizeof(g_fakeHost));
+
+            // v83 ★P0★ 身份统一：启动即把所有历史 cuid 校准为同一假值
+            normalizeIdentityPrefs();
         } @catch (id e) {}
 
         // ---- 1. v59: 首启只清 Cookie ----
@@ -2913,6 +3017,9 @@ static void initPrivacyHook(void) {
                 if (ofkM) {
                     IMP orig = method_getImplementation(ofkM);
                     IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
+                        // v83 ★P0★ cuid 类键 → 直接回本克隆统一假值，不读存储
+                        NSString *fv83 = fakeIdentityValueForKey(key);
+                        if (fv83) return fv83;
                         // v64: group 域 + 身份键 → 重定向到本克隆私有域
                         if (isStrictIdentityKeyStr(key)) {
                             NSUserDefaults *p = privPeerFor(s);
@@ -2934,6 +3041,9 @@ static void initPrivacyHook(void) {
                 if (sfkM) {
                     IMP orig = method_getImplementation(sfkM);
                     IMP imp = imp_implementationWithBlock(^NSString *(id s, NSString *key) {
+                        // v83 ★P0★ 同上：cuid 类键统一假值
+                        NSString *fv83 = fakeIdentityValueForKey(key);
+                        if (fv83) return fv83;
                         if (isStrictIdentityKeyStr(key)) {
                             NSUserDefaults *p = privPeerFor(s);
                             if (p && p != s) {
