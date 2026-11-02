@@ -2882,6 +2882,95 @@ static NSArray *filterCloneApps(NSArray *arr) {
 }
 
 // ============================================================
+// ★ v89 ★P0★ 身份轮换（Identity Epoch）
+//
+// 背景（2026-11-02 实测）：
+//   v83/v84 把全链路 cuid 统一成 CC558E35…，但那是**沿用**早已存在的
+//   旧假值。这个值在本机已经跑了大量失败下单，服务端对
+//   duxiaodian.baidu.com/api/trade/v2.0/orders/create 的判定是
+//   {"errno":3523,"errmsg":"当前下单人数过多，请稍后再试"}。
+//   confirm / calculateInit 全 errno=0、库存 150 正常，说明不是库存、
+//   不是账号、不是支付，而是 create 这一层的设备风险门。
+//
+//   一个被判定过的 cuid 再怎么"保持一致性"也还是那个被判定过的 cuid。
+//   所以这里做一次**整套身份轮换**：换新值，而不是修旧值。
+//
+// 轮换范围（只换我们自己生成的假身份，不碰登录票据）：
+//   BdD1.ck.*   —— CUID51 / BAIDUID / tcuid / DVIF / AB_* / FUID / ZFY …
+//   BdD1.iv     —— IDFV
+//   BdD1.ai     —— IDFA
+// 保留：
+//   BdD1.real.* —— 真机原值，出口消毒仍需要它
+//   BdD1.dn2    —— 设备名，与身份无关
+//   BdD1.bo     —— 开机偏移
+//   BDUSS/STOKEN 等登录 Cookie —— 不清，避免强迫重新登录
+//
+// 用 BdD1.epoch 做幂等：只在版本号变化时轮换一次，之后稳定不变
+// （同一"设备"多次启动必须是同一个身份，否则又制造新的不一致）。
+// ============================================================
+#define IDENTITY_EPOCH @"2"
+
+static void rotateIdentityIfNeeded(void) {
+    @try {
+        CFStringRef epKey = CFSTR("BdD1.epoch");
+        CFPropertyListRef epVal = CFPreferencesCopyAppValue(epKey, kCFPreferencesCurrentApplication);
+        NSString *ep = nil;
+        if (epVal) {
+            if (CFGetTypeID(epVal) == CFStringGetTypeID()) ep = (__bridge NSString *)epVal;
+            CFRelease(epVal);
+        }
+        if (ep && [ep isEqualToString:IDENTITY_EPOCH]) return;   // 已轮换过
+
+        CFArrayRef keys = CFPreferencesCopyKeyList(kCFPreferencesCurrentApplication,
+                                                   kCFPreferencesCurrentUser,
+                                                   kCFPreferencesAnyHost);
+        NSUInteger removed = 0;
+        if (keys) {
+            CFIndex n = CFArrayGetCount(keys);
+            for (CFIndex i = 0; i < n; i++) {
+                CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+                if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+                NSString *key = (__bridge NSString *)k;
+                BOOL drop = NO;
+                if ([key hasPrefix:@"BdD1.ck."]) drop = YES;
+                if ([key isEqualToString:@"BdD1.iv"] || [key isEqualToString:@"BdD1.ai"]) drop = YES;
+                if (drop) {
+                    // 置 NULL 即删除该键
+                    CFPreferencesSetAppValue(k, NULL, kCFPreferencesCurrentApplication);
+                    removed++;
+                }
+            }
+            CFRelease(keys);
+        }
+
+        // 服务端下发的设备 Cookie 一并清掉（保留登录票据），
+        // 否则旧的 BAIDUID/BAIDUCUID 会继续顶在 Cookie 头上。
+        NSInteger kept = 0;
+        @try {
+            NSHTTPCookieStorage *st = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+            for (NSHTTPCookie *c in [[st cookies] copy]) {
+                NSString *nm = c.name ?: @"";
+                BOOL isLogin = [nm isEqualToString:@"BDUSS"] || [nm isEqualToString:@"BDUSS_BFESS"]
+                            || [nm isEqualToString:@"STOKEN"] || [nm isEqualToString:@"PTOKEN"]
+                            || [nm isEqualToString:@"PToken"];
+                if (isLogin) { kept++; continue; }
+                [st deleteCookie:c];
+            }
+        } @catch (id e) {}
+
+        CFPreferencesSetAppValue(epKey, (__bridge CFStringRef)IDENTITY_EPOCH,
+                                 kCFPreferencesCurrentApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+
+        @try {
+            diagAppend([NSString stringWithFormat:
+                @"\n[EPOCH] rotated -> %@ (dropped %lu identity keys, kept %ld login cookies)\n",
+                IDENTITY_EPOCH, (unsigned long)removed, (long)kept]);
+        } @catch (id e) {}
+    } @catch (id e) {}
+}
+
+// ============================================================
 // Constructor — v58
 // ============================================================
 // v72: UIPasteboard 私有化 —— 保存 pasteboardWithNamespace: 原始 IMP + 防自递归标记
@@ -2902,6 +2991,9 @@ static void initPrivacyHook(void) {
         //      NSBundle 读到的就是官方包名了，出口消毒必须用这个快照值。
         g_cloneBundleID = [realBundleIdentifier() copy];
         (void)cloneTag();
+
+        // ---- 0a. v89: 身份轮换（必须早于任何 getFakeID 调用）----
+        rotateIdentityIfNeeded();
 
         // ---- 0b. v77: 设备聚类偏移量（必须在装 hook 之前算好）----
         // 每个克隆一组持久化随机值：开机时刻偏移 + 磁盘容量偏移。
@@ -3839,7 +3931,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v88 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v89 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -3859,6 +3951,11 @@ static void initPrivacyHook(void) {
                 //   请求参数）都必须是这同一个 51 位值。
                 [m appendFormat:@"  CUID_FAKE    = %@ (all identity channels)\n",
                  getFakeID(@"PLATCUID")];
+                [m appendFormat:@"  BAIDUID_FAKE = %@\n", getFakeID(@"BAIDUID")];
+                [m appendFormat:@"  IDFV_FAKE    = %@\n",
+                 getPersistent(@"BdD1.iv", ^{ return genUUIDStr(); })];
+                [m appendFormat:@"  EPOCH        = %@\n",
+                 getPersistent(@"BdD1.epoch", ^{ return @"(none)"; })];
 
                 // v80: 真机 MobileGestalt 各字段原始值 —— 用 orig 指针绕过本 hook，
                 //   用来确认 ProductType / HardwareModel 在真机上的真实格式，
