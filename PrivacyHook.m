@@ -1801,6 +1801,68 @@ static NSString *swapKnownDeviceIDs(NSString *s) {
 // 这是比 ID 本身更强的关联信号。该值不出现在任何 plist 里
 // （全容器 1362 个文件扫描，仅浏览历史 db 与个人中心 json 命中），
 // 只可能来自 keychain 加密项或 SDK 内存缓存 —— 出入口统一抹掉最稳。
+// ============================================================
+// v91 ★ 度小满 aif 设备三元组 + 其它恒定设备号 ★
+// ------------------------------------------------------------
+// 实测（v84/v85/v86/v87/v88/v89/v90 七份日志逐条比对）：
+//   POST https://www.dxmpay.com/aif/sdk/init
+//     imei      = aac0ffa13f27c5bb46357f8a13fd9e65
+//     cu_short  = 10ea1c171f99bc4d382772d1dba4047c
+//   这两个值**从 v84 到 v90 一次都没变过**，跨 epoch 身份轮换、
+//   跨杀进程重启、跨 prefs 深度清理，全都纹丝不动。
+//   这是目前唯一一条真正能「认出本机」的通道，而且它归属的
+//   正是给出 errno 3523 的度小满反欺诈 SDK —— 也就是说：
+//   我们换了账号、换了 cuid、换了 cookie，度小满看到的还是同一台手机。
+//
+// 同样恒定未变的（同一份日志的「轮换前后交集」里筛出来的）：
+//   pan.baidu.com/shoubai/*        devuid = defb08c6cc4952d6dfb776a08cd3d1e63c124e3f
+//                                  （= prefs 键 mtj_bdpanapp_device_id）
+//   wappass.baidu.com/v8/sdkconfig/init  cuid = 264fcac0587ab84e7b885b219fb628be
+//                                  （passport 自己的设备号，不是主 cuid）
+//
+// 做法：出口按「值」替换成本克隆专属的持久随机值 ——
+//   同克隆重启保持不变（一个设备只能有一个身份），
+//   不同克隆互不相同（服务端无法据此串联）。
+// ============================================================
+static NSString *stableHexFor(const char *storeKey, int len) {
+    NSString *k = [NSString stringWithUTF8String:storeKey];
+    return getPersistent(k, ^{
+        static const char *H = "0123456789abcdef";
+        char b[65];
+        int n = len > 64 ? 64 : len;
+        for (int i = 0; i < n; i++) b[i] = H[arc4random_uniform(16)];
+        b[n] = 0;
+        return [NSString stringWithUTF8String:b];
+    });
+}
+
+// 旧值 → 本克隆新值。
+// ★ 只动度小满这两项 ★
+//   devuid（pan.baidu.com）属于网盘备份子系统，passport cuid 属于登录子系统，
+//   两者与下单风控无关，且请求体里带 sig（签名覆盖参数），
+//   改了会让签名对不上、反而打坏网盘/登录 —— 明确不动。
+static NSArray<NSArray<NSString *> *> *aifIdPairs(void) {
+    static NSArray *pairs = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pairs = @[
+            @[@"aac0ffa13f27c5bb46357f8a13fd9e65", stableHexFor("BdD1.ck.AIF_IMEI", 32)],
+            @[@"10ea1c171f99bc4d382772d1dba4047c", stableHexFor("BdD1.ck.AIF_CU", 32)],
+        ];
+    });
+    return pairs;
+}
+
+static NSString *swapAifDeviceIDs(NSString *s) {
+    if (!s || s.length < 24) return s;
+    for (NSArray *p in aifIdPairs()) {
+        if ([s rangeOfString:p[0]].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:p[0] withString:p[1]];
+        }
+    }
+    return s;
+}
+
 static NSString *swapLegacyCuidValues(NSString *s) {
     if (!s || s.length < 20) return s;
     static NSArray<NSString *> *legacy = nil;
@@ -1843,6 +1905,8 @@ static NSString *rewriteIdentityString(NSString *s) {
     if (!s || s.length < 20) return s;
     @try {
         s = swapLegacyCuidValues(s);
+        // ★ v91 ★ 度小满 aif / 网盘 devuid / passport cuid —— 恒定设备号换新
+        s = swapAifDeviceIDs(s);
         NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
         if (rc.length >= 16 && [s rangeOfString:rc].location != NSNotFound) {
             s = [s stringByReplacingOccurrencesOfString:rc withString:getFakeID(@"BAIDUCUID")];
@@ -2556,6 +2620,18 @@ static void normalizeIdentityPrefs(void) {
                 @"\n[WALLET] bdwallet_device_uuid = %@ (expect %@)%@\n",
                 bs, wc, [bs isEqualToString:wc] ? @" OK" : @" ✗MISMATCH"]);
             if (back) CFRelease(back);
+        } @catch (id e) {}
+
+        // ★ v91 ★ 度小满 aif 设备号：生成并落盘，同时打一行日志便于核对
+        @try {
+            NSMutableString *line = [NSMutableString stringWithString:@"\n[DEV-ID]"];
+            NSArray *names = @[@"AIF_IMEI", @"AIF_CU"];
+            NSArray *pairs = aifIdPairs();
+            for (NSUInteger i = 0; i < pairs.count; i++) {
+                [line appendFormat:@" %@=%@", names[i], pairs[i][1]];
+            }
+            [line appendString:@"\n"];
+            diagAppend(line);
         } @catch (id e) {}
 
         CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
@@ -4012,7 +4088,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v90 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v91 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
