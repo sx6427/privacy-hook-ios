@@ -341,6 +341,86 @@ static Boolean hook_SCNetworkReachabilityGetFlags(const void *target, uint32_t *
     return r;
 }
 
+// ============ v96: 设备指纹溯源（mps / 百度安全 SDK） ============
+// 事实基础（v95 实测日志）：
+//   mps=3612411017 出现在 875 次请求、31 个 host 上，包含
+//     · sfp.safe.baidu.com/sfp/v1/rd   （百度安全指纹上报）
+//     · app.duxiaomanfintech.com/odp/wireless/sdk/init （度小满风控 SDK）
+//     · duxiaodian.baidu.com/api/trade/v2.0/orders/create （下单）
+//   且 URL / Header / Body 三处全量扫描 TRUTH-HIT = 0。
+//   → mps 不经过任何被 hook 的 ID 读取路径，是被独立计算/缓存的设备指纹。
+// 本版只做溯源：扫安全类、抓 mps 拼装处的调用栈。不改变任何行为，
+// 因此下单结果与 v95 完全可比。
+#include <execinfo.h>
+#include <ctype.h>
+
+static int g_v96BtLeft = 4;
+static int g_v96BodyBtLeft = 2;
+static int g_v96MpsLogs = 0;
+
+static void v96DumpBacktrace(NSString *tag, NSString *ctx) {
+    @try {
+        void *frames[48];
+        int n = backtrace(frames, 48);
+        NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] ctx=%@\n", tag,
+                              (ctx.length > 150 ? [ctx substringToIndex:150] : (ctx ?: @""))];
+        for (int i = 0; i < n; i++) {
+            Dl_info info;
+            if (dladdr(frames[i], &info) && info.dli_fname) {
+                const char *b = strrchr(info.dli_fname, '/');
+                const char *mod = b ? b + 1 : info.dli_fname;
+                [m appendFormat:@"  #%-2d %s+0x%lx\n", i, mod,
+                 (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
+            }
+        }
+        diagAppend(m);
+    } @catch (id e) {}
+}
+
+static BOOL v96SecNameMatch(const char *cn) {
+    if (!cn || !cn[0]) return NO;
+    static const char *kws[] = {
+        "finger", "sfp", "sofire", "secsdk", "seckit", "secbox",
+        "deviceid", "deviceinfo", "devicesn", "riskinfo", "riskctrl",
+        "mps", "zdid", "bds_", "securityguard", "soter",
+        NULL
+    };
+    char low[256]; size_t k = 0;
+    for (; cn[k] && k < 255; k++) low[k] = (char)tolower((unsigned char)cn[k]);
+    low[k] = 0;
+    for (int i = 0; kws[i]; i++) if (strstr(low, kws[i])) return YES;
+    return NO;
+}
+
+static void v96DumpSecurityClasses(void) {
+    @autoreleasepool {
+        int total = objc_getClassList(NULL, 0);
+        if (total <= 0) return;
+        Class *list = (Class *)malloc(sizeof(Class) * (size_t)total);
+        if (!list) return;
+        int n = objc_getClassList(list, total);
+        NSMutableString *out = [NSMutableString stringWithFormat:
+                                @"\n[SECKIT] v96 classes=%d\n", n];
+        int hit = 0;
+        for (int i = 0; i < n && hit < 140; i++) {
+            const char *cn = class_getName(list[i]);
+            if (!v96SecNameMatch(cn)) continue;
+            hit++;
+            [out appendFormat:@"  C %s\n", cn];
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(list[i], &mc);
+            if (ms) {
+                for (unsigned int j = 0; j < mc && j < 24; j++)
+                    [out appendFormat:@"      - %s\n", sel_getName(method_getName(ms[j]))];
+                free(ms);
+            }
+        }
+        [out appendFormat:@"[SECKIT] hits=%d\n", hit];
+        diagAppend(out);
+        free(list);
+    }
+}
+
 // ============ CFNetwork C 层 Cookie API ============
 // iOS SDK 未公开 CFHTTPCookie 头文件（仅 macOS 公开），手动声明类型，
 // 工具函数用 dlsym 运行时解析，hook 函数的 orig 指针由 fishhook 填充
@@ -3379,6 +3459,14 @@ static void initPrivacyHook(void) {
         // ---- 0a. v89: 身份轮换（必须早于任何 getFakeID 调用）----
         rotateIdentityIfNeeded();
 
+        // ---- 0a2. v96: 延迟枚举安全/指纹类（放后台，不阻塞启动）----
+        @try {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                v96DumpSecurityClasses();
+            });
+        } @catch (id e) {}
+
         // ---- 0b. v77: 设备聚类偏移量（必须在装 hook 之前算好）----
         // 每个克隆一组持久化随机值：开机时刻偏移 + 磁盘容量偏移。
         // 同克隆重启/升级都是同一组值（伪造的「设备」保持稳定）；
@@ -4107,6 +4195,21 @@ static void initPrivacyHook(void) {
                         NSURL *nu = u;
                         @try {
                             if (u.absoluteString.length > 20) {
+                                // ---- v96: mps 溯源（只观测，不改写）----
+                                if (g_v96BtLeft > 0 &&
+                                    [u.absoluteString rangeOfString:@"mps="].location != NSNotFound) {
+                                    g_v96BtLeft--;
+                                    v96DumpBacktrace(@"MPS-URL", u.absoluteString);
+                                }
+                                if (g_v96MpsLogs < 6 &&
+                                    [u.absoluteString rangeOfString:@"mps="].location != NSNotFound) {
+                                    g_v96MpsLogs++;
+                                    NSRange rr = [u.absoluteString rangeOfString:@"mps="];
+                                    NSString *tail = [u.absoluteString substringFromIndex:rr.location];
+                                    if (tail.length > 120) tail = [tail substringToIndex:120];
+                                    diagAppend([NSString stringWithFormat:
+                                                @"\n[MPS-VAL] %@\n", tail]);
+                                }
                                 NSString *r = rewriteIdentityString(u.absoluteString);
                                 if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
                             }
@@ -4124,6 +4227,15 @@ static void initPrivacyHook(void) {
                         @try {
                             if (body && g_bodyRewriteOff) {
                                 NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                                // v96: body 内 mps 溯源（只看不改，最多两次）
+                                if (raw && g_v96BodyBtLeft > 0 &&
+                                    [raw rangeOfString:@"mps="].location != NSNotFound) {
+                                    g_v96BodyBtLeft--;
+                                    NSRange rr = [raw rangeOfString:@"mps="];
+                                    NSString *tail = [raw substringFromIndex:rr.location];
+                                    if (tail.length > 150) tail = [tail substringToIndex:150];
+                                    v96DumpBacktrace(@"MPS-BODY", tail);
+                                }
                                 // ★ v95 ★ 下单链路全量取证 —— 不看结论看事实：
                                 //   把 App 真正发出去的 body 原文落盘，再用真机值清单扫一遍。
                                 //   命中项 = 服务端能看到本机的地方；全不命中 = 出口干净。
