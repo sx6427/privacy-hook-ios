@@ -1939,6 +1939,151 @@ static NSString *swapLegacyCuidValues(NSString *s) {
 // 观察点：日志里 [BODY-NATIVE] 会显示 App 自己拼出来的 body 用的是真值还是假值。
 static BOOL g_bodyRewriteOff = YES;
 
+// ============================================================
+// v95 — 真值对照清单 + 出口全量取证
+// ------------------------------------------------------------
+// 前面的路线（v90→v94）都在猜「服务端读的是哪条通道」，每版改一处，
+// 每版都被 3523 打回，包括官方原版。猜是错的，取证才是对的。
+//
+// 这里换一个方法：把「这台机器绕不过 hook 的原始值」先收集成一张表，
+// 再拿这张表去扫 App 真正发出去的 URL / Header / Body。
+//   · 命中 → 该字段就是服务端能看到本机的地方，直接定位
+//   · 全不命中 → 客户端出口是干净的，判定依据在服务端历史数据（设备档案/账号维度）
+// 这样无论结论是哪一边，都不需要再发第二版去猜。
+// ============================================================
+static NSMutableArray *g_truthPairs = nil;   // @[@{@"k":通道名, @"v":真机原值}]
+static BOOL g_truthBuilt = NO;
+
+// 只读取，缺值时绝不回写（避免把空串写进持久域污染后续判断）
+static NSString *truthReadKey(NSString *k) {
+    if (!k) return nil;
+    CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)k,
+                                                    kCFPreferencesCurrentApplication);
+    if (!v) return nil;
+    NSString *s = nil;
+    if (CFGetTypeID(v) == CFStringGetTypeID()) s = (__bridge NSString *)v;
+    CFRelease(v);
+    return s;
+}
+
+static void truthAdd(NSString *k, id v) {
+    if (!g_truthPairs) g_truthPairs = [NSMutableArray array];
+    if (!v) return;
+    NSString *s = [v isKindOfClass:[NSString class]] ? v : [v description];
+    if (s.length < 6) return;                       // 太短会误命中（地区码/版本号）
+    if ([s isEqualToString:@"(null)"] || [s isEqualToString:@"0"]) return;
+    for (NSDictionary *p in g_truthPairs) {
+        if ([p[@"v"] isEqualToString:s]) return;    // 同一值只留首条
+    }
+    [g_truthPairs addObject:@{@"k": k ?: @"?", @"v": s}];
+}
+
+// 收集真机原值：全部走 orig_* 指针，绕过本 dylib 自己的 hook。
+static void buildTruthList(void) {
+    if (g_truthBuilt) return;
+    g_truthBuilt = YES;
+    @try {
+        // 1) 百度身份真值（历史捕获，v57 起持久化）
+        NSString *rc = truthReadKey(@"BdD1.real.CUID_FAMILY");
+        if (rc.length >= 16) truthAdd(@"baidu.cuid.real", rc);
+        NSString *rb = truthReadKey(@"BdD1.real.BAIDUID_FAMILY");
+        if (rb.length >= 16) truthAdd(@"baidu.baiduid.real", rb);
+
+        // 2) MobileGestalt —— 硬件级唯一标识，官方与 clone 必然同值
+        if (orig_MGCopyAnswer) {
+            NSArray *ks = @[@"UniqueDeviceID", @"SerialNumber", @"UniqueChipID",
+                            @"ProductType", @"HardwareModel", @"PhysicalMachineModel",
+                            @"DeviceName", @"DieId", @"MLBSerialNumber"];
+            for (NSString *k in ks) {
+                @try {
+                    CFTypeRef v = orig_MGCopyAnswer((__bridge CFStringRef)k, NULL);
+                    if (!v) continue;
+                    if (CFGetTypeID(v) == CFStringGetTypeID()) {
+                        truthAdd([@"MG." stringByAppendingString:k], (__bridge NSString *)v);
+                    } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                        truthAdd([@"MG." stringByAppendingString:k],
+                                 [(__bridge NSNumber *)v stringValue]);
+                    }
+                    CFRelease(v);
+                } @catch (id e) {}
+            }
+        }
+
+        // 3) uname —— 主机名/机器名，官方与 clone 必然同值
+        if (orig_uname) {
+            struct utsname uu;
+            memset(&uu, 0, sizeof(uu));
+            if (orig_uname(&uu) == 0) {
+                if (uu.nodename[0]) truthAdd(@"uname.nodename",
+                                             [NSString stringWithUTF8String:uu.nodename]);
+                if (uu.machine[0])  truthAdd(@"uname.machine",
+                                             [NSString stringWithUTF8String:uu.machine]);
+            }
+        }
+
+        // 4) sysctl —— 内存/CPU/开机时刻，官方与 clone 必然同值
+        int (*rs)(const char *, void *, size_t *, void *, size_t) = orig_sysctlbyname;
+        if (rs) {
+            char b[256];
+            size_t s;
+            s = sizeof(b); memset(b, 0, sizeof(b));
+            if (rs("kern.hostname", b, &s, NULL, 0) == 0 && b[0])
+                truthAdd(@"sysctl.kern.hostname", [NSString stringWithUTF8String:b]);
+            s = sizeof(b); memset(b, 0, sizeof(b));
+            if (rs("kern.osversion", b, &s, NULL, 0) == 0 && b[0])
+                truthAdd(@"sysctl.kern.osversion", [NSString stringWithUTF8String:b]);
+            uint64_t mem = 0; s = sizeof(mem);
+            if (rs("hw.memsize", &mem, &s, NULL, 0) == 0 && mem)
+                truthAdd(@"sysctl.hw.memsize", [NSString stringWithFormat:@"%llu", mem]);
+            struct timeval tv; size_t ts = sizeof(tv);
+            if (rs("kern.boottime", &tv, &ts, NULL, 0) == 0 && tv.tv_sec > 0)
+                truthAdd(@"sysctl.kern.boottime", [NSString stringWithFormat:@"%ld", (long)tv.tv_sec]);
+        }
+
+        // 5) IDFV 真值 —— IDFV hook 安装前落盘的原始 UUID
+        NSString *ivR = truthReadKey(@"BdD1.real.idfv");
+        if (ivR.length >= 20) truthAdd(@"idfv.real", ivR);
+
+        diagAppend([NSString stringWithFormat:
+            @"\n[TRUTH] list built, %lu entries\n", (unsigned long)g_truthPairs.count]);
+    } @catch (id e) {
+        diagAppend([NSString stringWithFormat:@"\n[TRUTH] build failed: %@\n", e]);
+    }
+}
+
+// 扫描一段文本里有没有出现真机原值。命中即「服务端能看到本机」。
+static void scanTruthHits(NSString *where, NSString *text) {
+    if (!text || text.length < 6) return;
+    buildTruthList();
+    @try {
+        for (NSDictionary *p in g_truthPairs) {
+            NSString *v = p[@"v"];
+            if (v.length < 6) continue;
+            if ([text rangeOfString:v].location != NSNotFound) {
+                diagAppend([NSString stringWithFormat:
+                    @"[TRUTH-HIT] %@   <%@> = %@\n", where, p[@"k"], v]);
+            }
+        }
+    } @catch (id e) {}
+}
+
+// v95: 最近一次请求 URL —— setHTTPBody: 拿不到 URL，靠这个定位是不是下单链路
+static NSString *g_lastReqURL = nil;
+static int g_fullDumpCount = 0;   // 全量取证的次数上限，防止日志爆炸
+
+// 全量落盘一段请求（分块，避免单行过长被截断）
+static void dumpBlob(NSString *tag, NSString *text) {
+    if (!text) return;
+    const NSUInteger CH = 900;
+    NSUInteger n = text.length;
+    diagAppend([NSString stringWithFormat:@"\n[%@] len=%lu\n", tag, (unsigned long)n]);
+    for (NSUInteger i = 0; i < n; i += CH) {
+        NSUInteger l = MIN(CH, n - i);
+        diagAppend([NSString stringWithFormat:@"[%@:%04lu] %@\n", tag,
+                    (unsigned long)i, [text substringWithRange:NSMakeRange(i, l)]]);
+    }
+}
+
 static NSString *rewriteIdentityString(NSString *s) {
     if (!s || s.length < 20) return s;
     @try {
@@ -3103,6 +3248,18 @@ static NSArray *filterCloneApps(NSArray *arr) {
                 @"\n[APPS] installed=%lu afterFilter=%lu baiduHidden=%lu\n",
                 (unsigned long)arr.count, (unsigned long)out.count,
                 (unsigned long)baiduHidden]);
+            // v95: 完整名单落盘 —— v94 只剔了百度系，非百度 App（微信/支付宝/
+            //   淘宝…）仍与官方原版完全相同，依然是设备锚点。这份名单要看清。
+            @try {
+                NSMutableArray *bids = [NSMutableArray array];
+                for (id app in out) {
+                    NSString *b = nil;
+                    @try { b = [app valueForKey:@"bundleIdentifier"]; } @catch (id e2) {}
+                    if (b.length) [bids addObject:b];
+                }
+                diagAppend([NSString stringWithFormat:@"[APPS-LIST] %@\n",
+                            [bids componentsJoinedByString:@", "]]);
+            } @catch (id e3) {}
         } @catch (id e) {}
     }
     return (out.count == arr.count) ? arr : out;
@@ -3289,6 +3446,15 @@ static void initPrivacyHook(void) {
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
+                    // v95: 替换前先把真 IDFV 落盘 —— 真值扫描要用它判断
+                    //   「发出去的报文里有没有本机 IDFV」。此时 hook 尚未生效，
+                    //   这里读到的就是系统真值；每次启动覆盖写一次，值恒定。
+                    @try {
+                        NSUUID *ru = [[UIDevice currentDevice] identifierForVendor];
+                        if (ru.UUIDString.length >= 20) {
+                            setPersistent(@"BdD1.real.idfv", ru.UUIDString);
+                        }
+                    } @catch (id e) {}
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
                         return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdD1.iv", ^{ return genUUIDStr(); })];
                     });
@@ -3945,6 +4111,7 @@ static void initPrivacyHook(void) {
                                 if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
                             }
                         } @catch (id e) {}
+                        @try { if (nu.absoluteString) g_lastReqURL = nu.absoluteString; } @catch (id e) {}
                         ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), nu);
                     });
                     class_replaceMethod(reqClass, @selector(setURL:), newSetURL, method_getTypeEncoding(suM));
@@ -3957,6 +4124,41 @@ static void initPrivacyHook(void) {
                         @try {
                             if (body && g_bodyRewriteOff) {
                                 NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                                // ★ v95 ★ 下单链路全量取证 —— 不看结论看事实：
+                                //   把 App 真正发出去的 body 原文落盘，再用真机值清单扫一遍。
+                                //   命中项 = 服务端能看到本机的地方；全不命中 = 出口干净。
+                                @try {
+                                    NSString *u = g_lastReqURL ?: @"";
+                                    BOOL orderPath =
+                                        [u containsString:@"orders/create"] ||
+                                        [u containsString:@"orders/confirm"] ||
+                                        [u containsString:@"innerChannelAllInfo"] ||
+                                        [u containsString:@"calculateInit"] ||
+                                        [u containsString:@"trade/v2.0"] ||
+                                        [u containsString:@"cashier/sdk"];
+                                    // 兜底：URL 没抓到（CFNetwork/结构体路径）时按 body 特征判断
+                                    if (!orderPath && raw) {
+                                        orderPath = [raw containsString:@"orders/create"] ||
+                                                    [raw containsString:@"sdkSign"] ||
+                                                    [raw containsString:@"sdkParams"];
+                                    }
+                                    if (raw && raw.length > 30 && orderPath && g_fullDumpCount < 8) {
+                                        g_fullDumpCount++;
+                                        dumpBlob(@"REQ-BODY", raw);
+                                        scanTruthHits(@"REQ-BODY", raw);
+                                        NSMutableString *hdr = [NSMutableString string];
+                                        @try {
+                                            NSDictionary *hd = ((NSURLRequest *)s).allHTTPHeaderFields;
+                                            if (hd) [hdr appendFormat:@"HEADERS %@\n", hd];
+                                            NSString *ck = [((NSURLRequest *)s) valueForHTTPHeaderField:@"Cookie"];
+                                            if (ck) [hdr appendFormat:@"COOKIE %@\n", ck];
+                                        } @catch (id e2) {}
+                                        if (hdr.length) {
+                                            dumpBlob(@"REQ-HDR", hdr);
+                                            scanTruthHits(@"REQ-HDR", hdr);
+                                        }
+                                    }
+                                } @catch (id e3) {}
                                 // ★ v93 ★ v92 把「所有 body 改写」一起关了，副作用是
                                 //   v91 刚换好的度小满 aif 设备号（imei / cu_short）又退回
                                 //   真机旧值 —— 真机日志实证：v92 的
@@ -4003,6 +4205,7 @@ static void initPrivacyHook(void) {
                                 if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
                             }
                         } @catch (id e) {}
+                        @try { if (nu.absoluteString) g_lastReqURL = nu.absoluteString; } @catch (id e) {}
                         return ((id (*)(id, SEL, NSURL *))origInitURL)(s, @selector(initWithURL:), nu);
                     });
                     class_replaceMethod(reqClass, @selector(initWithURL:), newInitURL, method_getTypeEncoding(iwM));
@@ -4217,7 +4420,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v93 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v95 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
@@ -4242,6 +4445,14 @@ static void initPrivacyHook(void) {
                  getPersistent(@"BdD1.iv", ^{ return genUUIDStr(); })];
                 [m appendFormat:@"  EPOCH        = %@\n",
                  getPersistent(@"BdD1.epoch", ^{ return @"(none)"; })];
+
+                // v95: 真值清单落盘 —— 这份表就是「服务端可能看到的本机原值」，
+                //   出口取证时逐条比对，命中即漏点。
+                buildTruthList();
+                [m appendString:@"  --- TRUTH LIST (真机原值) ---\n"];
+                for (NSDictionary *p in g_truthPairs) {
+                    [m appendFormat:@"  %-24@ = %@\n", p[@"k"], p[@"v"]];
+                }
 
                 // v80: 真机 MobileGestalt 各字段原始值 —— 用 orig 指针绕过本 hook，
                 //   用来确认 ProductType / HardwareModel 在真机上的真实格式，
