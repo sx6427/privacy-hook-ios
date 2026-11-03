@@ -3056,21 +3056,53 @@ static BOOL isOurCloneBundleID(NSString *bid) {
     return [bid hasPrefix:@"com.baidu.BaiduMobile."];
 }
 
+// ★ v94 ★P0★ 设备指纹层：整条百度家族从枚举结果里剔除。
+//
+// v77 只剔掉了 clone 自己（com.baidu.BaiduMobile.BdDx），却**保留了官方
+// 原版 com.baidu.BaiduMobile** 以及 com.baidu.map / netdisk / tieba 等
+// 全家桶。后果是致命的：
+//
+//   同一台物理机上，clone 上报的 App 列表
+//   = 官方原版上报的 App 列表（一个不差）
+//   → 服务端拿这份名单一比，立刻确认「同一台设备」
+//   → cuid / imei / devuid / idfv / 机型 改多少遍都没用
+//
+// 这也解释了 2026-11-03 的实测：官方 App 与 v71/v93 clone 全部 3523
+// —— 因为三者的设备指纹本来就是同一份。
+//
+// v94 起：凡 com.baidu.* / com.baidubce.* 一律不出现在枚举结果里。
+// 服务端看到的是一台「只装了当前这一个 App」的干净设备。
+// 副作用：App 内跳转百度地图/网盘的一键唤起会失效（可接受）。
+static BOOL isBaiduFamilyApp(NSString *bid) {
+    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) return NO;
+    static NSArray *prefixes = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        prefixes = @[@"com.baidu.", @"com.baidubce.", @"com.baidu.BaiduMobile"];
+    });
+    for (NSString *p in prefixes) {
+        if ([bid hasPrefix:p]) return YES;
+    }
+    return NO;
+}
+
 static NSArray *filterCloneApps(NSArray *arr) {
     if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return arr;
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    NSUInteger baiduHidden = 0;
     for (id app in arr) {
         NSString *bid = nil;
         @try { bid = [app valueForKey:@"bundleIdentifier"]; } @catch (id e) {}
-        if (isOurCloneBundleID(bid)) continue;
+        if (isBaiduFamilyApp(bid)) { baiduHidden++; continue; }   // v94: 整个百度家族
         [out addObject:app];
     }
     if (!g_appsDiagLogged) {
         g_appsDiagLogged = YES;
         @try {
             diagAppend([NSString stringWithFormat:
-                @"\n[APPS] installed=%lu afterFilter=%lu (clone entries hidden)\n",
-                (unsigned long)arr.count, (unsigned long)out.count]);
+                @"\n[APPS] installed=%lu afterFilter=%lu baiduHidden=%lu\n",
+                (unsigned long)arr.count, (unsigned long)out.count,
+                (unsigned long)baiduHidden]);
         } @catch (id e) {}
     }
     return (out.count == arr.count) ? arr : out;
@@ -3423,10 +3455,36 @@ static void initPrivacyHook(void) {
                 if (qm) {
                     IMP oq = method_getImplementation(qm);
                     IMP impq = imp_implementationWithBlock(^NSArray *(id s, NSString *bid) {
-                        if (isOurCloneBundleID(bid)) return @[];
+                        if (isBaiduFamilyApp(bid)) return @[];   // v94
                         return ((NSArray *(*)(id, SEL, NSString *))oq)(s, qs, bid);
                     });
                     class_replaceMethod(lsw, qs, impq, method_getTypeEncoding(qm));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3a-3. v94: URL scheme 探测封堵 ★P0★ ----
+        // 枚举被过滤后还有一条绕路：-canOpenURL:。baidumap:// /
+        // baidunetdisk:// / baiduboxapp:// 任一返回 YES，等于直接告诉风控
+        // 「这台机器上装了百度全家桶」，结论与官方原版上报的完全一致。
+        // v77 只堵了 LSApplicationWorkspace，canOpenURL 在文件里 0 处覆盖。
+        // v94：百度系 scheme 一律 NO；其他 scheme 透传原实现。
+        @try {
+            Class uia = objc_getClass("UIApplication");
+            if (uia) {
+                SEL cs = @selector(canOpenURL:);
+                Method cm = class_getInstanceMethod(uia, cs);
+                if (cm) {
+                    IMP oc = method_getImplementation(cm);
+                    IMP ic = imp_implementationWithBlock(^BOOL(id s, NSURL *u) {
+                        if ([u isKindOfClass:[NSURL class]]) {
+                            NSString *sch = u.scheme.lowercaseString;
+                            if (sch.length && [sch hasPrefix:@"baidu"]) return NO;
+                        }
+                        return ((BOOL (*)(id, SEL, NSURL *))oc)(s, cs, u);
+                    });
+                    class_replaceMethod(uia, cs, ic, method_getTypeEncoding(cm));
+                    diagAppend(@"\n[SCHEME] canOpenURL hook on (baidu* -> NO)\n");
                 }
             }
         } @catch (id e) {}
