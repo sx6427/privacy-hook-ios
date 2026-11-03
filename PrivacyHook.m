@@ -3898,9 +3898,18 @@ static void initPrivacyHook(void) {
                         NSData *nb = body;
                         @try {
                             if (body && g_bodyRewriteOff) {
-                                // v92: 只观测不改写
                                 NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-                                if (raw && (raw.length > 40) &&
+                                // ★ v93 ★ v92 把「所有 body 改写」一起关了，副作用是
+                                //   v91 刚换好的度小满 aif 设备号（imei / cu_short）又退回
+                                //   真机旧值 —— 真机日志实证：v92 的
+                                //   aif/sdk/init 里 imei=aac0ffa1… / cu_short=10ea1c17…。
+                                //   这里只把 aif 这一类（带 atbc / cu_short）放行，
+                                //   下单 body 仍然保持原生，签名实验的口径不变。
+                                if (raw && ([raw containsString:@"cu_short="] ||
+                                            [raw containsString:@"atbc="]) &&
+                                    ![raw containsString:@"orders/create"]) {
+                                    nb = rewriteIdentityData(body);
+                                } else if (raw && (raw.length > 40) &&
                                     ([raw containsString:@"orders/create"] || [raw containsString:@"cuid="] ||
                                      [raw containsString:@"sdkParams"] || [raw containsString:@"sign="])) {
                                     NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
