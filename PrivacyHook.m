@@ -1291,10 +1291,19 @@ static BOOL isIdentityKeychainDict(CFDictionaryRef dict) {
         // v72: 补 mtj/cdid/umid/oaid/vaid/aaid —— 百度统计(MTJ)设备 ID 族，
         //       主二进制引用 40+ 处。缺了它们，克隆会按「非身份项」把原版
         //       存的统计设备 ID 读回退读进来 → 统计图谱直接关联
+        // ★ v93 ★ 补 zid —— 这是最后一块拼图。
+        //   证据链：zid 在 162 次请求里前缀 30 字节恒定；删掉
+        //   Documents/ehcacerifos/oetnv2 后重启会“重建出完全相同的值”；
+        //   换 cuid / 换 IDFV / 清 prefs / 重装七次全部无效。
+        //   → 说明它存在一个跨重装存活、且不在 prefs 里的地方：keychain。
+        //   而 v72 的关键字表里只有 umid/mtj/cdid，**没有 zid** →
+        //   zid 被判定为「非身份项」→ 走 v66 读回退 → 读到原版设备的 zid。
+        //   加进来后本克隆查不到 → 断开回退 → App 只能自己重建新身份。
         NSMutableArray *m = [@[@"cuid", @"devuid", @"deviceid", @"device_id", @"idfv", @"idfa",
                @"udid", @"stoken", @"token", @"bduss", @"login", @"account",
                @"passport", @"sapi", @"user", @"ptoken", @"session",
-               @"mtj", @"cdid", @"umid", @"oaid", @"vaid", @"aaid"] mutableCopy];
+               @"mtj", @"cdid", @"umid", @"oaid", @"vaid", @"aaid",
+               @"zid", @"zuid", @"umidtoken"] mutableCopy];
 #if MT_CLONE
         // ★ v75: 美团设备身份族（ONI SDK keychain 条目）★
         // 二进制实证：kONIPrivateKeychainValueUUID / ...DPID / ...UnionID、
@@ -1545,6 +1554,29 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
     // 回退命中的结果照走下方出口消毒（rewriteIdentityData / stripTag）。
     if (!identity && query && st == -25300 /* errSecItemNotFound */) {
         st = orig_SecItemCopyMatching(query, result);
+        // ★ v93 ★ 回退取证：本克隆没有、却从原版共享域读回来的条目到底有哪些。
+        //   只记 svc/acct 名字，不记值；每对只记一次，避免把日志刷爆。
+        //   目的：把「因为关键字表漏项而被当成非身份项」的条目全部找出来，
+        //   而不是继续靠猜。命中 zid/umid/cdid 一类即坐实串号。
+        if (st == 0 && query) {
+            @try {
+                CFTypeRef sv = CFDictionaryGetValue(query, kSecAttrService);
+                CFTypeRef av = CFDictionaryGetValue(query, kSecAttrAccount);
+                NSString *svcS = (sv && CFGetTypeID(sv) == CFStringGetTypeID()) ? (__bridge NSString *)sv : @"?";
+                NSString *acctS = (av && CFGetTypeID(av) == CFStringGetTypeID()) ? (__bridge NSString *)av : @"?";
+                static NSMutableSet *seenRT = nil;
+                static dispatch_once_t onceRT;
+                dispatch_once(&onceRT, ^{ seenRT = [NSMutableSet set]; });
+                NSString *sig = [NSString stringWithFormat:@"%@|%@", svcS, acctS];
+                @synchronized (seenRT) {
+                    if (![seenRT containsObject:sig]) {
+                        [seenRT addObject:sig];
+                        diagAppend([NSString stringWithFormat:@"\n[%@] KC-READTHROUGH svc=%@ acct=%@\n",
+                                    [NSDate date], svcS, acctS]);
+                    }
+                }
+            } @catch (id e) {}
+        }
     }
 #endif
 #if MT_CLONE
@@ -4118,7 +4150,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v92 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v93 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
