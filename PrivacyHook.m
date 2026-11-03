@@ -1901,6 +1901,12 @@ static NSString *swapLegacyCuidValues(NSString *s) {
     return s;
 }
 
+// ★ v92 实验开关 ★
+// 关闭 POST body 的出口改写，只保留读取路径（prefs/CFPreferences）的假身份。
+// 目的：验证 orders/create 的 sign、收银台的 sdkSign 是否被我们改写 body 之后失效。
+// 观察点：日志里 [BODY-NATIVE] 会显示 App 自己拼出来的 body 用的是真值还是假值。
+static BOOL g_bodyRewriteOff = YES;
+
 static NSString *rewriteIdentityString(NSString *s) {
     if (!s || s.length < 20) return s;
     @try {
@@ -3858,7 +3864,31 @@ static void initPrivacyHook(void) {
                     IMP origSetBody = method_getImplementation(sbM);
                     IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
                         NSData *nb = body;
-                        @try { if (body) nb = rewriteIdentityData(body); } @catch (id e) {}
+                        @try {
+                            if (body && g_bodyRewriteOff) {
+                                // v92: 只观测不改写
+                                NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                                if (raw && (raw.length > 40) &&
+                                    ([raw containsString:@"orders/create"] || [raw containsString:@"cuid="] ||
+                                     [raw containsString:@"sdkParams"] || [raw containsString:@"sign="])) {
+                                    NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
+                                    NSString *fc = getFakeID(@"BAIDUCUID");
+                                    NSString *rb = getPersistent(@"BdD1.real.BAIDUID_FAMILY", ^{ return @""; });
+                                    NSString *fb = getFakeID(@"BAIDUID");
+                                    NSUInteger cr = (rc.length > 15) ? [raw componentsSeparatedByString:rc].count - 1 : 0;
+                                    NSUInteger cf = (fc.length > 15) ? [raw componentsSeparatedByString:fc].count - 1 : 0;
+                                    NSUInteger br = (rb.length > 15) ? [raw componentsSeparatedByString:rb].count - 1 : 0;
+                                    NSUInteger bf = (fb.length > 15) ? [raw componentsSeparatedByString:fb].count - 1 : 0;
+                                    diagAppend([NSString stringWithFormat:
+                                        @"\n[BODY-NATIVE] len=%lu realCuid=%lu fakeCuid=%lu realBUID=%lu fakeBUID=%lu\n  HEAD: %@\n",
+                                        (unsigned long)raw.length, (unsigned long)cr, (unsigned long)cf,
+                                        (unsigned long)br, (unsigned long)bf,
+                                        [raw substringToIndex:MIN((NSUInteger)260, raw.length)]]);
+                                }
+                            } else if (body) {
+                                nb = rewriteIdentityData(body);
+                            }
+                        } @catch (id e) {}
                         ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), nb);
                     });
                     class_replaceMethod(reqClass, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(sbM));
@@ -4088,7 +4118,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v91 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v92 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
