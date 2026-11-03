@@ -1814,7 +1814,13 @@ static NSString *swapLegacyCuidValues(NSString *s) {
             // 本机真实 cuid（百度地图/翻译共用值，绝不该出现在克隆请求里）
             @"3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS",
             // v57P~v83 的 69 位 b64url 假 cuid（错误格式，必须消失）
-            @"TV4-nInmlRIwIxgTxxfkMUdyfife7qqeL0Y0ATsaSp661tgu_AvyZ1MLxxSpIDoTvyMmA"
+            @"TV4-nInmlRIwIxgTxxfkMUdyfife7qqeL0Y0ATsaSp661tgu_AvyZ1MLxxSpIDoTvyMmA",
+            // ★ v90: v84~v89 的平台 cuid 真值 —— 实测残留两处：
+            //   1) push bind body `old_cuid=`（每启动一次就上报一次，等于
+            //      主动声明「我换过设备 ID」，是最强的关联信号）；
+            //   2) prefs `easyBrowserPageRecoveryCmdURLString` 缓存 URL。
+            //   BDWallet 的 bdwallet_device_uuid 已改走读路径拦截，这里只兜底。
+            @"CC558E35AE333746EDB52C56DD62C15E8C26BB87KP4IT40I0QM"
         ];
     });
     NSString *fake = getFakeID(@"PLATCUID");
@@ -2465,6 +2471,13 @@ static BOOL isCuidValueKey(NSString *k) {
     if ([lk containsString:@"baiducuid"]) return YES;
     if ([lk containsString:@"mawebcuid"]) return YES;
     if ([lk containsString:@"cuid_family"]) return YES;
+    // ★ v90 ★ 度小满 / BDWallet 设备号 —— 值就是平台 cuid（51 位），
+    //   duxiaodian 的 orders/create 请求体里 `cuid=…|mobilebaidu` 直接取它。
+    //   v89 轮换只清了 BdD1.ck.*，没动这个键 → 轮换后下单仍带旧设备号，
+    //   与 URL 里的新 uid 打架（服务端一致性校验直接回 3523「人数过多」）。
+    if ([lk isEqualToString:@"bdwallet_device_uuid"]) return YES;
+    if ([lk hasPrefix:@"bdwallet_"] && [lk hasSuffix:@"uuid"]) return YES;
+    if ([lk hasPrefix:@"bdwallet_"] && [lk hasSuffix:@"cuid"]) return YES;
     return NO;
 }
 
@@ -2526,7 +2539,75 @@ static void normalizeIdentityPrefs(void) {
         CFPreferencesSetAppValue(CFSTR("com.baidu.baidumobile.cuidDeviceInfo"),
                                  (__bridge CFStringRef)[NSString stringWithUTF8String:FAKE_MACHINE],
                                  kCFPreferencesCurrentApplication);
+
+        // ★ v90 ★ BDWallet 设备号显式落盘（不依赖上面的遍历命不命中），
+        //   并回读一次写进日志，确认轮换后下单链路拿到的是新值。
+        @try {
+            NSString *wc = getFakeID(@"PLATCUID");
+            CFPreferencesSetAppValue(CFSTR("bdwallet_device_uuid"),
+                                     (__bridge CFStringRef)wc,
+                                     kCFPreferencesCurrentApplication);
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            CFPropertyListRef back = CFPreferencesCopyAppValue(CFSTR("bdwallet_device_uuid"),
+                                                               kCFPreferencesCurrentApplication);
+            NSString *bs = (back && CFGetTypeID(back) == CFStringGetTypeID())
+                         ? (__bridge NSString *)back : @"(null)";
+            diagAppend([NSString stringWithFormat:
+                @"\n[WALLET] bdwallet_device_uuid = %@ (expect %@)%@\n",
+                bs, wc, [bs isEqualToString:wc] ? @" OK" : @" ✗MISMATCH"]);
+            if (back) CFRelease(back);
+        } @catch (id e) {}
+
         CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+
+        // ★ v90 ★ 本地缓存 URL 净化 —— 实测 prefs 里
+        //   `easyBrowserPageRecoveryCmdURLString` 存着一整条带 uid=旧cuid 的
+        //   baiduboxapp:// 恢复链接，App 一旦用它还原页面就会拿旧设备号发请求。
+        //   只清「缓存/恢复链接」类键，不动账号与功能数据。
+        @try {
+            NSArray *tokens = @[
+                @"CC558E35AE333746EDB52C56DD62C15E8C26BB87KP4IT40I0QM",
+                @"33967FA4FB91506EBFB36D88DCBC44AB1C00385DPD129PU1D6E",
+                @"A71DA648AAEE97DFFB1AC3C736A7FD67D7B879526FLJNBFLEIB",
+                @"3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS"
+            ];
+            CFArrayRef kl2 = CFPreferencesCopyKeyList(kCFPreferencesCurrentApplication,
+                                                      kCFPreferencesCurrentUser,
+                                                      kCFPreferencesAnyHost);
+            NSUInteger scrubbed = 0;
+            if (kl2) {
+                CFIndex n2 = CFArrayGetCount(kl2);
+                for (CFIndex i = 0; i < n2; i++) {
+                    CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(kl2, i);
+                    if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+                    NSString *key = (__bridge NSString *)k;
+                    if ([key hasPrefix:@"BdD1."]) continue;
+                    NSString *lk = key.lowercaseString;
+                    BOOL cacheLike = ([lk containsString:@"url"] || [lk containsString:@"cache"]
+                                   || [lk containsString:@"recovery"] || [lk containsString:@"history"]);
+                    if (!cacheLike) continue;
+                    CFPropertyListRef cv = CFPreferencesCopyAppValue(k, kCFPreferencesCurrentApplication);
+                    if (!cv) continue;
+                    BOOL hit = NO;
+                    if (CFGetTypeID(cv) == CFStringGetTypeID()) {
+                        NSString *sv = (__bridge NSString *)cv;
+                        for (NSString *t in tokens) {
+                            if ([sv containsString:t]) { hit = YES; break; }
+                        }
+                    }
+                    CFRelease(cv);
+                    if (hit) {
+                        CFPreferencesSetAppValue(k, NULL, kCFPreferencesCurrentApplication);
+                        scrubbed++;
+                    }
+                }
+                CFRelease(kl2);
+            }
+            if (scrubbed) {
+                diagAppend([NSString stringWithFormat:@"\n[SCRUB] dropped %lu cached keys holding legacy cuid\n",
+                            (unsigned long)scrubbed]);
+            }
+        } @catch (id e) {}
     } @catch (id e) {}
 }
 
@@ -3931,7 +4012,7 @@ static void initPrivacyHook(void) {
                                       : (int (*)(const char *, void *, size_t *, void *, size_t))
                                         dlsym(RTLD_DEFAULT, "sysctlbyname");
                 NSMutableString *m = [NSMutableString stringWithFormat:
-                    @"\n===== v89 PROFILE %@ =====\n", [NSDate date]];
+                    @"\n===== v90 PROFILE %@ =====\n", [NSDate date]];
                 for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
                     unsigned char buf[256];
                     memset(buf, 0, sizeof(buf));
