@@ -1,5 +1,5 @@
 //
-// PrivacyHook.m — v68F: A 系列 v57f + group 域隔离 + Keychain 全量私有(不改 service) + 共享登录组过滤
+// PrivacyHook.m — v69F: keychain 全透传(保支付) + 共享登录组按 owned 白名单过滤
 //
 // 记忆文件教训：
 //   v57 成功（第一次能下单）：fishhook 只 hook 主程序，无 dyld 回调，无 URL/POST Body，简单清理
@@ -638,6 +638,59 @@ static void hook_CFPrefSetAppValue(CFStringRef key, CFPropertyListRef value, CFS
 // 说明：后缀由 fpx() 运行时派生，一份 dylib 打进 F1..F10 各自独立命名空间。
 // ============================================================
 
+// ---- v69F: 本 clone 写过的 keychain 条目白名单 ----
+// 思路：keychain 的写入/查询字段**全部原样透传**（保住度小满收银台），
+// 只在「读取结果」这一层判断：属于 passport 共享登录组、且不是本 clone 写的条目，
+// 一律剔除。这样既不碰支付，也不会把别的 clone 的 BDUSS 交出去。
+static NSString *kcKeyOf(NSDictionary *d) {
+    id svc = d[(__bridge id)kSecAttrService];
+    id acct = d[(__bridge id)kSecAttrAccount];
+    if (![svc isKindOfClass:[NSString class]]) svc = @"-";
+    if (![acct isKindOfClass:[NSString class]]) acct = @"-";
+    return [NSString stringWithFormat:@"%@\x1f%@", svc, acct];
+}
+
+static NSMutableSet *kcOwned(void) {
+    static NSMutableSet *st = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        st = [NSMutableSet set];
+        @try {
+            CFPropertyListRef v = CFPreferencesCopyAppValue(
+                (__bridge CFStringRef)FKEY(@"kcown"), kCFPreferencesCurrentApplication);
+            if (v) {
+                if (CFGetTypeID(v) == CFArrayGetTypeID()) {
+                    for (id x in (__bridge NSArray *)v)
+                        if ([x isKindOfClass:[NSString class]]) [st addObject:x];
+                }
+                CFRelease(v);
+            }
+        } @catch (id e) {}
+    });
+    return st;
+}
+
+static void kcRemember(NSDictionary *d) {
+    @try {
+        if (![d isKindOfClass:[NSDictionary class]]) return;
+        NSMutableSet *st = kcOwned();
+        NSString *k = kcKeyOf(d);
+        if ([st containsObject:k]) return;
+        [st addObject:k];
+        NSArray *a = st.allObjects;
+        if (a.count > 400) a = [a subarrayWithRange:NSMakeRange(a.count - 400, 400)];
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcown"),
+                                 (__bridge CFPropertyListRef)a,
+                                 kCFPreferencesCurrentApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    } @catch (id e) {}
+}
+
+static BOOL kcIsOwned(NSDictionary *d) {
+    @try { return [kcOwned() containsObject:kcKeyOf(d)]; } @catch (id e) {}
+    return NO;
+}
+
 static NSString *kcSuffix(void) {
     static NSString *s = nil;
     static dispatch_once_t once;
@@ -781,23 +834,6 @@ static void kcLogPay(const char *op, NSDictionary *d, OSStatus st) {
 // 其余所有 keychain 操作（度小满、推送、证书、系统服务）1:1 原样透传。
 // 多开隔离的主体仍由 A 系列的随机硬件人格承担，keychain 只兜住登录票据。
 // ============================================================
-// 百度 passport 的共享登录组（真机 keychain 取证：.36，2026-11-06）
-// 只有这个组里放 BDUSS / STOKEN / PTOKEN，其他两个组是 netdisk / baidumobile.cuid。
-static BOOL kcBaiduAG(NSString *ag) {
-    if (![ag isKindOfClass:[NSString class]] || ag.length == 0) return NO;
-    return [ag.lowercaseString rangeOfString:@"shareloginaccount"].location != NSNotFound;
-}
-
-// v68F 隔离范围：除支付命名空间外一律隔离。
-// 与 v67F 的区别：**只改写 account/service 的既有值，绝不注入新的 service**。
-// v67F 给每条都塞了 bdpriv.<BdFn>. 前缀，把钱包 SDK 依赖的 service 语义改掉，
-// 导致收银台拿不到渠道（用户实测不能支付）；v64F 只改 account，付款是好的。
-static BOOL kcShouldIso(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    if (kcPayNS(d)) return NO;
-    return YES;
-}
-
 static BOOL kcBaiduIDStr(NSString *v) {
     if (![v isKindOfClass:[NSString class]] || v.length == 0) return NO;
     NSString *l = v.lowercaseString;
@@ -830,26 +866,19 @@ static BOOL kcBaiduIDDict(NSDictionary *d) {
     return NO;
 }
 
-static BOOL kcForeignLoginItem(NSDictionary *item) {
+static BOOL kcShareLoginItem(NSDictionary *item) {
     if (![item isKindOfClass:[NSDictionary class]]) return NO;
-    NSString *ag = item[(__bridge id)kSecAttrAccessGroup];
-    if (!kcBaiduAG(ag)) return NO;
-    // 本 clone 写的条目 account/service 一定带 .BdFn 后缀；没有就是官方或其他 clone 写的
-    NSString *sfx = kcSuffix();
-    for (id k in kcLocatorKeys()) {
-        id v = item[k];
-        if ([v isKindOfClass:[NSString class]] && [(NSString *)v hasSuffix:sfx]) return NO;
-    }
-    return YES;
+    id ag = item[(__bridge id)kSecAttrAccessGroup];
+    if (![ag isKindOfClass:[NSString class]]) return NO;
+    return [((NSString *)ag).lowercaseString rangeOfString:@"shareloginaccount"].location != NSNotFound;
 }
 
-static CFTypeRef kcFilterEnumResult(CFTypeRef res) {
+// 只剔除「别人写进共享登录组」的条目；本 clone 写过的放行
+static CFTypeRef kcFilterLoginShared(CFTypeRef res) {
     if (!res) return res;
     if (CFGetTypeID(res) == CFDictionaryGetTypeID()) {
-        if (kcForeignLoginItem((__bridge NSDictionary *)res)) {
-            CFRelease(res);
-            return NULL;
-        }
+        NSDictionary *d = (__bridge NSDictionary *)res;
+        if (kcShareLoginItem(d) && !kcIsOwned(d)) { CFRelease(res); return NULL; }
         return res;
     }
     if (CFGetTypeID(res) != CFArrayGetTypeID()) return res;
@@ -859,8 +888,10 @@ static CFTypeRef kcFilterEnumResult(CFTypeRef res) {
     if (!out) return res;
     for (CFIndex i = 0; i < n; i++) {
         CFTypeRef o = CFArrayGetValueAtIndex(arr, i);
-        if (o && CFGetTypeID(o) == CFDictionaryGetTypeID() &&
-            kcForeignLoginItem((__bridge NSDictionary *)o)) continue;
+        if (o && CFGetTypeID(o) == CFDictionaryGetTypeID()) {
+            NSDictionary *d = (__bridge NSDictionary *)o;
+            if (kcShareLoginItem(d) && !kcIsOwned(d)) continue;
+        }
         CFArrayAppendValue(out, o);
     }
     CFRelease(res);
@@ -875,13 +906,12 @@ static OSStatus (*orig_SecItemDelete)(CFDictionaryRef) = NULL;
 static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
     if (!orig_SecItemAdd) return errSecParam;
     // 非登录票据：原样透传
-    if (!kcShouldIso((__bridge NSDictionary *)attrs)) {
-        if (attrs && kcPayNS((__bridge NSDictionary *)attrs)) {
-            OSStatus st0 = orig_SecItemAdd(attrs, result);
+    if (!kcBaiduIDDict((__bridge NSDictionary *)attrs)) {
+        OSStatus st0 = orig_SecItemAdd(attrs, result);
+        if (st0 == errSecSuccess) kcRemember((__bridge NSDictionary *)attrs);
+        if (attrs && kcPayNS((__bridge NSDictionary *)attrs))
             kcLogPay("ADD-PASS", (__bridge NSDictionary *)attrs, st0);
-            return st0;
-        }
-        return orig_SecItemAdd(attrs, result);
+        return st0;
     }
     @try {
         CFDictionaryRef ra = kcRewrite(attrs);
@@ -897,14 +927,14 @@ static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
 static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     if (!orig_SecItemCopyMatching) return errSecParam;
     // 非登录票据：原样透传（枚举、钱包、推送、证书一律不动）
-    if (!query || !kcShouldIso((__bridge NSDictionary *)query)) {
+    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
         OSStatus st0 = orig_SecItemCopyMatching(query, result);
         if (query && kcPayNS((__bridge NSDictionary *)query)) {
             kcLogPay("GET-PASS", (__bridge NSDictionary *)query, st0);
         }
         if (st0 == errSecSuccess && result && *result) {
             @try {
-                CFTypeRef f = kcFilterEnumResult(*result);
+                CFTypeRef f = kcFilterLoginShared(*result);
                 *result = f;
                 if (!f) return errSecItemNotFound;
             } @catch (id e) {}
@@ -928,7 +958,7 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
 
 static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef toUpdate) {
     if (!orig_SecItemUpdate) return errSecParam;
-    if (!query || !kcShouldIso((__bridge NSDictionary *)query)) {
+    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
         return orig_SecItemUpdate(query, toUpdate);
     }
     @try {
@@ -948,7 +978,12 @@ static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef toUpda
 
 static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
     if (!orig_SecItemDelete) return errSecParam;
-    if (!query || !kcShouldIso((__bridge NSDictionary *)query)) {
+    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
+        // 共享登录组：只允许删本 clone 写过的条目，避免把官方/其他 clone 的登录态删掉
+        @try {
+            NSDictionary *q = (__bridge NSDictionary *)query;
+            if (kcShareLoginItem(q) && !kcIsOwned(q)) return errSecSuccess;
+        } @catch (id e) {}
         return orig_SecItemDelete(query);
     }
     @try {
@@ -1193,8 +1228,8 @@ static void initPrivacyHook(void) {
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcp"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
-        // v68F 标记：只改 account 不改 service，共享登录组结果过滤
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcg"),
+        // v69F 标记：keychain 全透传 + owned 白名单过滤共享登录组
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kco"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
 
