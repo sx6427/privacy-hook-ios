@@ -1,5 +1,5 @@
 //
-// PrivacyHook.m — v65F: A 系列 v57f + group 域隔离 + Keychain 白名单隔离(仅登录票据/严格私有) + 收银台只读观测
+// PrivacyHook.m — v66F: A 系列 v57f + group 域隔离 + Keychain accessGroup 维度隔离 + 收银台只读观测
 //
 // 记忆文件教训：
 //   v57 成功（第一次能下单）：fishhook 只 hook 主程序，无 dyld 回调，无 URL/POST Body，简单清理
@@ -656,6 +656,7 @@ static NSArray *kcLocatorKeys(void) {
 
 // v63F: 前置声明（kcPayNS 定义在后面，kcDictIsIdentity 需要先引用）
 static BOOL kcPayNS(NSDictionary *d);
+static BOOL kcBaiduAG(NSString *ag);
 
 // 身份类判定：service / account / server 命中关键词即视为「账号或设备身份载体」
 static BOOL kcStrIsIdentity(NSString *v) {
@@ -710,6 +711,23 @@ static CFDictionaryRef kcRewrite(CFDictionaryRef src) {
     NSMutableDictionary *m = [(__bridge NSDictionary *)src mutableCopy];
     NSString *sfx = kcSuffix();
     BOOL changed = NO;
+
+    // ---- v66F: 百度共享 accessGroup 的条目，service 也注入私有前缀 ----
+    // 根因：passport 把 BDUSS 存在 B83JBVZ6M5.com.baidu.shareLoginAccount 组里，
+    // 它的 service / account 完全可能不含任何关键词，旧白名单判不出来 →
+    // 原样透传 → 新装的 F1 直接读到 F2 写进去的登录票据（实测 F1 显示 F2 账号）。
+    // 这里不依赖字符串猜测，直接看 accessGroup：属于百度账号组就加私有 service 维度。
+    id agv = m[(__bridge id)kSecAttrAccessGroup];
+    if ([agv isKindOfClass:[NSString class]] && kcBaiduAG((NSString *)agv)) {
+        NSString *pp = [@"bdpriv." stringByAppendingFormat:@"%@.", fpx()];
+        id sv = m[(__bridge id)kSecAttrService];
+        NSString *svc = [sv isKindOfClass:[NSString class]] ? (NSString *)sv : @"-";
+        if (![svc hasPrefix:pp]) {
+            m[(__bridge id)kSecAttrService] = [pp stringByAppendingString:svc];
+            changed = YES;
+        }
+    }
+
     for (id k in kcLocatorKeys()) {
         id v = m[k];
         if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
@@ -764,8 +782,11 @@ static void kcLogPay(const char *op, NSDictionary *d, OSStatus st) {
         NSString *p = [dir stringByAppendingPathComponent:@"bd_pay.log"];
         FILE *f = fopen(p.UTF8String, "a");
         if (!f) return;
-        fprintf(f, "[KC-%s] st=%d svc=%s acct=%s\n", op, (int)st,
-                svc.UTF8String, acct.UTF8String);
+        NSString *ag = d[(__bridge id)kSecAttrAccessGroup];
+        if (![ag isKindOfClass:[NSString class]]) ag = @"-";
+        if (ag.length > 56) ag = [ag substringToIndex:56];
+        fprintf(f, "[KC-%s] st=%d ag=%s svc=%s acct=%s\n", op, (int)st,
+                ag.UTF8String, svc.UTF8String, acct.UTF8String);
         fclose(f);
     } @catch (id e) {}
 }
@@ -799,8 +820,28 @@ static BOOL kcBaiduIDStr(NSString *v) {
 // 判定：必须是「登录票据」才隔离。
 //   account 命中关键词，或 service 显式带登录语义；
 //   仅凭 service = com.baidu.BaiduMobile 不隔离 —— 钱包也用这条 service。
+// 百度账号共享 accessGroup 判定。
+//   B83JBVZ6M5 是团队前缀；shareLoginAccount 是 passport 的共享登录组。
+//   支付（度小满）虽然也可能挂 B83JBVZ6M5，但它是功能凭证，必须放行。
+static BOOL kcBaiduAG(NSString *ag) {
+    if (![ag isKindOfClass:[NSString class]] || ag.length == 0) return NO;
+    NSString *l = ag.lowercaseString;
+    if ([l rangeOfString:@"dxm"].location != NSNotFound) return NO;
+    if ([l rangeOfString:@"duxiaoman"].location != NSNotFound) return NO;
+    if ([l rangeOfString:@"wallet"].location != NSNotFound) return NO;
+    if ([l rangeOfString:@"pay"].location != NSNotFound) return NO;
+    if ([l rangeOfString:@"shareloginaccount"].location != NSNotFound) return YES;
+    if ([l rangeOfString:@"passport"].location != NSNotFound) return YES;
+    if ([l rangeOfString:@"baidu"].location != NSNotFound) return YES;
+    return NO;
+}
+
 static BOOL kcBaiduIDDict(NSDictionary *d) {
     if (![d isKindOfClass:[NSDictionary class]]) return NO;
+    if (kcPayNS(d)) return NO;
+    // v66F: accessGroup 命中百度账号组 → 一律视为登录票据（不管 service/account 叫什么）
+    id ag = d[(__bridge id)kSecAttrAccessGroup];
+    if ([ag isKindOfClass:[NSString class]] && kcBaiduAG((NSString *)ag)) return YES;
     id acct = d[(__bridge id)kSecAttrAccount];
     if (kcBaiduIDStr(acct)) return YES;
     id svc = d[(__bridge id)kSecAttrService];
@@ -811,6 +852,29 @@ static BOOL kcBaiduIDDict(NSDictionary *d) {
         if ([l rangeOfString:@"baiducuid"].location != NSNotFound) return YES;
     }
     return NO;
+}
+
+// v66F: 全量枚举（只带 kSecClass，不带 service/account/accessGroup）的兜底。
+// SDK 用这种查询遍历 keychain 找登录票据；原样透传会把别的 clone 的条目
+// 一起交出去。这里不拦查询，只在结果里剔除「百度账号共享组」的条目。
+static CFTypeRef kcFilterEnumResult(CFTypeRef res) {
+    if (!res) return res;
+    if (CFGetTypeID(res) != CFArrayGetTypeID()) return res;
+    CFArrayRef arr = (CFArrayRef)res;
+    CFIndex n = CFArrayGetCount(arr);
+    CFMutableArrayRef out = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
+    if (!out) return res;
+    for (CFIndex i = 0; i < n; i++) {
+        CFTypeRef o = CFArrayGetValueAtIndex(arr, i);
+        if (o && CFGetTypeID(o) == CFDictionaryGetTypeID()) {
+            NSString *ag = (__bridge NSString *)CFDictionaryGetValue((CFDictionaryRef)o,
+                                                                     kSecAttrAccessGroup);
+            if ([ag isKindOfClass:[NSString class]] && kcBaiduAG(ag)) continue;
+        }
+        CFArrayAppendValue(out, o);
+    }
+    CFRelease(res);
+    return out;
 }
 
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
@@ -847,6 +911,10 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
         OSStatus st0 = orig_SecItemCopyMatching(query, result);
         if (query && kcPayNS((__bridge NSDictionary *)query)) {
             kcLogPay("GET-PASS", (__bridge NSDictionary *)query, st0);
+        }
+        // v66F: 全量枚举剔除百度账号共享组的条目
+        if (st0 == errSecSuccess && result && *result) {
+            @try { *result = kcFilterEnumResult(*result); } @catch (id e) {}
         }
         return st0;
     }
@@ -1132,8 +1200,8 @@ static void initPrivacyHook(void) {
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcp"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
-        // v65F 标记：keychain 白名单隔离 + 登录票据严格私有（无共享域回退）
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcs"),
+        // v66F 标记：keychain 按 accessGroup 隔离（共享登录票据不再串号）
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kca"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
 
