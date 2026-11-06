@@ -1,5 +1,5 @@
 //
-// PrivacyHook.m — v63F: A 系列 v57f + group 域隔离 + Keychain 隔离(支付命名空间放行) + 收银台只读观测
+// PrivacyHook.m — v64F: A 系列 v57f + group 域隔离 + Keychain 白名单隔离(仅登录票据) + 收银台只读观测
 //
 // 记忆文件教训：
 //   v57 成功（第一次能下单）：fishhook 只 hook 主程序，无 dyld 回调，无 URL/POST Body，简单清理
@@ -770,6 +770,49 @@ static void kcLogPay(const char *op, NSDictionary *d, OSStatus st) {
     } @catch (id e) {}
 }
 
+// ============================================================
+// v64F: Keychain 层改为「白名单隔离」
+//
+// v60F/v61F/v63F 都是黑名单思路：默认隔离，命中钱包关键词才放行。
+// 这要求猜对度小满的 service 命名 —— 猜错就会把支付凭证挡在私有域之外，
+// 收银台拿不到渠道列表（F4 实测：kc 版不能付款，F2「完全无隔离」可付款）。
+//
+// 白名单版：只有「百度账号登录票据」被加后缀隔离，
+// 其余所有 keychain 操作（度小满、推送、证书、系统服务）1:1 原样透传。
+// 多开隔离的主体仍由 A 系列的随机硬件人格承担，keychain 只兜住登录票据。
+// ============================================================
+static BOOL kcBaiduIDStr(NSString *v) {
+    if (![v isKindOfClass:[NSString class]] || v.length == 0) return NO;
+    NSString *l = v.lowercaseString;
+    static NSArray *ks = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ks = @[@"shareloginaccount", @"baiducuid", @"passport.bduss",
+               @"bduss", @"stoken", @"ptoken"];
+    });
+    for (NSString *k in ks) {
+        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// 判定：必须是「登录票据」才隔离。
+//   account 命中关键词，或 service 显式带登录语义；
+//   仅凭 service = com.baidu.BaiduMobile 不隔离 —— 钱包也用这条 service。
+static BOOL kcBaiduIDDict(NSDictionary *d) {
+    if (![d isKindOfClass:[NSDictionary class]]) return NO;
+    id acct = d[(__bridge id)kSecAttrAccount];
+    if (kcBaiduIDStr(acct)) return YES;
+    id svc = d[(__bridge id)kSecAttrService];
+    if ([svc isKindOfClass:[NSString class]]) {
+        NSString *l = [(NSString *)svc lowercaseString];
+        if ([l rangeOfString:@"shareloginaccount"].location != NSNotFound) return YES;
+        if ([l rangeOfString:@"passport.bduss"].location != NSNotFound) return YES;
+        if ([l rangeOfString:@"baiducuid"].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef) = NULL;
@@ -777,10 +820,14 @@ static OSStatus (*orig_SecItemDelete)(CFDictionaryRef) = NULL;
 
 static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
     if (!orig_SecItemAdd) return errSecParam;
-    if (attrs && kcPayNS((__bridge NSDictionary *)attrs)) {
-        OSStatus st = orig_SecItemAdd(attrs, result);
-        kcLogPay("ADD", (__bridge NSDictionary *)attrs, st);
-        return st;
+    // 非登录票据：原样透传
+    if (!kcBaiduIDDict((__bridge NSDictionary *)attrs)) {
+        if (attrs && kcPayNS((__bridge NSDictionary *)attrs)) {
+            OSStatus st0 = orig_SecItemAdd(attrs, result);
+            kcLogPay("ADD-PASS", (__bridge NSDictionary *)attrs, st0);
+            return st0;
+        }
+        return orig_SecItemAdd(attrs, result);
     }
     @try {
         CFDictionaryRef ra = kcRewrite(attrs);
@@ -795,37 +842,28 @@ static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
 
 static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     if (!orig_SecItemCopyMatching) return errSecParam;
-    if (query && kcPayNS((__bridge NSDictionary *)query)) {
-        OSStatus st = orig_SecItemCopyMatching(query, result);
-        kcLogPay("GET", (__bridge NSDictionary *)query, st);
-        return st;
+    // 非登录票据：原样透传（枚举、钱包、推送、证书一律不动）
+    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
+        OSStatus st0 = orig_SecItemCopyMatching(query, result);
+        if (query && kcPayNS((__bridge NSDictionary *)query)) {
+            kcLogPay("GET-PASS", (__bridge NSDictionary *)query, st0);
+        }
+        return st0;
     }
     @try {
-        if (!query) return orig_SecItemCopyMatching(query, result);
         NSDictionary *q = (__bridge NSDictionary *)query;
-
-        // v63F: 无定位条件 = 全量枚举。
-        // 旧版直接判空以堵 SDK 指纹，但度小满/收银台也用枚举找设备凭证，
-        // 一并挡掉会导致渠道列表不返回 → 放行（不改写、不改结果）。
-        if (!kcHasLocator(q)) {
-            OSStatus st = orig_SecItemCopyMatching(query, result);
-            kcLogPay("GET-ENUM", q, st);
-            return st;
-        }
-
         CFDictionaryRef rq = kcRewrite(query);
-        if (!rq) {
-            // 无法隔离（例如只按 server 查的 internet password）
-            if (kcDictIsIdentity(q)) return errSecItemNotFound;
-            return orig_SecItemCopyMatching(query, result);
-        }
+        if (!rq) return orig_SecItemCopyMatching(query, result);
         OSStatus st = orig_SecItemCopyMatching(rq, result);
         CFRelease(rq);
         BOOL miss = (st == errSecItemNotFound) ||
                     (st == errSecSuccess && result && *result == NULL);
-        // 非身份类条目回退共享（只读，不写回私有域）
-        if (miss && !kcDictIsIdentity(q)) {
-            return orig_SecItemCopyMatching(query, result);
+        // 私有域没有则回退共享域（只读）：兼容升级前的老登录票据，
+        // 避免升级到隔离版后直接被判 BDUSS 过期。
+        if (miss) {
+            OSStatus st2 = orig_SecItemCopyMatching(query, result);
+            kcLogPay("GET-FALLBACK", q, st2);
+            return st2;
         }
         return st;
     } @catch (id e) {}
@@ -834,21 +872,13 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
 
 static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef toUpdate) {
     if (!orig_SecItemUpdate) return errSecParam;
-    if (query && kcPayNS((__bridge NSDictionary *)query)) {
-        OSStatus st = orig_SecItemUpdate(query, toUpdate);
-        kcLogPay("UPD", (__bridge NSDictionary *)query, st);
-        return st;
+    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
+        return orig_SecItemUpdate(query, toUpdate);
     }
     @try {
-        if (!query) return orig_SecItemUpdate(query, toUpdate);
         NSDictionary *q = (__bridge NSDictionary *)query;
-        if (!kcHasLocator(q)) return errSecItemNotFound;
-
         CFDictionaryRef rq = kcRewrite(query);
-        if (!rq) {
-            if (kcDictIsIdentity(q)) return errSecItemNotFound;
-            return orig_SecItemUpdate(query, toUpdate);
-        }
+        if (!rq) return orig_SecItemUpdate(query, toUpdate);
         // attributesToUpdate 里若也带 service/account，必须同步加后缀，
         // 否则更新后条目会「跑」回共享域
         CFDictionaryRef ru = kcRewrite(toUpdate);
@@ -862,24 +892,14 @@ static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef toUpda
 
 static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
     if (!orig_SecItemDelete) return errSecParam;
-    if (query && kcPayNS((__bridge NSDictionary *)query)) {
-        OSStatus st = orig_SecItemDelete(query);
-        kcLogPay("DEL", (__bridge NSDictionary *)query, st);
-        return st;
+    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
+        return orig_SecItemDelete(query);
     }
     @try {
-        if (!query) return orig_SecItemDelete(query);
         NSDictionary *q = (__bridge NSDictionary *)query;
 
-        // 全量删除（只带 kSecClass）：忽略，保护官方 App 与其他 clone 的登录态
-        if (!kcHasLocator(q)) return errSecSuccess;
-
         CFDictionaryRef rq = kcRewrite(query);
-        if (!rq) {
-            // 无法隔离的身份类删除：不真删，假装成功
-            if (kcDictIsIdentity(q)) return errSecSuccess;
-            return orig_SecItemDelete(query);
-        }
+        if (!rq) return orig_SecItemDelete(query);
         OSStatus st = orig_SecItemDelete(rq);
         CFRelease(rq);
         return st;
@@ -1117,8 +1137,8 @@ static void initPrivacyHook(void) {
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcp"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
-        // v63F 标记：钱包命名空间不判身份 + 枚举放行 + 关键词扩充
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcr"),
+        // v64F 标记：keychain 白名单隔离（仅百度登录票据，其余全透传）
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcw"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
 
