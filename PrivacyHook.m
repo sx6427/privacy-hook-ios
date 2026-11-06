@@ -1,5 +1,5 @@
 //
-// PrivacyHook.m — v60F: A 系列 v57f + group 域隔离 + Keychain 命名空间隔离 + 前缀运行时派生
+// PrivacyHook.m — v63F: A 系列 v57f + group 域隔离 + Keychain 隔离(支付命名空间放行) + 收银台只读观测
 //
 // 记忆文件教训：
 //   v57 成功（第一次能下单）：fishhook 只 hook 主程序，无 dyld 回调，无 URL/POST Body，简单清理
@@ -654,6 +654,9 @@ static NSArray *kcLocatorKeys(void) {
     return a;
 }
 
+// v63F: 前置声明（kcPayNS 定义在后面，kcDictIsIdentity 需要先引用）
+static BOOL kcPayNS(NSDictionary *d);
+
 // 身份类判定：service / account / server 命中关键词即视为「账号或设备身份载体」
 static BOOL kcStrIsIdentity(NSString *v) {
     if (v.length == 0) return NO;
@@ -675,6 +678,10 @@ static BOOL kcStrIsIdentity(NSString *v) {
 
 static BOOL kcDictIsIdentity(NSDictionary *d) {
     if (![d isKindOfClass:[NSDictionary class]]) return NO;
+    // v63F: 支付 SDK 的命名空间一律不算「账号身份」。
+    // 度小满的服务名常含 account / device / token / uuid，旧逻辑会把它
+    // 误判成身份类而禁止回退共享域 → 读不到既有设备凭证 → 渠道列表为空。
+    if (kcPayNS(d)) return NO;
     for (id k in kcLocatorKeys()) {
         id v = d[k];
         if ([v isKindOfClass:[NSString class]] && kcStrIsIdentity((NSString *)v)) return YES;
@@ -725,7 +732,9 @@ static BOOL kcPayNS(NSDictionary *d) {
     static NSArray *ks = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        ks = @[@"dxm", @"duxiaoman", @"wallet", @"paydxm", @"baidupay", @"com.baidu.pay"];
+        ks = @[@"dxm", @"duxiaoman", @"wallet", @"paydxm", @"baidupay", @"com.baidu.pay",
+               @"cashier", @"cashdesk", @"ecard", @"unionpay", @"alipay", @"weixin",
+               @"tenpay", @"bep", @"bdpay", @"licai", @"youqian", @"axiamsdk", @"loan"];
     });
     NSArray *fields = @[(__bridge id)kSecAttrService,
                         (__bridge id)kSecAttrAccount,
@@ -795,8 +804,14 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
         if (!query) return orig_SecItemCopyMatching(query, result);
         NSDictionary *q = (__bridge NSDictionary *)query;
 
-        // 无定位条件 = 全量枚举 keychain（SDK 常用作设备指纹）→ 直接判空
-        if (!kcHasLocator(q)) return errSecItemNotFound;
+        // v63F: 无定位条件 = 全量枚举。
+        // 旧版直接判空以堵 SDK 指纹，但度小满/收银台也用枚举找设备凭证，
+        // 一并挡掉会导致渠道列表不返回 → 放行（不改写、不改结果）。
+        if (!kcHasLocator(q)) {
+            OSStatus st = orig_SecItemCopyMatching(query, result);
+            kcLogPay("GET-ENUM", q, st);
+            return st;
+        }
 
         CFDictionaryRef rq = kcRewrite(query);
         if (!rq) {
@@ -1100,6 +1115,10 @@ static void initPrivacyHook(void) {
                                  kCFPreferencesCurrentApplication);
         // v61F 标记：度小满 keychain 直通版
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcp"),
+                                 (__bridge CFStringRef)@"1",
+                                 kCFPreferencesCurrentApplication);
+        // v63F 标记：钱包命名空间不判身份 + 枚举放行 + 关键词扩充
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcr"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
 
