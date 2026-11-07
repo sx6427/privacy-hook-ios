@@ -1082,10 +1082,10 @@ static void kcMigrate(void) {
     @try {
         // v75F: 一次性抓 cuid 组结构
         CFPropertyListRef vd = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcvd"), kCFPreferencesCurrentApplication);
+            (__bridge CFStringRef)FKEY(@"kcvd2"), kCFPreferencesCurrentApplication);
         if (!vd) {
             if (orig_SecItemCopyMatching) kcDumpCuidGroup();
-            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcvd"),
+            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcvd2"),
                                      kCFBooleanTrue, kCFPreferencesCurrentApplication);
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         } else { CFRelease(vd); }
