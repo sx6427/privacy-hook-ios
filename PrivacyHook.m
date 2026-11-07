@@ -940,10 +940,10 @@ static void kcDumpLine(NSString *line) {
 
 static void kcAdoptExisting(void) {
     @try {
-        // v71F: 已装过 v70F 的机器 kcadopt 已经是 1，这里用 kcv2 判断是否需要
+        // v72F: kcv3 不存在时强制重跑一次全量认领（清掉 v71F 精确模式留下的残缺白名单）
         // 按新规则重跑一次（清空旧的「全量认领」结果再重新挑）。
         CFPropertyListRef v2 = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcv2"), kCFPreferencesCurrentApplication);
+            (__bridge CFStringRef)FKEY(@"kcv3"), kCFPreferencesCurrentApplication);
         if (v2) { CFRelease(v2); return; }
         if (!orig_SecItemCopyMatching) return;
 
@@ -1007,7 +1007,7 @@ static void kcAdoptExisting(void) {
         }
         CFRelease(all);
 
-        NSArray *take = (mine.count > 0) ? mine : cands;
+        NSArray *take = cands;  // v72F: 回到全量认领（与 F3 验证通过的 v70F 行为一致）
         kcDumpLine([NSString stringWithFormat:@"[PICK] cands=%lu mine=%lu take=%lu mode=%@",
                     (unsigned long)cands.count, (unsigned long)mine.count,
                     (unsigned long)take.count, mine.count > 0 ? @"exact" : @"all"]);
@@ -1015,7 +1015,7 @@ static void kcAdoptExisting(void) {
 
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcadopt"),
                                  kCFBooleanTrue, kCFPreferencesCurrentApplication);
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv2"),
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv3"),
                                  kCFBooleanTrue, kCFPreferencesCurrentApplication);
         CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
     } @catch (id e) {}
