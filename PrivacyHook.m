@@ -905,6 +905,22 @@ static NSString *kcBaseStr(NSString *s) {
     return t;
 }
 
+// 判定 service/account 是否带「别的实例」后缀（.BdF3 / .BdF4 ...）
+// v73F 迁移时把这类条目也当源复制了，导致 F6 把 F3/F4 的票据也吃进来。
+static BOOL kcIsForeignSvc(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
+    NSString *b = kcBaseStr(s);
+    NSRange r = [b rangeOfString:@".BdF" options:NSBackwardsSearch];
+    if (r.location == NSNotFound) return NO;
+    NSString *tail = [b substringFromIndex:r.location + 4];
+    if (tail.length == 0) return NO;
+    for (NSUInteger i = 0; i < tail.length; i++) {
+        unichar c = [tail characterAtIndex:i];
+        if (c < '0' || c > '9') return NO;
+    }
+    return YES;
+}
+
 static BOOL kcIsPrivLogin(NSDictionary *d) {
     id svc  = d[(__bridge id)kSecAttrService];
     id acct = d[(__bridge id)kSecAttrAccount];
@@ -997,9 +1013,10 @@ static void kcDumpLine(NSString *line) {
 // ============================================================
 static void kcMigrate(void) {
     @try {
-        CFPropertyListRef v4 = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcv4"), kCFPreferencesCurrentApplication);
-        if (v4) { CFRelease(v4); return; }
+        // v74F: kcv5 控制。v73F 已写过 kcv4 的机器要重跑一次清理。
+        CFPropertyListRef v5 = CFPreferencesCopyAppValue(
+            (__bridge CFStringRef)FKEY(@"kcv5"), kCFPreferencesCurrentApplication);
+        if (v5) { CFRelease(v5); return; }
         if (!orig_SecItemCopyMatching) return;
 
         NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
@@ -1014,6 +1031,53 @@ static void kcMigrate(void) {
         if (CFGetTypeID(all) == CFArrayGetTypeID()) arr = (__bridge NSArray *)all;
         else if (CFGetTypeID(all) == CFDictionaryGetTypeID()) arr = @[(__bridge id)all];
 
+        // ---- 1. 先清掉 v73F 复制出来的伪私有票据 ----
+        //   判据：① 带别的实例后缀（.BdF3.BdF6 这类）；
+        //         ② 内容与共享池里的基名条目完全相同（说明是复制品，不是自己登录写的）。
+        NSMutableDictionary *baseData = [NSMutableDictionary dictionary];
+        for (id o in arr) {
+            if (![o isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *d = (NSDictionary *)o;
+            if (!kcShareLoginItem(d)) continue;
+            id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
+            if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
+            if (kcIsPrivSvc(svc) || [(NSString *)svc hasPrefix:@"bdpriv."]) continue;
+            id v = d[(__bridge id)kSecValueData];
+            if (v) baseData[[NSString stringWithFormat:@"%@\x1f%@", svc, acct]] = v;
+        }
+
+        int purged = 0;
+        for (id o in arr) {
+            if (![o isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *d = (NSDictionary *)o;
+            if (!kcShareLoginItem(d)) continue;
+            id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
+            if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
+            if (!kcIsPrivSvc(svc) && !kcIsPrivSvc(acct)) continue;
+            // v67F 的 bdpriv.BdFn.* 是真实历史副本，保留不动
+            if ([(NSString *)svc hasPrefix:@"bdpriv."]) continue;
+
+            BOOL foreign = kcIsForeignSvc((NSString *)svc) || kcIsForeignSvc((NSString *)acct);
+            BOOL copied = NO;
+            if (!foreign) {
+                NSString *bk = [NSString stringWithFormat:@"%@\x1f%@",
+                                kcBaseStr((NSString *)svc), kcBaseStr((NSString *)acct)];
+                NSData *bv = baseData[bk];
+                id pv = d[(__bridge id)kSecValueData];
+                copied = (bv && pv && [pv isKindOfClass:[NSData class]] && [bv isEqualToData:(NSData *)pv]);
+            }
+            if (!foreign && !copied) continue;
+
+            NSMutableDictionary *dq = [NSMutableDictionary dictionary];
+            dq[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+            dq[(__bridge id)kSecAttrService] = svc;
+            dq[(__bridge id)kSecAttrAccount] = acct;
+            id ag = d[(__bridge id)kSecAttrAccessGroup];
+            if (ag) dq[(__bridge id)kSecAttrAccessGroup] = ag;
+            if (orig_SecItemDelete((__bridge CFDictionaryRef)dq) == errSecSuccess) purged++;
+        }
+
+        // ---- 2. 只认本实例真实私有源，不再用共享池兜底 ----
         NSString *pre = [NSString stringWithFormat:@"bdpriv.%@.", fpx()];
         NSMutableDictionary *best = [NSMutableDictionary dictionary];
         NSMutableSet *hasPriv = [NSMutableSet set];
@@ -1022,29 +1086,28 @@ static void kcMigrate(void) {
             if (![o isKindOfClass:[NSDictionary class]]) continue;
             NSDictionary *d = (NSDictionary *)o;
             if (!kcShareLoginItem(d)) continue;
-            id svc  = d[(__bridge id)kSecAttrService];
-            id acct = d[(__bridge id)kSecAttrAccount];
+            id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
             if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
-            NSString *lsvc  = kcBaseStr((NSString *)svc);
-            NSString *lacct = kcBaseStr((NSString *)acct);
+            if (kcIsForeignSvc((NSString *)svc) || kcIsForeignSvc((NSString *)acct)) continue;
+
+            NSString *lsvc = kcBaseStr((NSString *)svc), *lacct = kcBaseStr((NSString *)acct);
             NSString *key = [NSString stringWithFormat:@"%@\x1f%@", lsvc, lacct];
 
-            int pri = 1;
+            int pri = 0;
             if (kcIsPrivSvc((NSString *)svc) && ![(NSString *)svc hasPrefix:@"bdpriv."]) pri = 3;
             else if ([(NSString *)svc hasPrefix:pre]) pri = 2;
+            if (pri == 0) continue;   // 基名与其它来源一律不用
             if (pri == 3) [hasPriv addObject:key];
 
             NSArray *cur = best[key];
-            if (!cur || [(NSNumber *)cur[0] intValue] < pri)
-                best[key] = @[@(pri), d];
+            if (!cur || [(NSNumber *)cur[0] intValue] < pri) best[key] = @[@(pri), d];
         }
 
         int added = 0, skipped = 0, failed = 0;
         for (NSString *key in best) {
             if ([hasPriv containsObject:key]) { skipped++; continue; }
             NSDictionary *d = best[key][1];
-            NSString *svc  = d[(__bridge id)kSecAttrService];
-            NSString *acct = d[(__bridge id)kSecAttrAccount];
+            NSString *svc = d[(__bridge id)kSecAttrService], *acct = d[(__bridge id)kSecAttrAccount];
             NSMutableDictionary *a = [NSMutableDictionary dictionary];
             a[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
             a[(__bridge id)kSecAttrService] = [kcBaseStr(svc) stringByAppendingString:kcSuffix()];
@@ -1061,10 +1124,10 @@ static void kcMigrate(void) {
         }
         CFRelease(all);
 
-        kcDumpLine([NSString stringWithFormat:@"[MIGRATE] fpx=%@ keys=%lu added=%d skipped=%d failed=%d",
-                    fpx(), (unsigned long)best.count, added, skipped, failed]);
+        kcDumpLine([NSString stringWithFormat:@"[MIGRATE2] fpx=%@ keys=%lu purged=%d added=%d skipped=%d failed=%d",
+                    fpx(), (unsigned long)best.count, purged, added, skipped, failed]);
 
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv4"),
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv5"),
                                  kCFBooleanTrue, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcadopt"),
                                  kCFBooleanTrue, kCFPreferencesCurrentApplication);
