@@ -1093,6 +1093,177 @@ static void kcDumpCuidGroup(void) {
     } @catch (id e) {}
 }
 
+
+// ============================================================
+// v78F: App Group 容器隔离 + 推送设备 ID 重写
+//
+// 为什么：
+//   设备上 group.com.baidu.BaiduMobile 只有一个物理容器
+//   （/private/var/mobile/Containers/Shared/AppGroup/BAE9285C-...），
+//   所有 clone 共用同一份 Library/Preferences/group.com.baidu.BaiduMobile.plist。
+//   里面 BNPush_cuid = 431D8F7F709192B450E8B66066346C917CCC81615OLJCPRRFGN，
+//   格式与 keychain mainCUID 完全一致，是百度侧真正的设备 ID。
+//   之前只映射了 CFPreferences 的 suite 名，SDK 只要拿 group 路径直接读文件就绕过。
+//
+// 做法：
+//   1. hook -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]
+//      → 返回 App 沙盒内 Library/PrivGroups/<group>.<BdFn> 的私有容器；
+//      首次调用时把真实容器整份复制过来，此后各 clone 各自演化。
+//   2. 私有容器里的 group plist 把 BNPush_cuid / BNPush_cacheCuid
+//      改成本实例派生值（40 hex + 10 字母，与百度格式一致，稳定不漂移）。
+//   3. 同步写入私有 CFPreferences 域，保证两条读取路径一致。
+// ============================================================
+static IMP g_origGroupURL = NULL;
+
+static NSString *agSeed(void) {
+    static NSString *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @try {
+            CFPropertyListRef v = CFPreferencesCopyAppValue(
+                (__bridge CFStringRef)FKEY(@"gseed"), kCFPreferencesCurrentApplication);
+            if (v) {
+                if (CFGetTypeID(v) == CFStringGetTypeID()) s = [(__bridge NSString *)v copy];
+                CFRelease(v);
+            }
+            if (s.length == 0) {
+                s = [[NSUUID UUID] UUIDString];
+                CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"gseed"),
+                                         (__bridge CFStringRef)s,
+                                         kCFPreferencesCurrentApplication);
+                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            }
+        } @catch (id e) {}
+        if (s.length == 0) s = fpx();
+    });
+    return s;
+}
+
+static uint32_t agMix(const char *str, uint32_t seed) {
+    uint32_t h = 2166136261u ^ seed;
+    if (!str) return h;
+    while (*str) {
+        h ^= (uint32_t)(unsigned char)(*str++);
+        h *= 16777619u;
+    }
+    h ^= h >> 13;
+    h *= 0x5bd1e995u;
+    h ^= h >> 15;
+    return h;
+}
+
+// 40 位大写 HEX + 10 位小写字母，与 BNPush_cuid / mainCUID 同构
+static NSString *agFakeCuid(void) {
+    static NSString *c = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *seed = [NSString stringWithFormat:@"%@|%@|devid", agSeed(), fpx()];
+        const char *p = seed.UTF8String;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:40];
+        for (uint32_t i = 0; i < 5; i++) [hex appendFormat:@"%08X", agMix(p, i * 0x9E3779B9u + 1)];
+        NSMutableString *tail = [NSMutableString stringWithCapacity:10];
+        uint32_t v = agMix(p, 0xDEADBEEFu);
+        for (int i = 0; i < 10; i++) {
+            uint32_t sh = (uint32_t)((i * 5) % 25);
+            [tail appendFormat:@"%c", (char)('a' + ((v >> sh) & 0x1F) % 26)];
+        }
+        c = [hex stringByAppendingString:tail];
+    });
+    return c;
+}
+
+static NSString *agPrivRoot(void) {
+    static NSString *r = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        r = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/PrivGroups"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:r
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:NULL];
+    });
+    return r;
+}
+
+static NSString *agPrivPath(NSString *gid) {
+    NSString *safe = [gid stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    return [agPrivRoot() stringByAppendingPathComponent:
+            [safe stringByAppendingFormat:@".%@", fpx()]];
+}
+
+static void agSyncPrefs(NSString *gid, NSString *devid) {
+    @try {
+        NSString *ms = mapGroupSuite(gid);
+        if (ms.length == 0 || !orig_CFPrefSetAppValue) return;
+        CFStringRef msRef = (__bridge CFStringRef)ms;
+        orig_CFPrefSetAppValue((__bridge CFStringRef)@"BNPush_cuid",
+                               (__bridge CFStringRef)devid, msRef);
+        orig_CFPrefSetAppValue((__bridge CFStringRef)@"BNPush_cacheCuid",
+                               (__bridge CFStringRef)devid, msRef);
+        CFPreferencesAppSynchronize(msRef);
+    } @catch (id e) {}
+}
+
+static void agRewritePlist(NSString *privBase, NSString *gid) {
+    @try {
+        NSString *pp = [privBase stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"Library/Preferences/%@.plist", gid]];
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithContentsOfFile:pp];
+        if (!m) return;
+        NSString *devid = agFakeCuid();
+        BOOL changed = NO;
+        for (NSString *k in [m allKeys]) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            if ([k.lowercaseString rangeOfString:@"cuid"].location == NSNotFound) continue;
+            if (![m[k] isKindOfClass:[NSString class]]) continue;
+            if ([m[k] isEqualToString:devid]) continue;
+            m[k] = devid;
+            changed = YES;
+        }
+        if (changed) {
+            [m writeToFile:pp atomically:YES];
+            kcDumpLine([NSString stringWithFormat:@"[AG] rewrite %@ cuid=%@", gid, devid]);
+        }
+    } @catch (id e) {}
+}
+
+static void agPrepare(NSString *realBase, NSString *privBase, NSString *gid) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (realBase.length == 0 || privBase.length == 0) return;
+        if (![fm fileExistsAtPath:privBase]) {
+            [fm createDirectoryAtPath:agPrivRoot()
+          withIntermediateDirectories:YES attributes:nil error:NULL];
+            NSError *err = nil;
+            BOOL ok = [fm copyItemAtPath:realBase toPath:privBase error:&err];
+            if (!ok) {
+                [fm createDirectoryAtPath:privBase
+              withIntermediateDirectories:YES attributes:nil error:NULL];
+                kcDumpLine([NSString stringWithFormat:@"[AG] copy fail %@ err=%@",
+                            gid, err.localizedDescription ?: @"-"]);
+            } else {
+                kcDumpLine([NSString stringWithFormat:@"[AG] copy ok %@ -> %@", gid, privBase]);
+            }
+        }
+        agRewritePlist(privBase, gid);
+        agSyncPrefs(gid, agFakeCuid());
+    } @catch (id e) {}
+}
+
+static NSURL *hook_groupContainerURL(id self, SEL _cmd, NSString *gid) {
+    NSURL *real = NULL;
+    if (g_origGroupURL)
+        real = ((NSURL *(*)(id, SEL, NSString *))g_origGroupURL)(self, _cmd, gid);
+    @try {
+        if (gid.length && isGroupDomainStr(gid) && real.path.length) {
+            NSString *priv = agPrivPath(gid);
+            agPrepare(real.path, priv, gid);
+            return [NSURL fileURLWithPath:priv isDirectory:YES];
+        }
+    } @catch (id e) {}
+    return real;
+}
+
 static void kcMigrate(void) {
     @try {
         // v75F: 一次性抓 cuid 组结构
@@ -1601,6 +1772,20 @@ static void initPrivacyHook(void) {
             CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         }
+
+        // ---- 1z. v78F: App Group 容器隔离 ----
+        @try {
+            Class fmc = objc_getClass("NSFileManager");
+            if (fmc) {
+                SEL gs = @selector(containerURLForSecurityApplicationGroupIdentifier:);
+                Method gm = class_getInstanceMethod(fmc, gs);
+                if (gm) {
+                    g_origGroupURL = method_getImplementation(gm);
+                    class_replaceMethod(fmc, gs, (IMP)hook_groupContainerURL,
+                                        method_getTypeEncoding(gm));
+                }
+            }
+        } @catch (id e) {}
 
         // ---- 2. UIDevice hooks ----
         @try {
