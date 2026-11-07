@@ -1049,13 +1049,28 @@ static void kcDumpCuidGroup(void) {
             id acct = d[(__bridge id)kSecAttrAccount];
             NSData *data = d[(__bridge id)kSecValueData];
             NSString *ds = @"-";
+            NSString *extra = @"";
             if ([data isKindOfClass:[NSData class]]) {
                 NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                ds = t ?: [NSString stringWithFormat:@"<bin %lu>", (unsigned long)data.length];
+                if (t && t.length) {
+                    ds = t;
+                } else {
+                    ds = [data base64EncodedStringWithOptions:0];
+                    NSString *u16 = [[NSString alloc] initWithData:data
+                                                          encoding:NSUTF16LittleEndianStringEncoding];
+                    if (u16.length && u16.length < 500)
+                        extra = [NSString stringWithFormat:@" u16=%@", u16];
+                    NSMutableString *hx = [NSMutableString string];
+                    const uint8_t *bp = data.bytes;
+                    NSUInteger lim = MIN(data.length, (NSUInteger)48);
+                    for (NSUInteger i = 0; i < lim; i++) [hx appendFormat:@"%02x", bp[i]];
+                    extra = [extra stringByAppendingFormat:@" hex=%@", hx];
+                }
             }
-            if (ds.length > 400) ds = [ds substringToIndex:400];
-            kcDumpLine([NSString stringWithFormat:@"[CUID] agrp=%@ svc=%@ acct=%@ data=%@",
-                        ag, svc, acct, ds]);
+            if (ds.length > 500) ds = [ds substringToIndex:500];
+            kcDumpLine([NSString stringWithFormat:@"[CUID] svc=%@ acct=%@ len=%lu data=%@%@",
+                        svc, acct, (unsigned long)([data isKindOfClass:[NSData class]] ? [(NSData *)data length] : 0),
+                        ds, extra]);
             n++;
         }
         CFRelease(all);
