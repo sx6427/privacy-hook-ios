@@ -1011,8 +1011,70 @@ static void kcDumpLine(NSString *line) {
 //   1  基名 sapi_xxx             （共享，最后才用）
 // 每个逻辑键只取一个源，已有私有条目的跳过。
 // ============================================================
+// ============================================================
+// v75F: cuid 组取证（只读，不改行为）
+//
+// keychain 里 B83JBVZ6M5.com.baidu.baidumobile.cuid 是全机共享的，
+// 7 条，所有 clone 读到同一个设备 ID —— 这是「多开几个就被检测到」的直接原因。
+// 先把这个组的 service/account/data 明文抓出来，再决定怎么派生独立值。
+// ============================================================
+static void kcDumpCuidGroup(void) {
+    @try {
+        NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+                            (__bridge id)kSecReturnAttributes: @YES,
+                            (__bridge id)kSecReturnData: @YES};
+        CFTypeRef all = NULL;
+        OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, &all);
+        if (st != errSecSuccess || !all) { if (all) CFRelease(all); return; }
+
+        NSArray *arr = nil;
+        if (CFGetTypeID(all) == CFArrayGetTypeID()) arr = (__bridge NSArray *)all;
+        else if (CFGetTypeID(all) == CFDictionaryGetTypeID()) arr = @[(__bridge id)all];
+
+        NSString *udCuid = [[NSUserDefaults standardUserDefaults] stringForKey:FKEY(@"ck.cuid")];
+        NSString *udBcuid = [[NSUserDefaults standardUserDefaults] stringForKey:FKEY(@"ck.BAIDUCUID")];
+        kcDumpLine([NSString stringWithFormat:@"[CUID-HEAD] fpx=%@ ud.cuid=%@ ud.BAIDUCUID=%@",
+                    fpx(), udCuid ?: @"-", udBcuid ?: @"-"]);
+
+        int n = 0;
+        for (id o in arr) {
+            if (![o isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *d = (NSDictionary *)o;
+            id ag = d[(__bridge id)kSecAttrAccessGroup];
+            if (![ag isKindOfClass:[NSString class]]) continue;
+            if ([((NSString *)ag).lowercaseString rangeOfString:@"baidumobile.cuid"].location == NSNotFound) continue;
+
+            id svc  = d[(__bridge id)kSecAttrService];
+            id acct = d[(__bridge id)kSecAttrAccount];
+            NSData *data = d[(__bridge id)kSecValueData];
+            NSString *ds = @"-";
+            if ([data isKindOfClass:[NSData class]]) {
+                NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                ds = t ?: [NSString stringWithFormat:@"<bin %lu>", (unsigned long)data.length];
+            }
+            if (ds.length > 400) ds = [ds substringToIndex:400];
+            kcDumpLine([NSString stringWithFormat:@"[CUID] agrp=%@ svc=%@ acct=%@ data=%@",
+                        ag, svc, acct, ds]);
+            n++;
+        }
+        CFRelease(all);
+        kcDumpLine([NSString stringWithFormat:@"[CUID-TAIL] total=%d", n]);
+    } @catch (id e) {}
+}
+
 static void kcMigrate(void) {
     @try {
+        // v75F: 一次性抓 cuid 组结构
+        CFPropertyListRef vd = CFPreferencesCopyAppValue(
+            (__bridge CFStringRef)FKEY(@"kcvd"), kCFPreferencesCurrentApplication);
+        if (!vd) {
+            if (orig_SecItemCopyMatching) kcDumpCuidGroup();
+            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcvd"),
+                                     kCFBooleanTrue, kCFPreferencesCurrentApplication);
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+        } else { CFRelease(vd); }
+
         // v74F: kcv5 控制。v73F 已写过 kcv4 的机器要重跑一次清理。
         CFPropertyListRef v5 = CFPreferencesCopyAppValue(
             (__bridge CFStringRef)FKEY(@"kcv5"), kCFPreferencesCurrentApplication);
