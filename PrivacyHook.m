@@ -1,11 +1,178 @@
 //
-// PrivacyHook.m — v69F: keychain 全透传(保支付) + 共享登录组按 owned 白名单过滤
+// PrivacyHook.m — v66: keychain 隔离恢复 + 非身份项读回退
 //
-// 记忆文件教训：
-//   v57 成功（第一次能下单）：fishhook 只 hook 主程序，无 dyld 回调，无 URL/POST Body，简单清理
-//   v58+ 闪退：hook 所有镜像、dyld 回调、URL/POST Body、SystemVersion.plist 等全部导致闪退
+// ============ 版本主线 ============
+//   v57N  伪造全套硬件人格（后被 v58 推翻）
+//   v57Q  WKWebView UA 三路补堵（H5 读不到 baiduboxapp 段 → 农场进不去）
+//   v57V  按 keychain 服务名精准拦截 cuid（修「下单人数多」）
+//   v58   硬件人格一律回真机（假报大屏 → 小屏机页面错乱）
+//   v59   keychain 全量命名空间隔离（克隆互不串味）
+//   v60   隐藏注入痕迹：dyld 镜像枚举过滤 + 包标识伪装（v63 停用）
+//   v61   回退 App Group 容器重定向 + UA 补缺（修「选不了榴莲」）
+//   v62   group 域整域隔离（swizzle initWithSuiteName: + CFPreferences 换 appID）
+//   v63   停用 v60 两段（修 v62 启动闪退）+ cloneTag 重入保护
+//   v64   隔离粒度收窄到「身份键」——整域隔离会让共享域 72 键全读不到，
+//         果园这类 H5 活动页拿不到渠道/活动参数 →「能进但选不了水果」。
+//         改为 init 不改域名 + 按 key 分流：身份键走私有域，其余走共享域。
+//   v65   对照实验：整体关闭 keychain 隔离。用户实测 → 原版 App 被
+//         连坐拉黑 → keychain 隔离是保命机制，不能关。
+//   v66   keychain 恢复隔离 + 非身份项读回退（T4 教训：共身份→连坐拉黑）
+//   v67   cuid 双格式修复：平台层 cuid 用真机 40大写HEX+尾格式（PLATCUID），
+//         cookie 层保持 b64url —— 两套 ID 本来就不同
+//   v68   诊断日志（T7）：果园相关请求/响应写 bd_diag.log
+//   v73   诊断补全：连接层错误落盘（didCompleteWithError / completion error），
+//         之前错误分支静默，「请求没发 vs 连接失败」无法判读（M1 登录排查用）
+//   v69   诊断增强（T7b）：delegate 型请求 + 响应体 + JSBridge 名单
+//   v70   硬件人格回归（iPhone13,2）：下单通过但农场识破——真机是 13 Pro Max
+//         （屏幕 1284×2778 透传），与 iPhone12 机型串矛盾
+//   v71   人格改 iPhone13,4（12 Pro Max）：与真机同屏同内存，透传值全部自洽
+//   v72   ★ 泄漏点修复（2026-09-21 审计）★
+//         P0: UIPasteboard 克隆私有化（TalosPro 风控 SDK 在用，跨 App 串号）
+//         P0: keychain 身份关键字补 mtj/cdid/umid/oaid/vaid/aaid（统计 SDK 串号）
+//         P0: DCDevice/AppAttest 失败化（Apple 签名设备证明，绑定物理机）
+//         P1: CNCopyCurrentNetworkInfo 返空（家庭 WiFi BSSID 网络锚点）
+//   v74   ★ 克隆包名消毒 + 包标识伪装启用（2026-09-21，修 M1 登录发码）★
+//         诊断依据（M1 v4 日志）：美团三处把克隆包名明文上报服务端 ——
+//           · URL query  csecpkgname=com.meituan.imeituan.MtM1（csec 安全 SDK）
+//           · URL query  packageName=com.meituan.imeituan.MtM1（账号 SDK）
+//           · POST body  {"appInfo":{"app":"com.meituan.imeituan.MtM1"}}
+//           · 请求头     User-Agent: com.meituan.imeituan.MtM1/349883 (...)
+//         而「获取验证码」在全部三次抓包里**没有发出任何请求**
+//         （其余接口全 200，无 WebView）→ 客户端本地判定层拦截。
+//         多开必然改 bundle id，改包名是重打包检测的经典特征，故：
+//           1) 出口消毒 maskCloneBundleID()：URL / 请求体 / 请求头
+//              里的克隆包名一律换成官方包名（复用它现成的
+//              rewriteIdentityString/Data 出口，零新增 hook 风险）
+//           2) 包标识伪装启用（v60 写过但 v63 因启动闪退停用；
+//              真因是 isMainBundleObject 内部调 [NSBundle mainBundle]
+//              读 Info.plist → 触发自身 hook → 无限递归。
+//              改为安装 hook 前缓存 mainBundle 指针一次，比较指针，
+//              彻底消除递归）
+//           3) MT 构建不再强制 DCDevice/AppAttest 失败（美团主二进制
+//              有 DCDevice 引用；强制失败＝把自己变成「设备证明异常」
+//              的少数派，且错误域里带 "BdClone" 字样）
+//           4) 诊断补盲：NSURLConnection / NSURLProtocol 全覆盖，
+//              响应头落盘 —— 登录通道若不走 NSURLSession，前三次
+//              抓包是看不见的
+//         不动 dyld 镜像隐藏（v63 停用原因未二分，保持单一变量）
 //
-// v57e = v57 精确结构 + 仅新增 hw.serialnumber/hw.uuid/hw.target 三个 sysctlbyname key
+//   v75   ★ 美团设备身份隔离（2026-09-21，修「识别到本机」）★
+//         真机取证（原版 HAR + 克隆日志 + 手机容器双向比对）：
+//           原版(9/19 抓包) uuid=000000000000011F...546
+//           克隆(今天 v6)  uuid=000000000000011F...546  ← 完全相同
+//         且不止一处，同一身份以多个名字共用：
+//           · query  uuid= / did= / iuuid= / w_uuid= / wm_uuid=
+//           · body   env.deviceid= / babelid= / dpid= / unionId=
+//           · prefs  babelId / kNovaEnvironmentCacheUnionidKey /
+//                    sakguard_storage_dfpid 三键与原版同值
+//           而 IDFV 类（kLoganEncryptIdentify）两边不同 → 排除硬件派生，
+//           确定是「从共享存储读到了原版写的值」。
+//         根因（两条共享通道，均因克隆沿用原版授权而存在）：
+//           a) keychain：克隆 entitlements 原样保留原版
+//              keychain-access-groups = FSS9ANCQ68.com.meituan.access
+//              → 与「美团全家桶共享组」完全同一空间。美团 ONI SDK 把设备
+//              身份存 keychain（二进制实证 kONIPrivateKeychainValueUUID /
+//              ...DPID / ...UnionID / sharedKeychainGroup），
+//              而本库身份关键字表有 udid/deviceid 却**没有 uuid** →
+//              该条目被判为「非身份项」→ 触发 v66 读回退 → 读到原版真值
+//           b) App Group：group.com.meituan.imeituan 也是共用容器，
+//              其中的 widget_entry_appgroup_uuid / _token 就是原版设备 ID
+//              和**原版登录票据**（后者是连坐拉黑的高危通道）
+//         修法（三条，全部只在 MT_CLONE 生效，不碰在跑的百度 D 系列）：
+//           1) keychain 身份关键字补 uuid/oniprivate/oniid/onimaru/
+//              dpid/dfpid/unionid/utdid/babel/sakguard → 这些条目
+//              禁用读回退，克隆自建（硬件身份已被伪造 → 天然互不相同）
+//           2) NSUserDefaults/CFPreferences 身份键补美团项
+//              （babelId / widget_entry_appgroup_* / sakguard 设备身份
+//              / unionid 缓存）→ 改走本克隆私有域
+//           3) 出口兜底：出口串若仍出现已知的**本机真值**（设备 uuid /
+//              dpid / dfpid），说明还有没拦住的通道 → 记诊断日志；
+//              设备 uuid 直接换成本克隆等价 ID（dpid/dfpid 被签名覆盖
+//              不替换，避免破坏 mtgsig 校验）
+//   v76   ★ 给克隆发自己的身份证（2026-09-21，v75 的副作用修复）★
+//         v75 装到真机实测：原版 uuid/dpid 出口命中 0 次（隔离成功），
+//         KC-IDENTITY-MISS 37 条（身份条目已不回退）—— 但**克隆对外
+//         上报的是空 UUID**，比原来更醒目：
+//           csec 上报  {"app_version":"1200660201",...,"UUID":"","bundles":[]}
+//           block-popup URL  ...&uuid=&version_name=12.66.201&...
+//           lx0 上报  {"cityId":0,"userId":"","uuid":"",...}
+//         根因：v75 把身份条目的读回退关掉了（防泄漏，正确），但 MISS 后
+//         直接返回 errSecItemNotFound → 美团 ONI/csec SDK 读到 nil →
+//         拼出空串上报。原版这些字段都带合法值，克隆报空 =
+//         「环境异常/设备信息缺失」标记，仍会被判定为异常设备。
+//         修法（只在 MT_CLONE 生效）：
+//           1) keychain 身份条目 MISS 时**合成同形稳定伪值并返回**
+//              （mtSynthIdentityValue / mtSynthKeychainResult）
+//              · uuid/localid/utdid/oni* → 64 位 hex（同美团设备 ID 形态）
+//              · dpid/dfpid/unionid      → 32 hex + 19 位数字（同原版形态）
+//              · 含 token/login/session/passport/bduss 的条目**不合成**
+//                （伪造票据会破坏登录态，查不到才是正确行为）
+//              新增诊断 KC-IDENTITY-SYNTH 便于下轮核对
+//           2) mtFakeDeviceUUID 前缀不再硬编码原版的 011F，改随机 4 位 hex
+//              （同前缀 = 给服务端留一个「同批次」聚类锚点）
+//   v77   ★ 设备聚类信号封堵（2026-10-26，修「隔天又被检测到」）★
+//         实测时间线：v72 的 D10 于 9-21 下单成功，**隔天即被拦**。
+//         新身份第一天干净 → 说明服务端过夜后把该克隆关联回了同一台
+//         物理机。v72 已堵 DeviceCheck / 剪贴板 / WiFi BSSID / keychain
+//         关键字，剩下四条「同机完全一致且跨天不变」的信号此前全裸奔：
+//           1) kern.boottime / -[NSProcessInfo systemUptime]
+//              开机时刻精确到秒，同机所有 App 完全相同 → 最强聚类锚点
+//           2) -[NSProcessInfo hostName]
+//              真实设备名（如「张三的iPhone」），v70 只改了 UIDevice.name
+//           3) 磁盘总容量 NSFileSystemSize
+//              硬件属性，同机一致；按克隆偏移 1~12GB
+//           4) LSApplicationWorkspace 枚举
+//              私有 API 能列出本机全部 bundle id → BdD1…BdD10 / BdE1…
+//              / BdT1… 一览无余 = 多开实锤 → 整机拉黑（连原版）
+//         修法：1~3 每克隆持久化随机值（同克隆重启稳定、跨克隆不同）；
+//              4 枚举结果剔除所有 com.baidu.BaiduMobile.<后缀>，保留官方版。
+//         1 与 systemUptime 同步加偏移，保证 boottime/uptime 互相自洽。
+//
+//   v78   ★ 通道自洽性修复（2026-11-01，修 v77 自伤）★
+//         现象：13 Pro Max 能进农场，点下单返回「下单人数过多」。
+//         该文案主二进制里不存在 → 服务端软性拒绝，风控降权的标准写法。
+//         根因不在伪装强度，而在 v77 把「同指标多通道」改成了互相打架：
+//           · kern.boottime 只拦了 sysctlbyname，没拦 sysctl(MIB)
+//             主二进制实测导入 _sysctl，一条老式调用就拿到真开机时刻
+//             → sysctlbyname 报假、sysctl 报真，比不伪装更像篡改
+//           · 磁盘只改了 NSFileManager，主二进制同时导入 _statfs/_statvfs
+//             → 容量两条通道两个答案，同样自曝
+//         修法：
+//           1) 绑回 sysctl(MIB)，拦 CTL_KERN/KERN_BOOTTIME 与
+//              CTL_HW/HW_MACHINE/HW_MODEL，口径与 sysctlbyname 完全一致
+//              （只拦 namelen==2 且 MIB 明确的调用，写操作/未知 MIB 透传）
+//           2) 磁盘伪装整体撤销，回到透传真值 —— 该信号聚类价值低
+//              （同型号同容量机器极多），而矛盾风险高，收益不划算
+//         原则：宁可不伪装，也绝不允许同一指标出现两个值。
+//
+//   v67   ★ cuid 双格式修复 ★ 真机取证发现平台层 cuid（plist/keychain）
+//         = 40位大写HEX+11位尾巴（51字符），与 cookie BAIDUCUID（b64url
+//         ~70字符）是**两个不同的 ID**。旧实现把 cookie 格式顶给了平台层
+//         → 服务端识别非法 cuid → 果园不下发浏览任务。新增 genPlatform
+//         CUID()，NSUserDefaults/keychain 层改用平台格式，cookie 层不变。
+//
+// ============ v60 设计（当前） ============
+//
+// 堵两条已知暴露面：
+//   1) dyld 枚举 —— 主可执行里有 _dyld_image_count /
+//      _dyld_get_image_name / _dyld_get_image_header /
+//      _dyld_get_image_vmaddr_slide。任何一次完整枚举都能看到
+//      注入的 BaiduBoxSys.dylib（镜像数 +1、多一条陌生路径）。
+//      → 对外 count 减 1，并做「对外索引 → 真实索引」重映射，
+//        跳过隐藏项，遍历结果依旧连续完整。
+//   2) 包标识 —— 多开必须改 bundle id，克隆是
+//      com.baidu.BaiduMobile.BdD1，与官方不同，属重打包特征。
+//      → 读取侧（bundleIdentifier / infoDictionary /
+//        objectForInfoDictionaryKey / CFBundleGetIdentifier）
+//        一律返回官方值；克隆后缀改走 realBundleIdentifier()。
+//
+// 身份伪造（cuid/UDID/IDFV/ECID/设备名）与 v59 隔离机制维持不变。
+//
+// 保留教训（不重蹈覆辙）：
+//   不 hook sysctl() 旧 API（闪退）；不 hook setURL:/setHTTPBody:（签名错误）；
+//   fishhook 覆盖所有非系统镜像 + dyld 回调；dyld 回调用全局 C 函数；
+//   持久化用 CFPreferences 不用 NSUserDefaults；-Xlinker -no_fixup_chains。
+//   返回结构体的方法严禁用 imp_implementationWithBlock（走 sret，ABI 无保证）。
 //
 
 #import <Foundation/Foundation.h>
@@ -14,12 +181,25 @@
 #import <Security/Security.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
-#include <errno.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
+#include <string.h>
 #include "fishhook.h"
+
+// ============================================================
+// MT_CLONE — 美团多开构建开关（2026-09-21）
+//   1 = 美团多开（禁用百度专属 hook：WKWebView UA / NSMutableURLRequest UA 补段等）
+//   0 = 百度多开（D/E/T/P 系列）
+// ★ 由 Makefile 决定：默认 0；美团构建目标 $(DYLIB_MT) 传 -DMT_CLONE=1。
+//   不要在这里硬编码——否则另一系重建时静默翻车。
+// dylib 产物下载后本地留档（百度 = dylib_v72/，美团 = dylib_mt/），互不覆盖。
+// ============================================================
+#ifndef MT_CLONE
+#define MT_CLONE 0
+#endif
 
 #define NSLog(...)
 
@@ -27,19 +207,514 @@ static __thread BOOL g_inCookieHook = NO;
 static BOOL g_inUDHook = NO;
 
 // ============================================================
-// 预计算的内核级伪装值 (C 字符串，在 hook 安装前填充)
+// ★ v66: keychain 隔离恢复 + 非身份项读回退 ★
+//
+// v65 对照实验结论（用户实测）：关掉 keychain 隔离后，克隆与原版
+// 共用同一批 keychain 项（cuid/SToken/登录票据），**原版 App 被连坐
+// 拉黑** → keychain 隔离是保命机制，绝不能关。
+//
+// 但 v59 的全量隔离把 keychain 里所有项都切到私有域，若某些
+// 非身份配置项是原版写入的（克隆从未写过），克隆就读不到 → 功能
+// 降级嫌疑（果园不对劲从 v59 开始）。
+//
+// v66 策略：
+//   写（Add/Update）/ 删（Delete）：始终落在本克隆后缀域 ——
+//     克隆永远不写共享域，原版绝不被污染。
+//   读（CopyMatching）：
+//     身份/登录类项（isIdentityKeychainDict）→ 只读后缀域，绝不
+//       回读共享域（防串号、防连坐 —— T4 的教训）。
+//     非身份类项 → 先读后缀域；读不到（errSecItemNotFound）再
+//       回读共享域原样项。读到的数据仍走 rewriteIdentityData
+//       出口消毒，身份字符串照样替换。
 // ============================================================
-static char g_fakeMachine[32] = "";
-static char g_fakeBuild[32] = "";
-static char g_fakeOSVersion[32] = "";
-static char g_fakeDarwinRel[32] = "";
-static uint64_t g_fakeMemSize = 0;
+#define BD_KCHAIN_NS_ISOLATION 1
+#define BD_KCHAIN_READTHROUGH 1
 
+// ============================================================
+// ★ 硬件人格策略（v58 起变更）
+// v57N-v57V: 全套伪造 iPhone15,3 / iOS 17.6.1 / 6GB / 430x932
+//   → XS 实测「页面变大」（UIScreen 假尺寸是根因）。
+// v58: 硬件全部跟真机（机型/系统/内存/屏幕透传真值，全通道自洽），
+//   只伪造身份（cuid/UDID/IDFV/ECID/设备名/序列号置空）。
+//   实测已证明百度风控认 cuid 不认硬件指纹（D1 与原版同机均可下单）。
+// 下方 FAKE_* 常量仅被未启用的 uname/sysctl hook 引用，保留备查。
+// ============================================================
+// ------------------------------------------------------------
+// ★ v80：三个「机型」字段必须分开，不能共用一个字符串 ★
+//
+// 真机实测（v79 PROFILE，iPhone 13 Pro Max / iOS 16.1.2）：
+//   sysctlbyname("hw.machine") = "iphone14,3"   ← 全小写
+//   sysctlbyname("hw.model")   = "D64AP"        ← 主板代号，6 字符
+//   MGCopyAnswer("ProductType")= "iPhone14,3"   ← 大写 I
+//
+// v71~v79 把 hw.machine / hw.model / HardwareModel 全部回 FAKE_MACHINE
+// （"iPhone13,4"），于是：
+//   · hw.model 返回一台真机绝不会出现的值（真机此处永远是主板代号）
+//   · hw.machine 大小写也与真机不符
+// 任何读到一次 hw.model 的代码都能 100% 判定「设备信息被篡改」。
+// 这不是「检测到本机」，是「检测到你在伪装」，比不伪装更糟。
+//
+// 人格仍沿用 iPhone13,4（12 Pro Max）：与真机 13 Pro Max 同为
+// 1284×2778 / 6GB / 6 核，屏幕与内存零矛盾（v71 选它的原意）。
+// ------------------------------------------------------------
+static const char *FAKE_MACHINE    = "iPhone13,4";       // MobileGestalt ProductType（真机此处大写）
+static const char *FAKE_MACHINE_LC = "iphone13,4";       // sysctl hw.machine / uname.machine（真机全小写）
+static const char *FAKE_HWMODEL    = "D54pAP";           // hw.model / HardwareModel（12 Pro Max 主板代号）
+static const char *FAKE_OSVER     = "17.6.1";            // 系统版本
+static const char *FAKE_DARWIN    = "23.6.0";            // 对应 Darwin 内核版本
+static const char *FAKE_PRODUCT   = "iPhone15,3";
+static const char *FAKE_MODELNUM  = "MQ9G3CH/A";         // 14 Pro Max 国行型号
+static const char *FAKE_UA_SUFFIX = "iPhone OS 17_6_1";  // UA 中的系统版本
+static const uint64_t FAKE_MEMSIZE = 6ULL * 1024 * 1024 * 1024; // 6GB
+
+// ============================================================
+// ★ v77 设备聚类信号（每克隆唯一，持久化）★
+//
+// 背景：v72 的 D10 在 9-21 下单成功，隔天又被拦 —— 新身份第一天干净、
+// 过夜后被服务端关联回同一台物理机。说明还有「稳定设备信号」在持续
+// 上报。以下三项都是同机所有 App 完全一致、且跨天不变的强聚类信号：
+//   · kern.boottime / systemUptime —— 精确到秒的开机时刻
+//   · 磁盘总容量                   —— 硬件属性
+//   · NSProcessInfo.hostName       —— 真实设备名
+// 加上「已安装应用枚举」（见 constructor 2f 段，能直接列出所有 BdDx/BdEx
+// 克隆 → 多开实锤），这四条是 v72 之后最可能被风控拿来串联设备的通道。
+//
+// 两个偏移量在构造函数最早期（装任何 hook 之前）算好，避免递归。
+// ============================================================
+static long long g_bootOffset = 0;   // 秒：伪造「本克隆专属开机时刻」的偏移
+static long long g_diskDelta  = 0;   // 字节：伪造磁盘总容量的偏移
+// v81: 统一假主机名。真机实测 gethostname/uname.nodename/sysctl kern.hostname
+//   三者同值（本例 "1-4"）。此前只有 ObjC 侧（NSProcessInfo.hostName /
+//   UIDevice.name）走 getPersistent，C 侧写死 "iPhone"，而
+//   sysctlbyname("kern.hostname") 干脆透传真值 —— 同一指标三个答案，
+//   既是矛盾也是真名泄漏。这里缓存一份，所有通道共用。
+static char      g_fakeHost[128] = {0};
+static NSString *g_realGPUName = nil; // v79: 真机 Metal 设备名（伪装前抓取，供诊断）
+static BOOL      g_appsDiagLogged = NO;
+
+// ============================================================
+// fishhook 原函数指针
+// ============================================================
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
-static int (*orig_uname)(struct utsname *) = NULL;
+static CFPropertyListRef (*orig_MGCopyAnswer)(CFStringRef key, CFDictionaryRef options) = NULL;
+static __thread BOOL g_inMGHook = NO;
 
-// 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获局部变量）
-#define REBIND_COUNT 10
+typedef unsigned int io_registry_entry_t;
+static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, uint32_t) = NULL;
+
+// v72: WiFi 信息返空 —— SSID/BSSID 是家庭路由器锚点，所有克隆与原版一致，
+// 服务端 IP+BSSID 聚类就能把新 bundle id 和被拉黑的原版连起来。
+// iOS14+ 无定位权限本来也拿不到，返 NULL 不异常。
+// ⚠️ 仅百度构建启用。美团版（MT_CLONE=1）禁用：实测美团登录模块用
+//    CNCopyCurrentNetworkInfo 判网络状态，返 NULL → 获取验证码报「网络异常」；
+//    且美团原版本就正常使用、不存在被拉黑原版可关联，隐藏 WiFi 无收益。
+#if !MT_CLONE
+static CFArrayRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
+static CFArrayRef hook_CNCopyCurrentNetworkInfo(CFStringRef ifName) {
+    (void)ifName;
+    return NULL;
+}
+#endif // !MT_CLONE
+
+// v73: SCNetworkReachabilityGetFlags 诊断 —— 只记录「判定为不可达」的调用。
+// M1 登录验证码「网络异常」疑点：登录 SDK 本地 Reachability 状态卡死，
+// 点发码时本地直接拒绝、无任何网络请求。此 hook 验证系统层到底报什么。
+static void diagAppend(NSString *s); // 前置声明（实现在诊断日志段）
+static Boolean (*orig_SCNetworkReachabilityGetFlags)(const void *, uint32_t *) = NULL;
+static int g_reachUnreachableLogs = 0;
+static Boolean hook_SCNetworkReachabilityGetFlags(const void *target, uint32_t *flags) {
+    Boolean r = orig_SCNetworkReachabilityGetFlags(target, flags);
+    @try {
+        // kSCNetworkFlagsReachable = 0x2；不可达才记（可达的调用太频繁）
+        if (r && flags && !(*flags & 0x2) && g_reachUnreachableLogs < 60) {
+            g_reachUnreachableLogs++;
+            NSMutableString *m = [NSMutableString stringWithFormat:
+                @"\n[%@] REACH-UNREACHABLE flags=0x%lx\n", [NSDate date], (unsigned long)*flags];
+            if (target) {
+                // target 是 SCNetworkReachabilityRef，描述里带 host
+                NSString *desc = CFBridgingRelease(CFCopyDescription(target));
+                [m appendFormat:@"  TARGET: %@\n", desc ?: @"?"];
+            }
+            diagAppend(m);
+        }
+    } @catch (id e) {}
+    return r;
+}
+
+// ============ v96: 设备指纹溯源（mps / 百度安全 SDK） ============
+// 事实基础（v95 实测日志）：
+//   mps=3612411017 出现在 875 次请求、31 个 host 上，包含
+//     · sfp.safe.baidu.com/sfp/v1/rd   （百度安全指纹上报）
+//     · app.duxiaomanfintech.com/odp/wireless/sdk/init （度小满风控 SDK）
+//     · duxiaodian.baidu.com/api/trade/v2.0/orders/create （下单）
+//   且 URL / Header / Body 三处全量扫描 TRUTH-HIT = 0。
+//   → mps 不经过任何被 hook 的 ID 读取路径，是被独立计算/缓存的设备指纹。
+// 本版只做溯源：扫安全类、抓 mps 拼装处的调用栈。不改变任何行为，
+// 因此下单结果与 v95 完全可比。
+#include <execinfo.h>
+#include <ctype.h>
+
+static int g_v96BtLeft = 4;
+static int g_v96BodyBtLeft = 2;
+static int g_v96MpsLogs = 0;
+
+static void v96DumpBacktrace(NSString *tag, NSString *ctx) {
+    @try {
+        void *frames[48];
+        int n = backtrace(frames, 48);
+        NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] ctx=%@\n", tag,
+                              (ctx.length > 150 ? [ctx substringToIndex:150] : (ctx ?: @""))];
+        for (int i = 0; i < n; i++) {
+            Dl_info info;
+            if (dladdr(frames[i], &info) && info.dli_fname) {
+                const char *b = strrchr(info.dli_fname, '/');
+                const char *mod = b ? b + 1 : info.dli_fname;
+                [m appendFormat:@"  #%-2d %s+0x%lx\n", i, mod,
+                 (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
+            }
+        }
+        diagAppend(m);
+    } @catch (id e) {}
+}
+
+static BOOL v96SecNameMatch(const char *cn) {
+    if (!cn || !cn[0]) return NO;
+    static const char *kws[] = {
+        "finger", "sfp", "sofire", "secsdk", "seckit", "secbox",
+        "deviceid", "deviceinfo", "devicesn", "riskinfo", "riskctrl",
+        "mps", "zdid", "bds_", "securityguard", "soter",
+        NULL
+    };
+    char low[256]; size_t k = 0;
+    for (; cn[k] && k < 255; k++) low[k] = (char)tolower((unsigned char)cn[k]);
+    low[k] = 0;
+    for (int i = 0; kws[i]; i++) if (strstr(low, kws[i])) return YES;
+    return NO;
+}
+
+static void v96DumpSecurityClasses(void) {
+    @autoreleasepool {
+        int total = objc_getClassList(NULL, 0);
+        if (total <= 0) return;
+        Class *list = (Class *)malloc(sizeof(Class) * (size_t)total);
+        if (!list) return;
+        int n = objc_getClassList(list, total);
+        NSMutableString *out = [NSMutableString stringWithFormat:
+                                @"\n[SECKIT] v96 classes=%d\n", n];
+        int hit = 0;
+        for (int i = 0; i < n && hit < 140; i++) {
+            const char *cn = class_getName(list[i]);
+            if (!v96SecNameMatch(cn)) continue;
+            hit++;
+            [out appendFormat:@"  C %s\n", cn];
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(list[i], &mc);
+            if (ms) {
+                for (unsigned int j = 0; j < mc && j < 24; j++)
+                    [out appendFormat:@"      - %s\n", sel_getName(method_getName(ms[j]))];
+                free(ms);
+            }
+        }
+        [out appendFormat:@"[SECKIT] hits=%d\n", hit];
+        diagAppend(out);
+        free(list);
+    }
+}
+
+// ============ CFNetwork C 层 Cookie API ============
+// iOS SDK 未公开 CFHTTPCookie 头文件（仅 macOS 公开），手动声明类型，
+// 工具函数用 dlsym 运行时解析，hook 函数的 orig 指针由 fishhook 填充
+typedef struct OpaqueCFHTTPCookie *CFHTTPCookieRef;
+typedef struct OpaqueCFHTTPCookieStorage *CFHTTPCookieStorageRef;
+
+// hook 的原函数（fishhook rebind 后由 fishhook 填充真实地址）
+static void (*orig_CFHTTPCookieStorageSetCookie)(CFHTTPCookieStorageRef, CFHTTPCookieRef) = NULL;
+static void (*orig_CFHTTPCookieStorageSetCookies)(CFHTTPCookieStorageRef, CFArrayRef, CFURLRef) = NULL;
+static CFArrayRef (*orig_CFHTTPCookieStorageCopyCookiesForURL)(CFHTTPCookieStorageRef, CFURLRef, CFURLRef) = NULL;
+static CFArrayRef (*orig_CFHTTPCookieStorageCopyAllCookies)(CFHTTPCookieStorageRef) = NULL;
+
+// 工具函数（dlsym 运行时解析，避免链接依赖）
+static CFStringRef (*p_CFHTTPCookieCopyName)(CFHTTPCookieRef) = NULL;
+static CFStringRef (*p_CFHTTPCookieCopyValue)(CFHTTPCookieRef) = NULL;
+static CFDictionaryRef (*p_CFHTTPCookieCopyProperties)(CFHTTPCookieRef) = NULL;
+static CFHTTPCookieRef (*p_CFHTTPCookieCreateWithProperties)(CFAllocatorRef, CFDictionaryRef) = NULL;
+
+static void init_cf_cookie_syms(void) {
+    if (p_CFHTTPCookieCopyName) return;
+    void *h = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_LAZY);
+    if (!h) h = dlopen(NULL, RTLD_LAZY); // 兜底：在已加载镜像中查找
+    if (!h) return;
+    p_CFHTTPCookieCopyName = dlsym(h, "CFHTTPCookieCopyName");
+    p_CFHTTPCookieCopyValue = dlsym(h, "CFHTTPCookieCopyValue");
+    p_CFHTTPCookieCopyProperties = dlsym(h, "CFHTTPCookieCopyProperties");
+    p_CFHTTPCookieCreateWithProperties = dlsym(h, "CFHTTPCookieCreateWithProperties");
+}
+
+// CFPreferences suite 域隔离（防 App Group 共享容器泄露设备指纹）
+static CFPropertyListRef (*orig_CFPreferencesCopyAppValue)(CFStringRef, CFStringRef) = NULL;
+static CFPropertyListRef (*orig_CFPreferencesCopyValue)(CFStringRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
+static Boolean (*orig_CFPreferencesSetValue)(CFStringRef, CFPropertyListRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
+static void (*orig_CFPreferencesSetAppValue)(CFStringRef, CFPropertyListRef, CFStringRef) = NULL;
+
+// 前向声明
+static NSString *getPersistent(NSString *key, NSString *(^gen)(void));
+static NSString *genUUIDStr(void);
+static NSString *genDeviceName(void);
+static NSString *getFakeID(NSString *name);
+static NSString *fakeIdentityValueForKey(NSString *key);   // v83: cuid 类键统一假值
+static BOOL isDeviceCookie(NSString *cookieName);
+static NSString *canonicalCookieKey(NSString *name);
+static BOOL isSessionCookie(NSString *cookieName);
+static void captureRealIdentity(NSString *name, NSString *value);
+static NSString *rewriteIdentityString(NSString *s);
+static NSData *rewriteIdentityData(NSData *d);
+static NSString *fakeCUIDValue(void);
+static NSString *cloneTag(void);
+static NSString *mapGroupSuite(NSString *suite);
+static CFStringRef mapGroupAppID(CFStringRef appID);
+static BOOL isCuidServiceDict(CFDictionaryRef dict);
+static NSData *fakeCUIDDataFrom(NSData *realData);
+static void forceCuidInResultDict(CFMutableDictionaryRef md);
+
+// ============================================================
+// v60-A: 隐藏注入痕迹 —— dyld 镜像枚举过滤
+//
+// 背景：主可执行里实测存在 _dyld_image_count / _dyld_get_image_name /
+// _dyld_get_image_header / _dyld_get_image_vmaddr_slide（各 2~3 处）。
+// 任何一次完整枚举都会看到注入的 BaiduBoxSys.dylib —— 镜像总数 +1，
+// 且多出一条陌生路径，是最直白的「被注入」证据。
+//
+// 做法：对外把 count 减 1，并把「对外索引」重映射到「真实索引」
+// （跳过隐藏项）。App 遍历 0..count-1 拿到的仍是连续完整的列表。
+//
+// ⚠️ 隐藏判定只能调用 orig_*，否则自我递归 / 索引错位。
+// ⚠️ 这几个 API 自身的 GOT 也会被替换，所以安装 rebind 时必须先用
+//    局部数组把 (header, slide) 收全，再统一替换（见构造函数 7d）。
+// ============================================================
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
+
+#define HIDDEN_IMAGE_COUNT 1
+#if MT_CLONE
+static const char *g_hiddenImageKeys[HIDDEN_IMAGE_COUNT] = { "MtKit.dylib" };       // 美团克隆内嵌名
+#else
+static const char *g_hiddenImageKeys[HIDDEN_IMAGE_COUNT] = { "BaiduBoxSys.dylib" }; // 百度克隆内嵌名
+#endif
+
+static int isHiddenImageIndex(uint32_t idx) {
+    if (!orig_dyld_get_image_name) return 0;
+    const char *n = orig_dyld_get_image_name(idx);
+    if (!n) return 0;
+    for (int i = 0; i < HIDDEN_IMAGE_COUNT; i++) {
+        if (strstr(n, g_hiddenImageKeys[i])) return 1;
+    }
+    return 0;
+}
+
+static uint32_t hook_dyld_image_count(void) {
+    if (!orig_dyld_image_count) return 0;
+    uint32_t total = orig_dyld_image_count();
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (isHiddenImageIndex(i)) hidden++;
+    }
+    return total - hidden;
+}
+
+static uint32_t mapImageIndex(uint32_t outIdx) {
+    if (!orig_dyld_image_count) return outIdx;
+    uint32_t total = orig_dyld_image_count();
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (isHiddenImageIndex(i)) continue;
+        if (seen == outIdx) return i;
+        seen++;
+    }
+    return outIdx;   // 越界：透传，交给系统自己报错
+}
+
+static const char *hook_dyld_get_image_name(uint32_t idx) {
+    if (!orig_dyld_get_image_name) return NULL;
+    return orig_dyld_get_image_name(mapImageIndex(idx));
+}
+
+static const struct mach_header *hook_dyld_get_image_header(uint32_t idx) {
+    if (!orig_dyld_get_image_header) return NULL;
+    return orig_dyld_get_image_header(mapImageIndex(idx));
+}
+
+static intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t idx) {
+    if (!orig_dyld_get_image_vmaddr_slide) return 0;
+    return orig_dyld_get_image_vmaddr_slide(mapImageIndex(idx));
+}
+
+#define HIDE_REBIND_COUNT 4
+#define HIDE_MAX_IMG      512
+static struct rebinding g_hide_rebindings[HIDE_REBIND_COUNT];
+
+// ============================================================
+// v60-B: 包标识伪装 —— 对外一律报告官方 bundle id
+//
+// 背景：多开必须改 bundle id（同 id 无法共存），克隆是
+// "com.baidu.BaiduMobile.BdD1"，官方是 "com.baidu.BaiduMobile"。
+// 主可执行里 bundleIdentifier 选择器 5 处、CFBundleIdentifier 4 处、
+// objectForInfoDictionaryKey 1 处。改包名本就是重打包检测的经典特征。
+//
+// 做法：读取侧全部返回官方值。
+// ⚠️ 克隆后缀（keychain 命名空间）必须改走 realBundleIdentifier()，
+//    绝不能再取被 hook 后的值 —— 否则每个克隆算出的后缀都会变成
+//    "BaiduMobile"，v59 的隔离当场失效（所有克隆挤进同一命名空间）。
+//
+// ★ v63 停用原因（v74 修复）★
+//   原实现判断「是不是主 bundle」用 `bundle == [NSBundle mainBundle]`，
+//   而首次调用 [NSBundle mainBundle] 自身要读 Info.plist → 触发
+//   -infoDictionary hook → 再次调用 [NSBundle mainBundle] → 无限递归。
+//   v74 改为：安装 hook **之前**先把 mainBundle 指针缓存下来，
+//   hook 内部只做指针比较，永不调用 [NSBundle mainBundle]。
+// ============================================================
+#if MT_CLONE
+#define OFFICIAL_BUNDLE_ID "com.meituan.imeituan"      // 美团官方包名
+#else
+#define OFFICIAL_BUNDLE_ID "com.baidu.BaiduMobile"     // 百度官方包名
+#endif
+
+static NSString *(*orig_bundleIdentifier)(id, SEL) = NULL;
+static NSDictionary *(*orig_infoDictionary)(id, SEL) = NULL;
+static id (*orig_objectForInfoDictionaryKey)(id, SEL, NSString *) = NULL;
+static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef) = NULL;
+
+// v74: 安装 hook 前缓存，hook 内只比指针（消除 v63 的递归闪退）
+static NSBundle *g_mainBundleCached = nil;
+// v74: 本克隆的真实 bundle id（构造函数最早期固定，hook 生效后仍可用）
+static NSString *g_cloneBundleID = nil;
+
+// 取真实 bundle id（绕过 hook）—— 只给 cloneTag / 出口消毒用
+static NSString *realBundleIdentifier(void) {
+    if (orig_bundleIdentifier) {
+        return orig_bundleIdentifier([NSBundle mainBundle], @selector(bundleIdentifier));
+    }
+    return [[NSBundle mainBundle] bundleIdentifier];
+}
+
+// ★ v74: 出口包名消毒 —— 任何要发出去/写下去的字符串里的克隆包名换成官方包名
+//   （URL query 的 csecpkgname/packageName、POST body 的 appInfo.app、
+//     User-Agent 头部，以及 keychain/共享域回读内容）
+static NSString *maskCloneBundleID(NSString *s) {
+    if (!s || s.length < 12) return s;
+    @try {
+        NSString *cloneID = g_cloneBundleID;
+        if (cloneID.length < 12) cloneID = realBundleIdentifier();
+        if (cloneID.length < 12) return s;
+        if ([cloneID isEqualToString:@(OFFICIAL_BUNDLE_ID)]) return s;   // 未改包名，无需消毒
+        if ([s rangeOfString:cloneID].location == NSNotFound) return s;
+        return [s stringByReplacingOccurrencesOfString:cloneID withString:@(OFFICIAL_BUNDLE_ID)];
+    } @catch (id e) {}
+    return s;
+}
+
+static NSData *maskCloneBundleIDData(NSData *d) {
+    if (!d || d.length < 12) return d;
+    @try {
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s) return d;
+        NSString *r = maskCloneBundleID(s);
+        if (r == s) return d;
+        return [r dataUsingEncoding:NSUTF8StringEncoding] ?: d;
+    } @catch (id e) { return d; }
+}
+
+static BOOL isMainBundleObject(id bundle) {
+    if (!bundle) return NO;
+    if (g_mainBundleCached) return (bundle == g_mainBundleCached);
+    return (bundle == [NSBundle mainBundle]);
+}
+
+
+static NSString *hook_bundleIdentifier(id self, SEL _cmd) {
+    if (isMainBundleObject(self)) return @(OFFICIAL_BUNDLE_ID);
+    if (orig_bundleIdentifier) return orig_bundleIdentifier(self, _cmd);
+    return nil;
+}
+
+static NSDictionary *hook_infoDictionary(id self, SEL _cmd) {
+    NSDictionary *d = orig_infoDictionary ? orig_infoDictionary(self, _cmd) : nil;
+    if (!d || !isMainBundleObject(self)) return d;
+    static NSDictionary *cached = nil;          // infoDictionary 被高频调用，缓存一份
+    if (!cached) {
+        NSMutableDictionary *md = [d mutableCopy];
+        if (md) {
+            md[@"CFBundleIdentifier"] = @(OFFICIAL_BUNDLE_ID);
+            cached = md;
+        }
+    }
+    return cached ? cached : d;
+}
+
+static id hook_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
+    if (isMainBundleObject(self) && key && [key isEqualToString:@"CFBundleIdentifier"]) {
+        return @(OFFICIAL_BUNDLE_ID);
+    }
+    if (orig_objectForInfoDictionaryKey) return orig_objectForInfoDictionaryKey(self, _cmd, key);
+    return nil;
+}
+
+static CFStringRef hook_CFBundleGetIdentifier(CFBundleRef b) {
+    if (b && b == CFBundleGetMainBundle()) return CFSTR(OFFICIAL_BUNDLE_ID);
+    if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(b);
+    return NULL;
+}
+
+// 给实例方法装 IMP，并把原实现存进 outOrig（传 &orig_xxx）
+// class_addMethod 成功 = 本类原本没有该方法（继承自父类），新 IMP 直接生效；
+// 返回 NO = 本类已有实现，走 method_setImplementation 覆盖。
+// 这样绝不会误改父类的实现（NSBundle 的方法若来自父类，直接
+// method_setImplementation 会污染所有子类）。
+static void installInstanceMethod(Class cls, SEL sel, IMP newImp, void *outOrig) {
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    if (outOrig) *(void **)outOrig = (void *)orig;
+    if (!class_addMethod(cls, sel, newImp, method_getTypeEncoding(m))) {
+        method_setImplementation(m, newImp);
+    }
+}
+
+static void installBundleIdentifierHooks(void) {
+    Class nb = objc_getClass("NSBundle");
+    if (!nb) return;
+    // ★ v74: 先缓存 mainBundle 指针（此刻 hook 未装，读取路径干净），
+    //   之后 hook 内只做指针比较 —— 这是 v63 递归闪退的正式修复
+    g_mainBundleCached = [NSBundle mainBundle];
+    installInstanceMethod(nb, @selector(bundleIdentifier),
+                          (IMP)hook_bundleIdentifier, &orig_bundleIdentifier);
+    installInstanceMethod(nb, @selector(infoDictionary),
+                          (IMP)hook_infoDictionary, &orig_infoDictionary);
+    installInstanceMethod(nb, @selector(objectForInfoDictionaryKey:),
+                          (IMP)hook_objectForInfoDictionaryKey, &orig_objectForInfoDictionaryKey);
+}
+
+// ============================================================
+// 全局 rebindings — dyld 回调中需要访问（不能用 block 捕获）
+// ============================================================
+// v57T: 回退到 9 条 —— uname/sysctl/gethostname 三条 rebind 与
+// v57R/v57S 启动闪退强相关（二分定位：Q.1 可启动，R/S 均闪退，
+// 剩余可疑增量只有这 3 条 rebind + dlopen）。先保证能启动，
+// 后续逐条加回以精确定位。
+// hook 函数本体保留（未注册不影响体积），随时可恢复。
+// v60: 13 → 14，新增 CFBundleGetIdentifier（包标识的 C 层读取入口）
+// v63: 15 → 14 —— 移除 CFBundleGetIdentifier（v60 包标识伪装同批停用）
+// v72: 16 → 17 —— 新增 CNCopyCurrentNetworkInfo（WiFi 锚点返空，仅百度构建）
+// MT_CLONE=1 时该 rebind 不注册，表长回 16
+// v73: 新增 SCNetworkReachabilityGetFlags 诊断 rebind（两系都注册）
+// v78: 百度新增 sysctl(MIB) 绑定 —— 补 KERN_BOOTTIME / HW_MACHINE 通道
+#if !MT_CLONE
+#define REBIND_COUNT 19
+#else
+#define REBIND_COUNT 17
+#endif
 static struct rebinding g_rebindings[REBIND_COUNT];
 
 // dyld 回调 — 动态加载的非系统镜像也 hook（必须用 C 函数，不能用 block）
@@ -52,130 +727,1070 @@ static void hook_new_image(const struct mach_header *header, intptr_t slide) {
         if (strncmp(path, "/System/", 8) == 0) return;
         if (strncmp(path, "/Developer/", 11) == 0) return;
         rebind_symbols_image((void *)header, slide, g_rebindings, REBIND_COUNT);
+        // v63: 不再装「隐藏」rebind —— 见构造函数 7d 的说明。
+        // 动态加载的镜像若装了 dyld 枚举 hook，任何在新镜像里发起的
+        // _dyld_image_count 调用都会走 O(n) 重映射，且与系统自身使用
+        // 这些 API 的时序冲突，是启动崩溃的高危来源。
     }
 }
 
 // ============================================================
-// sysctlbyname hook — 纯 C 实现，ZERO ObjC 调用
+// sysctlbyname hook — v58 只消毒，不再伪造硬件人格
+// 机型/内存/系统版本全部返回真值（跟真机，与 UIScreen/NSProcessInfo 自洽）
+// 仅保留：序列号/UUID 置空（应用本来无权限，返回空不算异常）
 // ============================================================
+// 辅助：把 C 字符串写入 sysctl 输出缓冲（ZERO ObjC 调用）
+static int hook_return_cstr(const char *val, void *oldp, size_t *oldlenp) {
+    size_t need = strlen(val) + 1;
+    if (oldlenp) {
+        if (oldp && *oldlenp >= need) {
+            memcpy(oldp, val, need);
+        }
+        *oldlenp = need;
+    }
+    return 0;
+}
+
+// v79: 整型 sysctl 返回（hw.optional.arm.FEAT_* / hw.ncpu 等均为 int）
+static int hook_return_int(int val, void *oldp, size_t *oldlenp) {
+    size_t need = sizeof(int);
+    if (oldlenp) {
+        if (oldp && *oldlenp >= need) {
+            memcpy(oldp, &val, need);
+        }
+        *oldlenp = need;
+    }
+    return 0;
+}
+
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!name) goto fallback;
-
-    const char *fakeStr = NULL;
-
-    if (strcmp(name, "hw.machine") == 0 ||
-        strcmp(name, "hw.model") == 0 ||
-        strcmp(name, "hw.product") == 0 ||
-        strcmp(name, "hw.target") == 0) {
-        fakeStr = g_fakeMachine;
-    } else if (strcmp(name, "kern.osversion") == 0) {
-        fakeStr = g_fakeBuild;
-    } else if (strcmp(name, "kern.osproductversion") == 0) {
-        fakeStr = g_fakeOSVersion;
-    } else if (strcmp(name, "kern.osrelease") == 0) {
-        fakeStr = g_fakeDarwinRel;
-    } else if (strcmp(name, "hw.serialnumber") == 0 ||
-               strcmp(name, "hw.uuid") == 0) {
-        if (oldlenp) {
-            if (oldp && *oldlenp >= 1) {
-                ((char *)oldp)[0] = '\0';
-                *oldlenp = 1;
-            } else {
-                *oldlenp = 1;
-            }
+    if (name) {
+        // 序列号/UUID 清空（应用本来无权限，返回空不算异常）
+        if (strcmp(name, "hw.serialnumber") == 0 || strcmp(name, "hw.uuid") == 0) {
+            return hook_return_cstr("", oldp, oldlenp);
         }
-        return 0;
-    } else if (strcmp(name, "hw.memsize") == 0) {
-        if (oldlenp) {
-            if (oldp) {
-                if (*oldlenp >= sizeof(uint64_t)) {
-                    *(uint64_t *)oldp = g_fakeMemSize;
-                    *oldlenp = sizeof(uint64_t);
-                    return 0;
-                } else {
-                    *oldlenp = sizeof(uint64_t);
-                    return ENOMEM;
-                }
-            } else {
-                *oldlenp = sizeof(uint64_t);
+        // v70/v71: hw.machine/hw.model 回伪人格。v71 改 iPhone13,4（12 Pro Max，
+        //      与真机 13 Pro Max 同屏 1284×2778 同 6GB）—— v70 用 iPhone13,2
+        //      被农场识破：请求里 cua@1284_2778/statusbar-height 等真屏幕参数
+        //      与 iPhone12 的 1170×2532 矛盾，物理不存在的组合。
+        // v80 ★P0★ hw.machine 与 hw.model 必须分开返回 —— 见文件头三个常量。
+        //   v71~v79 两者共用 FAKE_MACHINE，导致 hw.model = "iPhone13,4"，
+        //   而真机该字段恒为主板代号（本例 D64AP）。这是格式级硬伤：
+        //   不是「像不像 12 Pro Max」，而是「这个值在 iOS 上不可能存在」。
+        if (strcmp(name, "hw.machine") == 0) return hook_return_cstr(FAKE_MACHINE_LC, oldp, oldlenp);
+        if (strcmp(name, "hw.model")   == 0) return hook_return_cstr(FAKE_HWMODEL,    oldp, oldlenp);
+        // kern.osproductversion / kern.osversion / kern.osrelease /
+        // hw.memsize 全部透传真值 —— 与 12 Pro Max 人格自洽（6GB/同系统区间）
+
+        // ★ v79: ARM 特性位 —— 直接把 SoC 世代写在脸上 ★
+        // 实证：主二进制字符串池里有 hw.optional.arm.FEAT_DotProd /
+        //       hw.optional.arm.FEAT_I8MM（TalosPro 没有，主二进制有）。
+        // A14（iPhone13,4 = 12 Pro Max 人格）不支持 I8MM；真机是 A15，支持。
+        // 于是同一台机器上报：机型 iPhone13,4（A14）+ 特性位 I8MM=1（A15）
+        // —— 又是「一个指标两个值」。这两条必须跟人格走。
+        if (strcmp(name, "hw.optional.arm.FEAT_I8MM") == 0)    return hook_return_int(0, oldp, oldlenp);
+        if (strcmp(name, "hw.optional.arm.FEAT_DotProd") == 0) return hook_return_int(1, oldp, oldlenp);
+
+        // v81 ★真名泄漏★ kern.hostname 此前未处理 → 透传真机设备名（本例 "1-4"）。
+        //   这是全机唯一一处「真实用户名」直接上网的通道（二进制实测引用 1 次），
+        //   而且与 gethostname/uname/NSProcessInfo.hostName 返回的假名互相矛盾。
+        if (strcmp(name, "kern.hostname") == 0) {
+            return hook_return_cstr(g_fakeHost[0] ? g_fakeHost : "iPhone", oldp, oldlenp);
+        }
+
+        // v77: kern.boottime ★设备聚类信号★
+        // 同一台机器上所有 App / 所有克隆读到的开机时刻精确到秒完全相同，
+        // 是风控串联「这些包跑在同一台物理机」最省事的锚点。给每克隆一个
+        // 持久化偏移（1 小时 ~ 6 天），并与 -[NSProcessInfo systemUptime]
+        // 同步加同样偏移，保证两条通道互相自洽（uptime = now - boottime）。
+        if (name && strcmp(name, "kern.boottime") == 0 &&
+            g_bootOffset > 0 && oldp && oldlenp) {
+            struct timeval tv;
+            size_t sz = sizeof(tv);
+            if (orig_sysctlbyname(name, &tv, &sz, NULL, 0) == 0) {
+                tv.tv_sec -= (time_t)g_bootOffset;
+                size_t n = (*oldlenp < sizeof(tv)) ? *oldlenp : sizeof(tv);
+                memcpy(oldp, &tv, n);
+                *oldlenp = n;
                 return 0;
             }
         }
-        return 0;
     }
-
-    if (fakeStr) {
-        size_t fakeLen = strlen(fakeStr) + 1;
-        if (oldlenp) {
-            if (oldp) {
-                if (*oldlenp >= fakeLen) {
-                    memcpy(oldp, fakeStr, fakeLen);
-                    *oldlenp = fakeLen;
-                    return 0;
-                } else {
-                    *oldlenp = fakeLen;
-                    return ENOMEM;
-                }
-            } else {
-                *oldlenp = fakeLen;
-                return 0;
-            }
-        }
-        return 0;
-    }
-
-fallback:
     return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
 // ============================================================
-// uname hook — 纯 C 实现
+// ★★ v57R 关键补漏：uname / sysctl / gethostname ★★
+//
+// 二进制扫描确认：App 引用 uname 32 次、sysctl 9 次、gethostname 2 次。
+// 此前只 hook 了 sysctlbyname —— 而 iOS 的 uname().machine 返回的是
+// 真实机型（如 iPhone14,3），sysctl(CTL_HW, HW_MACHINE) 同理。
+// 于是出现：sysctlbyname 说 iPhone15,3，uname 说 iPhone14,3 ——
+// 同一设备两条通道两个答案，是最典型的篡改特征。
+// 伪造人格再自洽，漏了这条通道就等于全盘暴露。
+//
+// 教训（务必遵守）：
+//   1. 三个 hook 全部纯 C、零 ObjC 调用（可能在极早期被调用）
+//   2. sysctl 只拦截明确的 MIB，其余全部透传（此前盲目 hook 闪退）
+//   3. newp != NULL 是写操作，永远透传
 // ============================================================
-static int hook_uname(struct utsname *name) {
-    int ret = orig_uname(name);
-    if (ret == 0 && name) {
-        strncpy(name->machine, g_fakeMachine, sizeof(name->machine) - 1);
-        name->machine[sizeof(name->machine) - 1] = '\0';
-        strncpy(name->release, g_fakeDarwinRel, sizeof(name->release) - 1);
-        name->release[sizeof(name->release) - 1] = '\0';
+static int (*orig_uname)(struct utsname *) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_gethostname)(char *, size_t) = NULL;
+
+static int hook_uname(struct utsname *u) {
+    if (!orig_uname) return -1;                 // 防护：未绑定绝不能解引用
+    if (!u) return orig_uname(u);
+    int r = orig_uname(u);          // 先调真实版保证缓冲区有效，再覆盖
+    if (r != 0) return r;
+    // v70: 只覆盖 nodename（防真实设备名泄漏）和 machine（机型人格）。
+    // sysname/release/version 保留真实值 —— 与 sysctlbyname 的
+    // kern.osrelease（透传真值）保持自洽，不能再用写死的 FAKE_DARWIN。
+    // v81: nodename 与 gethostname / sysctl kern.hostname 同值。
+    //      machine 跟真机实测格式 —— 真机 uname().machine = "iPhone14,3"（大写 I），
+    //      而 sysctl hw.machine = "iphone14,3"（全小写）。两条通道本就大小写不同，
+    //      v80 把两者都改成小写，反而与真机行为不符，这里按实测各自还原。
+    strlcpy(u->nodename, g_fakeHost[0] ? g_fakeHost : "iPhone", sizeof(u->nodename));
+    strlcpy(u->machine,  FAKE_MACHINE,                          sizeof(u->machine));
+    return 0;
+}
+
+// sysctl() 旧 API —— 只拦这几项，其余透传
+// MIB 常量（Darwin 稳定值，直接用数字避免头文件差异）：
+//   CTL_KERN=1  CTL_HW=6
+//   KERN_OSTYPE=1  KERN_OSRELEASE=2  KERN_HOSTNAME=10
+//   HW_MACHINE=1   HW_MODEL=2
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+                       void *newp, size_t newlen) {
+    if (!orig_sysctl) return -1;                // 防护：未绑定绝不能解引用
+    if (!name || namelen != 2 || newp != NULL) {
+        return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     }
-    return ret;
+    // 防护：oldp 与 oldlenp 必须成对出现，缺一透传（调用方布局未知，不能猜）
+    if (!oldlenp && oldp) {
+        return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    }
+    const int a = name[0], b = name[1];
+    // v80: 与 sysctlbyname 严格同口径 —— HW_MACHINE(1) 小写、
+    //      HW_MODEL(2) 主板代号。两者此前共用 FAKE_MACHINE 是同一处硬伤。
+    if (a == 6 && b == 1) return hook_return_cstr(FAKE_MACHINE_LC, oldp, oldlenp);  // HW_MACHINE
+    if (a == 6 && b == 2) return hook_return_cstr(FAKE_HWMODEL,    oldp, oldlenp);  // HW_MODEL
+    if (a == 1) {                                 // CTL_KERN
+        if (b == 1)  return hook_return_cstr("Darwin",      oldp, oldlenp);
+        // v81 ★修正★ KERN_OSRELEASE 改为透传。
+        //   这里此前返回 FAKE_DARWIN="23.6.0"（iOS 17.6 的内核），而
+        //   sysctlbyname("kern.osrelease") 与 kern.osversion 都是透传真值
+        //   （真机 22.1.0 / 20B82 = iOS 16.1）。同一指标两条通道两个值，
+        //   且 16.1 系统配 17.6 内核是不可能存在的组合 → 直接自曝。
+        //   人格本身就是 12 Pro Max 跑 iOS 16.1，真实值天然自洽。
+        if (b == 10) return hook_return_cstr(g_fakeHost[0] ? g_fakeHost : "iPhone",
+                                             oldp, oldlenp);
+        // v78 ★P0★ KERN_BOOTTIME(21) —— 补齐第二条开机时刻通道。
+        //   v77 只改了 sysctlbyname("kern.boottime")，但 sysctl() 是
+        //   独立的系统调用路径（不经过 sysctlbyname 符号），拿到的是真值。
+        //   于是同一台设备上：sysctlbyname 报「假开机时刻」、
+        //   sysctl 报「真开机时刻」—— 两条通道对不上，是比不伪装
+        //   更容易被判定篡改的特征。
+        if (b == 21) {
+            struct timeval tv;
+            size_t sz = sizeof(tv);
+            // 未绑定时原样透传，绝不返回自造的 -1（调用方会当成 ENOMEM）
+            if (!orig_sysctlbyname)
+                return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            if (orig_sysctlbyname("kern.boottime", &tv, &sz, NULL, 0) != 0)
+                return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            if (g_bootOffset > 0) tv.tv_sec -= (time_t)g_bootOffset;
+            if (oldlenp) {
+                if (oldp && *oldlenp >= sizeof(tv)) memcpy(oldp, &tv, sizeof(tv));
+                *oldlenp = sizeof(tv);
+            }
+            return 0;
+        }
+    }
+    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+
+static int hook_gethostname(char *name, size_t namelen) {
+    if (!orig_gethostname) return -1;           // 防护：未绑定绝不能解引用
+    if (!name || namelen == 0) return orig_gethostname(name, namelen);
+    const char *fake = g_fakeHost[0] ? g_fakeHost : "iPhone";  // v81: 与 uname/sysctl 同值
+    // v57S: 任何分支都保证 '\0' 结尾 —— 截断后不留 '\0' 会让调用方
+    // strlen() 越界读（EXC_BAD_ACCESS，且 @try 拦不住内存故障）
+    size_t copy = strlen(fake);
+    if (copy > namelen - 1) copy = namelen - 1;
+    memcpy(name, fake, copy);
+    name[copy] = '\0';
+    return 0;
 }
 
 // ============================================================
-// v59F: 前缀运行时派生
-//
-// A 系列每个克隆用独立前缀（Bd62/Bd63/…），过去靠「改源码 + 重新编译」。
-// 现在改成从 bundle id 末段取：com.baidu.BaiduMobile.BdF3 → "BdF3"。
-// 好处：同一份 dylib 打进 F1..F10，每个克隆自动得到独立命名空间，
-//       不再需要编译十次。
-//
-// 重入保护：本函数可能被 CFPreferences / NSUserDefaults 的 hook 在很深
-// 的栈上调用（Foundation 初始化过程中），计算路径若绕回来必须直接返回
-// 哨兵值，否则爆栈闪退（v63 cloneTag 踩过同样的坑）。
+// MGCopyAnswer hook — MobileGestalt 私有 API
+// v57L: 只伪装唯一标识（UDID/序列号/ECID/设备名），其余全放行真实值
+// （真实机型/系统与屏幕、UA 天然一致，不存在交叉矛盾）
 // ============================================================
-static NSString *fpx(void) {
-    static NSString *px = nil;
-    if (px) return px;
+static CFPropertyListRef hook_MGCopyAnswer(CFStringRef key, CFDictionaryRef options) {
+    if (!key || g_inMGHook) return orig_MGCopyAnswer(key, options);
+    g_inMGHook = YES;
+    @try {
+        // UniqueDeviceID (UDID) — 核心唯一标识
+        if (CFStringCompare(key, CFSTR("J1WLa1FfC0Dowb1A"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("UniqueDeviceID"), 0) == 0) {
+            NSString *u = getPersistent(@"BdD1.udid", ^{ return genUUIDStr(); });
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)u;
+        }
+        // SerialNumber — 空值（应用层本来无权限，返回空不算异常）
+        if (CFStringCompare(key, CFSTR("h9jDsbgj7xIugkIB2RVp1cKoVBOyBj8r"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("SerialNumber"), 0) == 0) {
+            g_inMGHook = NO;
+            return CFRetain(CFSTR(""));
+        }
+        // UniqueChipID (ECID) — 64位芯片唯一码，v57k 漏掉的硬伤
+        if (CFStringCompare(key, CFSTR("UniqueChipID"), 0) == 0) {
+            uint64_t ecid = 0;
+            NSString *s = getPersistent(@"BdD1.ecid", ^{
+                uint64_t hi = ((uint64_t)arc4random() << 32) | (uint64_t)arc4random();
+                return [NSString stringWithFormat:@"%llu", (unsigned long long)(hi & 0x00FFFFFFFFFFFFFFULL)];
+            });
+            ecid = [s longLongValue];
+            g_inMGHook = NO;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &ecid);
+        }
+        // DeviceName — 每克隆独立设备名
+        if (CFStringCompare(key, CFSTR("wfiZJ9aJbL5A3hMOznwq7A"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("DeviceName"), 0) == 0) {
+            NSString *n = getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)n;
+        }
+        // v70/v71: ProductType —— 机型人格（v71 起 iPhone13,4），与 hw.machine/uname 保持一致
+        if (CFStringCompare(key, CFSTR("ProductType"), 0) == 0) {
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_MACHINE];
+        }
+        // v80 ★P0★ 主板代号字段 → D54pAP。此前与 ProductType 共用
+        //   "iPhone13,4"，而 MobileGestalt 这两个键在真机上恒为主板代号
+        //   （真机实测 HardwareModel 与 sysctl hw.model 同为 D64AP）。
+        if (CFStringCompare(key, CFSTR("PhysicalMachineModel"), 0) == 0 ||
+            CFStringCompare(key, CFSTR("HardwareModel"), 0) == 0) {
+            g_inMGHook = NO;
+            return (__bridge_retained CFPropertyListRef)[NSString stringWithUTF8String:FAKE_HWMODEL];
+        }
+        // ---- v58: ProductType / ModelNumber / ProductVersion / BuildVersion
+        //      不再伪造 —— 硬件人格跟真机，避免「XS 假报 Pro Max」的矛盾。
+        //      身份类（UDID/Serial/ECID/DeviceName）仍伪造。
+        // 地区码保持 CN（真机国行）
+        g_inMGHook = NO;
+    } @catch (id e) {
+        g_inMGHook = NO;
+    }
+    return orig_MGCopyAnswer(key, options);
+}
+
+// ============================================================
+// IOKit hook — 只伪装 IOPlatformUUID / IOPlatformSerialNumber
+// ============================================================
+static CFTypeRef hook_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef allocator, uint32_t options) {
+    if (key) {
+        if (CFStringCompare(key, CFSTR("IOPlatformUUID"), 0) == 0) {
+            NSString *u = getPersistent(@"BdD1.iouuid", ^{ return genUUIDStr(); });
+            return (__bridge_retained CFTypeRef)u;
+        }
+        if (CFStringCompare(key, CFSTR("IOPlatformSerialNumber"), 0) == 0) {
+            return CFRetain(CFSTR(""));
+        }
+    }
+    if (!orig_IORegistryEntryCreateCFProperty) return NULL;
+    return orig_IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+}
+
+// ============================================================
+// C 层 Cookie 清洗 — 百度 SDK 绕过 ObjC 直调 CFNetwork 时兜底
+// v57U: capture=YES 时先捕获 SDK 生成的原始值（真实身份）再替换。
+// 只在写入路径（SetCookie/SetCookies）传 YES；读路径（Copy*）存的是
+// 已替换的伪造值，捕获会污染真实值缓存。
+// ============================================================
+static CFHTTPCookieRef sanitizeCFCookie(CFHTTPCookieRef ck, BOOL capture) {
+    if (!ck) return ck;
+    init_cf_cookie_syms();
+    if (!p_CFHTTPCookieCopyName || !p_CFHTTPCookieCopyProperties || !p_CFHTTPCookieCreateWithProperties) return ck;
+    CFStringRef nm = p_CFHTTPCookieCopyName(ck);
+    if (!nm) return ck;
+    NSString *name = (__bridge_transfer NSString *)nm; // +1 transferred
+    if (!isDeviceCookie(name)) return ck;              // 返回原引用（调用方判断相同则不 release）
+    if (capture && p_CFHTTPCookieCopyValue) {
+        CFStringRef vv = p_CFHTTPCookieCopyValue(ck);
+        if (vv) {
+            NSString *val = (__bridge_transfer NSString *)vv; // +1 transferred
+            captureRealIdentity(name, val);
+        }
+    }
+    CFDictionaryRef props = p_CFHTTPCookieCopyProperties(ck);
+    if (!props) return ck;
+    NSMutableDictionary *md = [(__bridge_transfer NSDictionary *)props mutableCopy]; // +1 transferred
+    md[@"kCFHTTPCookieValue"] = getFakeID(name);  // kCFHTTPCookieValue 运行时值即该字符串
+    CFHTTPCookieRef nc = p_CFHTTPCookieCreateWithProperties(kCFAllocatorDefault, (__bridge CFDictionaryRef)md);
+    return nc; // +1，调用方负责 release（若与原引用不同）
+}
+
+static void hook_CFHTTPCookieStorageSetCookie(CFHTTPCookieStorageRef storage, CFHTTPCookieRef ck) {
+    if (ck) {
+        CFHTTPCookieRef nc = sanitizeCFCookie(ck, YES);
+        orig_CFHTTPCookieStorageSetCookie(storage, nc ? nc : ck);
+        if (nc && nc != ck) CFRelease(nc);
+        return;
+    }
+    orig_CFHTTPCookieStorageSetCookie(storage, ck);
+}
+
+static void hook_CFHTTPCookieStorageSetCookies(CFHTTPCookieStorageRef storage, CFArrayRef cookies, CFURLRef mainDoc) {
+    if (cookies && CFArrayGetCount(cookies) > 0) {
+        CFMutableArrayRef out = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        for (CFIndex i = 0; i < CFArrayGetCount(cookies); i++) {
+            CFHTTPCookieRef ck = (CFHTTPCookieRef)CFArrayGetValueAtIndex(cookies, i);
+            CFHTTPCookieRef nc = sanitizeCFCookie(ck, YES);
+            if (nc) {
+                CFArrayAppendValue(out, nc);
+                if (nc != ck) CFRelease(nc);
+            }
+        }
+        orig_CFHTTPCookieStorageSetCookies(storage, out, mainDoc);
+        CFRelease(out);
+        return;
+    }
+    orig_CFHTTPCookieStorageSetCookies(storage, cookies, mainDoc);
+}
+
+static CFArrayRef hook_CFHTTPCookieStorageCopyCookiesForURL(CFHTTPCookieStorageRef storage, CFURLRef url, CFURLRef mainDoc) {
+    CFArrayRef arr = orig_CFHTTPCookieStorageCopyCookiesForURL(storage, url, mainDoc);
+    if (!arr || CFArrayGetCount(arr) == 0) return arr;
+    CFMutableArrayRef out = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+    for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
+        CFHTTPCookieRef ck = (CFHTTPCookieRef)CFArrayGetValueAtIndex(arr, i);
+        CFHTTPCookieRef nc = sanitizeCFCookie(ck, NO);
+        if (nc) {
+            CFArrayAppendValue(out, nc);
+            if (nc != ck) CFRelease(nc);
+        }
+    }
+    CFRelease(arr);
+    return out;
+}
+
+static CFArrayRef hook_CFHTTPCookieStorageCopyAllCookies(CFHTTPCookieStorageRef storage) {
+    CFArrayRef arr = orig_CFHTTPCookieStorageCopyAllCookies(storage);
+    if (!arr || CFArrayGetCount(arr) == 0) return arr;
+    CFMutableArrayRef out = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+    for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
+        CFHTTPCookieRef ck = (CFHTTPCookieRef)CFArrayGetValueAtIndex(arr, i);
+        CFHTTPCookieRef nc = sanitizeCFCookie(ck, NO);
+        if (nc) {
+            CFArrayAppendValue(out, nc);
+            if (nc != ck) CFRelease(nc);
+        }
+    }
+    CFRelease(arr);
+    return out;
+}
+
+// ============================================================
+// CFPreferences suite 域隔离 — App Group 共享容器防泄露
+// 若克隆间共享 App Group（entitlement 泄露），SDK 可通过 group.* 域
+// 读写共享设备指纹 → 全部重定向到本克隆私有域，物理隔离
+//
+// ★★ v62 重写（实测驱动）★★
+// v57U~v61 的方案是「key 加前缀 + 塞进 kCFPreferencesCurrentApplication」，
+// 真机验证结果：**完全没生效**。取证（Filza 直读设备文件）：
+//   共享容器 .../Shared/AppGroup/E2DB4240.../Library/Preferences/
+//        group.com.baidu.BaiduMobile.plist          → 72 键，含
+//        cuid / devuid / idfv / user_id / is_login / SAPI_LOCAL_STTOKEN
+//   克隆沙盒 .../Data/Application/<uuid>/Library/Preferences/
+//        group.com.baidu.BaiduMobile.BdE1.plist     → 6 键，无任何身份键
+// 根因：百度用 NSUserDefaults(suiteName:)，底层走 Foundation 内部的
+//   私有函数 _CFPreferences*WithContainer —— 系统库内部调用，
+//   fishhook 重绑定公开符号根本够不到。
+//
+// v62 改为在 **suiteName 层面** 隔离：把 group 域名字加后缀，
+//   group.com.baidu.BaiduMobile → group.com.baidu.BaiduMobile.BdE1
+// iOS 对「未在 entitlement 声明的 group 名」会当作普通域处理，
+// 文件落在 App 自己的沙盒 Library/Preferences/ 下 —— 天然按克隆隔离，
+// 且目录/机制由系统保证，无 v59「只拼路径不建目录」之虞。
+// 真机已存在 group.com.baidu.BaiduMobile.BdD6.plist 这类文件，
+// 证明该形态 iOS 接受。
+// ============================================================
+static BOOL isGroupDomain(CFStringRef appID) {
+    if (!appID) return NO;
+    NSString *dom = (__bridge NSString *)appID;
+    return [dom hasPrefix:@"group."] || [dom hasPrefix:@"group:"];
+}
+
+// 后缀：cloneTag() 是 "#BdE1"，文件名里去掉 '#'（真机验证过的形态用 '.'）
+static NSString *groupSuffix(void) {
+    NSString *tag = cloneTag();
+    if ([tag hasPrefix:@"#"]) return [tag substringFromIndex:1];
+    return tag;
+}
+
+// 把 group 域映射为「本克隆私有域」；非 group 域返回 nil（表示不改写）
+static NSString *mapGroupSuite(NSString *suite) {
+    if (!suite || suite.length == 0) return nil;
+    if (!isGroupDomain((__bridge CFStringRef)suite)) return nil;
+    NSString *suf = groupSuffix();
+    if (suf.length == 0) return nil;
+    if ([suite hasSuffix:suf]) return nil;          // 已映射，幂等
+    return [suite stringByAppendingFormat:@".%@", suf];
+}
+
+// CFStringRef 版本：需要改写时返回 +1 的映射值，调用方负责 release
+static CFStringRef mapGroupAppID(CFStringRef appID) {
+    if (!appID) return NULL;
+    NSString *mapped = mapGroupSuite((__bridge NSString *)appID);
+    if (!mapped) return NULL;
+    return (__bridge_retained CFStringRef)mapped;
+}
+
+// ============================================================
+// ★ v64: 按键精准隔离（取代 v62 的 group 域整域隔离）
+//
+// v62 把 group 域整体指到本克隆私有域。真机取证（Filza WebDAV 直读）：
+//   共享域 group.com.baidu.BaiduMobile.plist        72 键
+//   克隆私有域 group.com.baidu.BaiduMobile.BdD6.plist  5~6 键（只有 SAPI 登录态）
+// → channel_prefix / BDPOpenWidgetCommonParams / 成长权益 / 位置历史 /
+//   Widget 数据 等 60 多个 **非身份** 键全部读不到。
+// 果园是跑在 WKWebView 里的 H5 活动页，初始化要读渠道与活动参数，
+// 症状就是「能进果园，但选不了水果」。
+//
+// v64 只把「设备/账号标识」这一类键重定向到私有域，其余键一律继续
+// 读写共享域（等价 v61 的可用行为）：
+//   身份各克隆独立（防关联）+ 功能数据完整（果园可用）。
+// ============================================================
+static BOOL isStrictIdentityKeyStr(NSString *k) {
+    if (k.length == 0) return NO;
+    static NSSet *exact = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        exact = [NSSet setWithArray:@[
+            @"cuid", @"devuid", @"idfv", @"user_id", @"is_login", @"bdpanCookie",
+            @"BNPush_cuid", @"BNPush_cacheCuid", @"BNPush_token", @"BNPush_channelid",
+        ]];
+    });
+    if ([exact containsObject:k]) return YES;
+    if ([k rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+#if MT_CLONE
+    // ★ v75: 美团身份键（真机 prefs 取证，见文件头 v75 段）★
+    // 这些键在「原版 prefs / 共享 App Group」里存着原版的设备身份与票据，
+    // 克隆按「非身份项」读就会拿到原版的值 → 必须改走本克隆私有域。
+    static NSSet *mtExact = nil;
+    static dispatch_once_t once2;
+    dispatch_once(&once2, ^{
+        mtExact = [NSSet setWithArray:@[
+            @"babelId", @"UTDID", @"mputdid",
+            @"kNovaEnvironmentCacheUnionidKey",
+            @"widget_entry_appgroup_uuid", @"widget_entry_appgroup_token",
+            @"widget_entry_appgroup_userid",
+            @"ONIMMKVTransferFlagkONImaruUUIDKey",
+            @"ONIMMKVTransferFlagkONImaruDPIDKey",
+        ]];
+    });
+    if ([mtExact containsObject:k]) return YES;
+    static NSArray *mtSub = nil;
+    static dispatch_once_t once3;
+    dispatch_once(&once3, ^{
+        // 子串匹配（宁宽勿漏：多隔离只是让克隆自建，漏了就是身份共享）
+        mtSub = @[@"uuid", @"dfpid", @"dpid", @"unionid", @"utdid", @"babel",
+                  @"sakguard_storage", @"sakguard_deviceinfo", @"sakg_",
+                  @"oniprivate", @"oniid", @"onimaru", @"widget_entry_appgroup"];
+    });
+    for (NSString *t in mtSub) {
+        if ([k rangeOfString:t options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    }
+#endif
+    return NO;
+}
+
+static BOOL isStrictIdentityKey(CFStringRef key) {
+    if (!key) return NO;
+    return isStrictIdentityKeyStr((__bridge NSString *)key);
+}
+
+// ---- v64: NSUserDefaults 私有域镜像（按键重定向用）----
+static IMP g_origISS = NULL;              // 原始 -[NSUserDefaults initWithSuiteName:]
+static char kUDGroupSuiteKey;             // 关联对象 key：记录实例的 group 域名
+static BOOL g_inPrivPeer = NO;            // 私有域实例构造重入哨兵
+
+// 用原始 IMP 构造实例，绕过 swizzle（不打标记、不递归）
+static NSUserDefaults *udRaw(NSString *suite) {
+    if (!g_origISS || suite.length == 0) return nil;
+    Class uc = objc_getClass("NSUserDefaults");
+    if (!uc) return nil;
+    id o = [uc alloc];
+    return ((id (*)(id, SEL, NSString *))g_origISS)(o, @selector(initWithSuiteName:), suite);
+}
+
+// 取该 group 域实例对应的「本克隆私有域」实例（惰性建、缓存）
+static NSUserDefaults *privPeerFor(id s) {
+    // 重入保护：udRaw 构造实例时可能再次走到本函数（swizzle 是类级别的），
+    // 不设哨兵会无限递归 → 栈溢出闪退（v62 的 NSBundle 递归是同类教训）。
+    if (!s || g_inPrivPeer) return nil;
+    NSString *suite = objc_getAssociatedObject(s, &kUDGroupSuiteKey);
+    if (suite.length == 0) return nil;
+    NSString *mapped = mapGroupSuite(suite);
+    if (mapped.length == 0) return nil;
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+    @synchronized (cache) {
+        NSUserDefaults *d = cache[mapped];
+        if (d) return d;
+        g_inPrivPeer = YES;
+        @try {
+            d = udRaw(mapped);
+            if (d) cache[mapped] = d;
+        } @catch (id e) {}
+        g_inPrivPeer = NO;
+        return d;
+    }
+}
+
+// v57U: 出口消毒 —— 返回的字符串若含本机真实身份值则替换
+// （SDK 把真实 cuid 缓存在 NSUserDefaults/CFPreferences 里，读出来
+//   就拼进请求参数。按值替换，不做 key 名猜测。）
+// 注意：我们自己的键（BdD1.*，含真实值缓存）必须排除，否则 rewrite
+// 拿到的"真实值"会被自己换成伪造值，逻辑失效。
+static CFPropertyListRef sanitizeIdentityPList(CFPropertyListRef v) {
+    if (!v) return v;
+    if (CFGetTypeID(v) != CFStringGetTypeID()) return v;
+    NSString *s = (__bridge NSString *)v;
+    NSString *r = rewriteIdentityString(s);
+    if (r == s) return v;
+    return (__bridge_retained CFPropertyListRef)r;   // 调用方持有 +1
+}
+
+static BOOL isOwnPrefKey(CFStringRef key) {
+    if (!key) return NO;
+    return [( __bridge NSString *)key hasPrefix:@"BdD1."];
+}
+
+// v57V: 按键名拦截 —— key 含 "cuid" 且值为短字符串 → 强制返回伪造 cuid
+// （SAPICUIDKit 等也走 CFPreferences/NSUserDefaults 持久化 cuid）
+static CFPropertyListRef sanitizePrefValueForKey(CFStringRef key, CFPropertyListRef v) {
+    if (!v || !key) return v;
+    if (isOwnPrefKey(key)) return v;
+    if (CFGetTypeID(v) != CFStringGetTypeID()) return v;
+    NSString *k = (__bridge NSString *)key;
+    if ([k rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location == NSNotFound) return v;
+    NSString *s = (__bridge NSString *)v;
+    if (s.length < 16 || s.length > 128) return v;      // cuid 合理长度
+    NSString *fake = fakeCUIDValue();
+    if ([s isEqualToString:fake]) return v;             // 已是伪造值
+    captureRealIdentity(@"BAIDUCUID", s);               // 顺带捕获真实值兜底
+    return (__bridge_retained CFPropertyListRef)fake;   // 调用方持有 +1
+}
+
+static CFPropertyListRef hook_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
+    // v83 ★P0★ cuid 类键统一假值 —— 不管存在哪个域、存的是什么
+    if (key && CFGetTypeID(key) == CFStringGetTypeID()) {
+        NSString *fv83 = fakeIdentityValueForKey((__bridge NSString *)key);
+        if (fv83) return (__bridge_retained CFPropertyListRef)fv83;
+    }
+    // v64: 只有身份键才改 appID（读本克隆私有域）；功能键保持原域，功能不受影响。
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
+    CFPropertyListRef v = orig_CFPreferencesCopyAppValue(key, mapped ? mapped : appID);
+    if (mapped) CFRelease(mapped);
+    if (isOwnPrefKey(key)) return v;
+    v = sanitizePrefValueForKey(key, v);
+    return sanitizeIdentityPList(v);
+}
+
+static CFPropertyListRef hook_CFPreferencesCopyValue(CFStringRef key, CFStringRef appID, CFStringRef user, CFStringRef host) {
+    // v83 ★P0★ 同上
+    if (key && CFGetTypeID(key) == CFStringGetTypeID()) {
+        NSString *fv83 = fakeIdentityValueForKey((__bridge NSString *)key);
+        if (fv83) return (__bridge_retained CFPropertyListRef)fv83;
+    }
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
+    CFPropertyListRef v = orig_CFPreferencesCopyValue(key, mapped ? mapped : appID, user, host);
+    if (mapped) CFRelease(mapped);
+    if (isOwnPrefKey(key)) return v;
+    v = sanitizePrefValueForKey(key, v);
+    return sanitizeIdentityPList(v);
+}
+
+// ============================================================
+// v57U: keychain 出口消毒 — SecItemCopyMatching
+// 同团队签名的 App 共享 keychain 访问组（百度系 App 全家桶），
+// 克隆版能直接读到原版 App 存的本机真实设备 ID。
+// 不做查询过滤（避免破坏登录凭证），只按「值」消毒：
+// 返回的数据/字典里若含真实 CUID/BAIDUID → 替换为伪造值。
+// ============================================================
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result) = NULL;
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) = NULL;
+static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query) = NULL;
+
+// ---- v57V: keychain 服务名精准拦截 ----
+// 二进制取证发现：
+//   - keychain 共享组/服务名 "B83JBVZ6M5.com.baidu.baidumobile.cuid"
+//   - SAPICUIDKit（百度原生 cuid 生成器）首启从真实硬件算 cuid 存 keychain
+//   - 收银台反欺诈 BDNCashierSDKAntiFraudProcotol（下单环节）
+// v57U 的按值替换依赖捕获，但原生 cuid 走 keychain 不经过 cookie 写路径，
+// 捕获从未发生 → 替换从未生效。
+// v57V 改为按「服务名」拦截：凡 kSecAttrService 含 "cuid" 的 keychain
+// 读写，值一律替换为伪造 cuid（与 cookie 伪造值同源，单一身份）。
+// 不再依赖捕获；同时顺带捕获真实值（若真出现）供按值替换兜底。
+
+// 伪造 cuid（v67: keychain 里存的 cuid = 平台层格式 40大写HEX+尾，
+// 与 plist cuid 一致；不再用 cookie 层的 b64url 格式）
+static NSString *fakeCUIDValue(void) {
+    return getFakeID(@"PLATCUID");
+}
+
+// 判断 keychain 查询/属性字典是否为 cuid 存储（服务名/账号名含 cuid）
+static BOOL isCuidServiceDict(CFDictionaryRef dict) {
+    if (!dict) return NO;
+    const void *keys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, keys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            if ([s rangeOfString:@"cuid" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        }
+    }
+    return NO;
+}
+
+// v66: 判断 keychain 项是否「身份/登录」类 —— 这类项绝不回读共享域。
+// T4 实测教训：克隆读到原版的 cuid/SToken/登录票据 = 与原版共身份，
+// 原版 App 直接被连坐拉黑。
+// 关键字列表偏宽（宁可少回退、不冒串号风险）。
+static BOOL isIdentityKeychainDict(CFDictionaryRef dict) {
+    if (!dict) return NO;
+    static NSArray *kw = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // v72: 补 mtj/cdid/umid/oaid/vaid/aaid —— 百度统计(MTJ)设备 ID 族，
+        //       主二进制引用 40+ 处。缺了它们，克隆会按「非身份项」把原版
+        //       存的统计设备 ID 读回退读进来 → 统计图谱直接关联
+        // ★ v93 ★ 补 zid —— 这是最后一块拼图。
+        //   证据链：zid 在 162 次请求里前缀 30 字节恒定；删掉
+        //   Documents/ehcacerifos/oetnv2 后重启会“重建出完全相同的值”；
+        //   换 cuid / 换 IDFV / 清 prefs / 重装七次全部无效。
+        //   → 说明它存在一个跨重装存活、且不在 prefs 里的地方：keychain。
+        //   而 v72 的关键字表里只有 umid/mtj/cdid，**没有 zid** →
+        //   zid 被判定为「非身份项」→ 走 v66 读回退 → 读到原版设备的 zid。
+        //   加进来后本克隆查不到 → 断开回退 → App 只能自己重建新身份。
+        NSMutableArray *m = [@[@"cuid", @"devuid", @"deviceid", @"device_id", @"idfv", @"idfa",
+               @"udid", @"stoken", @"token", @"bduss", @"login", @"account",
+               @"passport", @"sapi", @"user", @"ptoken", @"session",
+               @"mtj", @"cdid", @"umid", @"oaid", @"vaid", @"aaid",
+               @"zid", @"zuid", @"umidtoken"] mutableCopy];
+#if MT_CLONE
+        // ★ v75: 美团设备身份族（ONI SDK keychain 条目）★
+        // 二进制实证：kONIPrivateKeychainValueUUID / ...DPID / ...UnionID、
+        // sharedKeychainValue/sharedKeychainGroup、UTDIDKeychainItemWrapper。
+        // 之前表里只有 udid/deviceid，**没有 uuid** → ONI 的设备 uuid 被判为
+        // 「非身份项」→ 走 v66 读回退 → 读到原版设备 uuid（真机日志实锤：
+        // 原版与克隆对外发送的 64 位设备 ID 完全一致）。
+        // 加入后这些条目禁用回退，克隆在私有命名空间里重建 → 因硬件身份
+        // (UDID/ECID/IDFV) 已伪造，重建值天然与原版不同。
+        [m addObjectsFromArray:@[@"uuid", @"dpid", @"dfpid", @"unionid", @"utdid",
+                                 @"babel", @"oniprivate", @"oniid", @"onimaru",
+                                 @"mtkeychain", @"sakguard", @"sakg_", @"localid"]];
+#endif
+        kw = [m copy];
+    });
+    const void *keys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, keys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            for (NSString *k in kw) {
+                if ([s rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+#if MT_CLONE
+// ============================================================
+// ★ v76: 身份类 keychain 条目的「合成返回值」★
+//
+// v75 的副作用（真机日志实锤）：身份条目在克隆私有命名空间里 MISS 后
+// 直接返回 errSecItemNotFound → 美团 ONI/csec SDK 读到 nil → 对外上报
+// 空 UUID：
+//     csec 上报体      {"app_version":"1200660201",...,"UUID":"","bundles":[]}
+//     block-popup URL  ...&uuid=&version_name=12.66.201&...
+//     lx0 上报体        {"cityId":0,"userId":"","uuid":"",...}
+// 原版这些都带合法值。克隆报空 = 比「报原版值」更醒目的异常特征，
+// 这就是「识别到本机」的现行嫌疑（堵死了却没给克隆发自己的身份证）。
+//
+// 修法：设备标识类条目 MISS 时，按 service+account 生成「与美团原生格式
+// 同形」且持久稳定的伪值直接返回，让克隆像一个正常的新设备。
+//   - uuid/localid/utdid/oni*  → 64 位 hex（同美团设备 ID 形态）
+//   - dpid/dfpid/unionid       → 32 位 hex + 19 位数字（同原版 dpid 形态）
+//   - 含 token/login/session/passport/bduss 的条目绝不合成 —— 伪造票据会
+//     破坏登录态，保持「查不到」才是正确行为（克隆就该是未登录）。
+// ============================================================
+static BOOL mtIsDeviceIdentityName(NSString *s) {
+    if (!s || s.length == 0) return NO;
+    NSString *l = [s lowercaseString];
+    for (NSString *bad in @[@"token", @"login", @"session", @"passport", @"bduss"]) {
+        if ([l rangeOfString:bad].location != NSNotFound) return NO;
+    }
+    for (NSString *k in @[@"uuid", @"localid", @"utdid", @"dpid", @"dfpid",
+                          @"unionid", @"deviceid", @"device_id", @"devuid",
+                          @"idfv", @"idfa", @"oni", @"babel", @"sakg"]) {
+        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static NSString *mtSynthIdentityValue(NSString *svc, NSString *acct) {
+    NSString *joined = [NSString stringWithFormat:@"%@|%@", svc ?: @"", acct ?: @""];
+    NSString *l = [joined lowercaseString];
+    BOOL dpidLike = ([l rangeOfString:@"dpid"].location != NSNotFound ||
+                     [l rangeOfString:@"unionid"].location != NSNotFound);
+    NSString *storeKey = [NSString stringWithFormat:@"BdD1.mtkc.%@",
+                          [joined stringByReplacingOccurrencesOfString:@"|" withString:@"."]];
+    return getPersistent(storeKey, ^{
+        static const char *H = "0123456789ABCDEF";
+        if (dpidLike) {
+            char a[33];
+            for (int i = 0; i < 32; i++) a[i] = H[arc4random_uniform(16)];
+            a[32] = 0;
+            char d[20];
+            for (int i = 0; i < 19; i++) d[i] = (char)('0' + arc4random_uniform(10));
+            d[19] = 0;
+            return [NSString stringWithFormat:@"%s%s", a, d];
+        }
+        char b[65];
+        for (int i = 0; i < 64; i++) b[i] = H[arc4random_uniform(16)];
+        b[64] = 0;
+        return [NSString stringWithUTF8String:b];
+    });
+}
+
+// 按 query 要求的返回形态构造 result；成功返 0(errSecSuccess)，否则 -25300
+static OSStatus mtSynthKeychainResult(CFDictionaryRef query, CFTypeRef *result, NSString *valStr) {
+    if (!query || !result || !valStr) return -25300;   // errSecItemNotFound
+    @try {
+        BOOL wantData = (CFDictionaryGetValue(query, kSecReturnData) == kCFBooleanTrue);
+        BOOL wantAttrs = (CFDictionaryGetValue(query, kSecReturnAttributes) == kCFBooleanTrue);
+        BOOL wantRef = (CFDictionaryGetValue(query, kSecReturnRef) == kCFBooleanTrue);
+        // SecKeychainItemRef 无法伪造；只要存在性/计数也保持原样
+        if (wantRef && !wantData && !wantAttrs) return -25300;
+        if (!wantData && !wantAttrs) return -25300;
+
+        NSData *vd = [valStr dataUsingEncoding:NSUTF8StringEncoding];
+        if (!vd) return -25300;
+
+        // kSecReturnData=true 且不要属性时，result 类型就是 CFDataRef
+        if (wantData && !wantAttrs) {
+            *result = (__bridge_retained CFTypeRef)vd;
+            return 0;   // errSecSuccess
+        }
+        // 需要属性字典（可能同时要 data）
+        CFMutableDictionaryRef md = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (!md) return -25300;
+        CFTypeRef av = CFDictionaryGetValue(query, kSecAttrAccount);
+        if (av) CFDictionarySetValue(md, kSecAttrAccount, av);
+        CFTypeRef sv = CFDictionaryGetValue(query, kSecAttrService);
+        if (sv) CFDictionarySetValue(md, kSecAttrService, sv);
+        CFTypeRef gv = CFDictionaryGetValue(query, kSecAttrGeneric);
+        if (gv) CFDictionarySetValue(md, kSecAttrGeneric, gv);
+        CFDictionarySetValue(md, kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlock);
+        if (wantData) CFDictionarySetValue(md, kSecValueData, (__bridge CFDataRef)vd);
+        *result = (CFTypeRef)md;    // +1 交给调用方
+        return 0;
+    } @catch (id e) {}
+    return -25300;
+}
+#endif // MT_CLONE
+
+// 捕获真实值（仅当不是我们自己的伪造值，防自毒）并返回伪造 data
+static NSData *fakeCUIDDataFrom(NSData *realData) {
+    @try {
+        NSString *s = [[NSString alloc] initWithData:realData encoding:NSUTF8StringEncoding];
+        if (s.length >= 16 && ![s isEqualToString:fakeCUIDValue()]) {
+            captureRealIdentity(@"BAIDUCUID", s);
+        }
+    } @catch (id e) {}
+    NSString *fake = fakeCUIDValue();
+    return [fake dataUsingEncoding:NSUTF8StringEncoding] ?: realData;
+}
+
+// 从字典结果里强制替换 cuid 值（kSecValueData / kSecAttrGeneric）
+static void forceCuidInResultDict(CFMutableDictionaryRef md) {
+    const void *valKeys[] = { kSecValueData, kSecAttrGeneric };
+    for (size_t i = 0; i < 2; i++) {
+        CFDataRef vd = (CFDataRef)CFDictionaryGetValue(md, valKeys[i]);
+        if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
+            NSData *nd = fakeCUIDDataFrom((__bridge NSData *)vd);
+            CFDictionarySetValue(md, valKeys[i], (__bridge CFDataRef)nd);
+        }
+    }
+}
+
+// ============================================================
+// ★ v59: keychain / App Group 全量命名空间隔离
+//
+// 原始 IPA entitlements（DER 实测）：
+//   com.apple.security.application-groups = group.com.baidu.BaiduMobile
+//   keychain-access-groups = B83JBVZ6M5.com.baidu.{shareLoginAccount,
+//                            baidumobile.cuid, netdisk, lbsmap, mtjgroup}
+// TrollStore 重签后这些字符串不变 → 所有克隆共享同一批 keychain 项
+// 和同一个 App Group 容器目录。
+// v57V 只拦 service 含 "cuid" 的项，其余（尤其 shareLoginAccount 里的
+// 登录票据、mtjgroup 里的统计标识）克隆间互通 → 服务端可据此关联
+// （实测：装/开 D2 后 D1 被判风险）。
+//
+// v59 方案：给所有 keychain 项的 service/account/generic 追加本克隆后缀，
+// 读写两侧一致改写 → 各克隆物理互不可见，App 自身逻辑不受影响。
+// App Group 容器同理：容器 URL 追加克隆专属子目录。
+// ============================================================
+static NSString *cloneTag(void) {
+    static NSString *tag = nil;
+    if (tag) return tag;
+    // v63: 重入保护。
+    // 本函数现在会在 initWithSuiteName: / CFPreferences / keychain hook
+    // 内部被调用，可能落在非常早、非常深的调用栈上（例如 Foundation
+    // 初始化 NSUserDefaults 的过程中）。原实现「算完才赋值」，一旦
+    // 计算路径重新回到本函数（tag 仍为 nil）就是无限递归 → 爆栈闪退。
+    // 计算前先立哨兵，重入时直接返回哨兵值而不是再算一遍。
     static BOOL computing = NO;
-    if (computing) return @"BdF0";
+    if (computing) return @"#BdInit";
     computing = YES;
-    NSString *bid = nil;
-    @try { bid = [[NSBundle mainBundle] bundleIdentifier]; } @catch (id e) {}
-    if (bid.length == 0) bid = @"com.baidu.BaiduMobile.BdF1";
-    NSString *last = [bid componentsSeparatedByString:@"."].lastObject;
-    if (last.length == 0) last = @"BdF1";
-    px = [last copy];
+    NSString *bid = realBundleIdentifier() ?: @"unknown";
+    NSArray *parts = [bid componentsSeparatedByString:@"."];
+    NSString *last = parts.count ? parts.lastObject : @"unknown";
+    tag = [NSString stringWithFormat:@"#%@", last];
     computing = NO;
-    return px;
+    return tag;
 }
 
-static NSString *FKEY(NSString *suffix) {
-    return [NSString stringWithFormat:@"%@.%@", fpx(), suffix];
+// 改写 keychain 字典的标识字段（返回 +1；无需改写时返回原字典的 retain）
+static CFDictionaryRef mangleKeychainDict(CFDictionaryRef dict) {
+    if (!dict) return NULL;
+#if !BD_KCHAIN_NS_ISOLATION
+    // v65 对照实验曾整体关闭 keychain 隔离（本分支未编译保留备查）。
+    // 用户实测结论：关闭后克隆与原版共身份 → 原版被连坐拉黑。
+    // v66 恢复隔离（=1），读侧改用「非身份项读回退」保功能兼容。
+    return CFRetain(dict);
+#else
+    const void *idKeys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    NSString *tag = cloneTag();
+    BOOL need = NO;
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, idKeys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            if (![(__bridge NSString *)v hasSuffix:tag]) { need = YES; break; }
+        }
+    }
+    if (!need) return CFRetain(dict);
+    CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, dict);
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(dict, idKeys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            if (![s hasSuffix:tag]) {
+                CFDictionarySetValue(md, idKeys[i],
+                    (__bridge CFStringRef)[s stringByAppendingString:tag]);
+            }
+        }
+    }
+    return md;
+#endif
+}
+
+// 结果字典里隐藏克隆后缀（App 若自检 service 不会看出异常）
+static void stripTagInResultDict(CFMutableDictionaryRef md) {
+    if (!md) return;
+    NSString *tag = cloneTag();
+    const void *idKeys[] = { kSecAttrService, kSecAttrAccount, kSecAttrGeneric };
+    for (size_t i = 0; i < 3; i++) {
+        CFTypeRef v = CFDictionaryGetValue(md, idKeys[i]);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            NSString *s = (__bridge NSString *)v;
+            if ([s hasSuffix:tag] && s.length > tag.length) {
+                NSString *ns = [s substringToIndex:s.length - tag.length];
+                CFDictionarySetValue(md, idKeys[i], (__bridge CFStringRef)ns);
+            }
+        }
+    }
+}
+
+static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    BOOL targeted = isCuidServiceDict(query);   // v57V: 按服务名精准拦截
+    BOOL identity = targeted || isIdentityKeychainDict(query);   // v66
+    CFDictionaryRef mq = mangleKeychainDict(query);   // v59: 命名空间隔离
+    OSStatus st = orig_SecItemCopyMatching(mq ? mq : query, result);
+    if (mq) CFRelease(mq);
+#if BD_KCHAIN_READTHROUGH
+    // v66: 非身份项读回退 —— 本克隆后缀域没有该条目时，回读共享域原样项。
+    // 身份/登录类绝不回退（T4 教训：读到原版身份 = 连坐拉黑）。
+    // 回退命中的结果照走下方出口消毒（rewriteIdentityData / stripTag）。
+    if (!identity && query && st == -25300 /* errSecItemNotFound */) {
+        st = orig_SecItemCopyMatching(query, result);
+        // ★ v93 ★ 回退取证：本克隆没有、却从原版共享域读回来的条目到底有哪些。
+        //   只记 svc/acct 名字，不记值；每对只记一次，避免把日志刷爆。
+        //   目的：把「因为关键字表漏项而被当成非身份项」的条目全部找出来，
+        //   而不是继续靠猜。命中 zid/umid/cdid 一类即坐实串号。
+        if (st == 0 && query) {
+            @try {
+                CFTypeRef sv = CFDictionaryGetValue(query, kSecAttrService);
+                CFTypeRef av = CFDictionaryGetValue(query, kSecAttrAccount);
+                NSString *svcS = (sv && CFGetTypeID(sv) == CFStringGetTypeID()) ? (__bridge NSString *)sv : @"?";
+                NSString *acctS = (av && CFGetTypeID(av) == CFStringGetTypeID()) ? (__bridge NSString *)av : @"?";
+                static NSMutableSet *seenRT = nil;
+                static dispatch_once_t onceRT;
+                dispatch_once(&onceRT, ^{ seenRT = [NSMutableSet set]; });
+                NSString *sig = [NSString stringWithFormat:@"%@|%@", svcS, acctS];
+                @synchronized (seenRT) {
+                    if (![seenRT containsObject:sig]) {
+                        [seenRT addObject:sig];
+                        diagAppend([NSString stringWithFormat:@"\n[%@] KC-READTHROUGH svc=%@ acct=%@\n",
+                                    [NSDate date], svcS, acctS]);
+                    }
+                }
+            } @catch (id e) {}
+        }
+    }
+#endif
+#if MT_CLONE
+    // v75 诊断 → v76 合成：身份类条目在本克隆命名空间里「查不到」
+    if (identity && st == -25300 /* errSecItemNotFound */) {
+        @try {
+            CFTypeRef sv = query ? CFDictionaryGetValue(query, kSecAttrService) : NULL;
+            CFTypeRef av = query ? CFDictionaryGetValue(query, kSecAttrAccount) : NULL;
+            NSString *svcS = (sv && CFGetTypeID(sv) == CFStringGetTypeID()) ? (__bridge NSString *)sv : @"";
+            NSString *acctS = (av && CFGetTypeID(av) == CFStringGetTypeID()) ? (__bridge NSString *)av : @"";
+            diagAppend([NSString stringWithFormat:@"\n[%@] KC-IDENTITY-MISS svc=%@ acct=%@\n",
+                        [NSDate date], svcS.length ? svcS : @"?", acctS.length ? acctS : @"?"]);
+            // ★ v76 核心：堵死泄漏的同时必须给克隆发一张自己的身份证 ★
+            // 否则美团读到 nil → 对外上报空 UUID → 比原来更醒目。
+            if (mtIsDeviceIdentityName(svcS) || mtIsDeviceIdentityName(acctS)) {
+                NSString *synth = mtSynthIdentityValue(svcS, acctS);
+                OSStatus s2 = mtSynthKeychainResult(query, result, synth);
+                if (s2 == 0) {
+                    diagAppend([NSString stringWithFormat:@"\n[%@] KC-IDENTITY-SYNTH svc=%@ acct=%@ len=%lu\n",
+                                [NSDate date], svcS, acctS, (unsigned long)synth.length]);
+                    return s2;   // errSecSuccess + 合成值
+                }
+            }
+        } @catch (id e) {}
+    }
+#endif
+    if (st != 0 || !result || !*result) return st;   // 0 = errSecSuccess
+    @try {
+        CFTypeRef v = *result;
+        CFTypeID tid = CFGetTypeID(v);
+        if (tid == CFDataGetTypeID()) {
+            NSData *d = (__bridge NSData *)v;
+            NSData *nd = targeted ? fakeCUIDDataFrom(d) : rewriteIdentityData(d);
+            if (nd != d) {
+                CFRelease(v);                                   // 释放 orig 给的 +1
+                *result = (__bridge_retained CFTypeRef)nd;      // 交给调用方 +1
+            }
+        } else if (tid == CFDictionaryGetTypeID()) {
+            CFMutableDictionaryRef md = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef)v);
+            stripTagInResultDict(md);                  // v59: 对外隐藏克隆后缀
+            if (targeted) {
+                forceCuidInResultDict(md);
+            } else {
+                CFDataRef vd = (CFDataRef)CFDictionaryGetValue(md, kSecValueData);
+                if (vd && CFGetTypeID(vd) == CFDataGetTypeID()) {
+                    NSData *d = (__bridge NSData *)vd;
+                    NSData *nd = rewriteIdentityData(d);
+                    if (nd != d) {
+                        CFDictionarySetValue(md, kSecValueData, (__bridge CFDataRef)nd);
+                    }
+                }
+            }
+            CFRelease(v);
+            *result = (CFTypeRef)md;   // +1 交给调用方（CF→CF 普通 C 转型）
+        }
+    } @catch (id e) {}
+    return st;
+}
+
+// v57V: 写入侧 —— cuid 服务名的 keychain 写入直接落伪造值，
+// 让后续所有读取（含未 hook 的通道）天然拿到伪造值
+// v59: 所有写入统一加克隆后缀（物理隔离）
+static OSStatus hook_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    @try {
+        CFDictionaryRef base = attributes;
+        CFMutableDictionaryRef mut = NULL;
+        if (isCuidServiceDict(attributes)) {
+            mut = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributes);
+            forceCuidInResultDict(mut);
+            base = mut;
+        }
+        CFDictionaryRef mangled = mangleKeychainDict(base);
+        CFDictionaryRef outDict = mangled ? mangled : base;
+        OSStatus st = orig_SecItemAdd(outDict, result);
+        if (mangled) CFRelease(mangled);
+        if (mut) CFRelease(mut);
+        return st;
+    } @catch (id e) {}
+    return orig_SecItemAdd(attributes, result);
+}
+
+static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    @try {
+        CFDictionaryRef base = attributesToUpdate;
+        CFMutableDictionaryRef mut = NULL;
+        if (isCuidServiceDict(query) || isCuidServiceDict(attributesToUpdate)) {
+            if (attributesToUpdate && CFDictionaryGetCount(attributesToUpdate) > 0) {
+                mut = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributesToUpdate);
+                forceCuidInResultDict(mut);
+                base = mut;
+            }
+        }
+        CFDictionaryRef mq = mangleKeychainDict(query);
+        CFDictionaryRef ma = mangleKeychainDict(base);
+        OSStatus st = orig_SecItemUpdate(mq ? mq : query, ma ? ma : base);
+        if (mq) CFRelease(mq);
+        if (ma) CFRelease(ma);
+        if (mut) CFRelease(mut);
+        return st;
+    } @catch (id e) {}
+    return orig_SecItemUpdate(query, attributesToUpdate);
+}
+
+// v59: 删除也要加后缀 —— 否则某克隆的「清空重来」会把共享组里
+// 其他克隆/原版 App 的登录票据一起删掉（正是 D2 一开 D1 即异常的嫌疑路径）
+static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
+    @try {
+        CFDictionaryRef mq = mangleKeychainDict(query);
+        OSStatus st = orig_SecItemDelete(mq ? mq : query);
+        if (mq) CFRelease(mq);
+        return st;
+    } @catch (id e) {}
+    return orig_SecItemDelete(query);
+}
+
+static Boolean hook_CFPreferencesSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID, CFStringRef user, CFStringRef host) {
+    // v64: 身份键写私有域；功能键写回原域（否则会把共享配置整体搬进私有域）
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
+    Boolean ok = orig_CFPreferencesSetValue(key, value, mapped ? mapped : appID, user, host);
+    if (mapped) CFRelease(mapped);
+    return ok;
+}
+
+// v62: CFPreferencesSetAppValue 是公开 API，v61 之前完全漏了 ——
+// 任何直接调用它的 SDK 都能把设备指纹原样写进共享域。
+static void hook_CFPreferencesSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID) {
+    if (!orig_CFPreferencesSetAppValue) return;
+    CFStringRef mapped = isStrictIdentityKey(key) ? mapGroupAppID(appID) : NULL;
+    orig_CFPreferencesSetAppValue(key, value, mapped ? mapped : appID);
+    if (mapped) CFRelease(mapped);
 }
 
 // ============================================================
-// Persistent fake IDs (BdF1..BdF10 prefix，运行时派生)
+// Persistent fake IDs (BdD1. prefix — 构建脚本替换为 Bd63/BdC1 等)
 // ============================================================
 static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     CFStringRef cfKey = (__bridge CFStringRef)key;
@@ -191,24 +1806,415 @@ static NSString *getPersistent(NSString *key, NSString *(^gen)(void)) {
     return newVal;
 }
 
+// v57U: 持久写入（捕获本机真实身份值用）
+static void setPersistent(NSString *key, NSString *val) {
+    if (!key || !val || val.length == 0) return;
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)val,
+                             kCFPreferencesCurrentApplication);
+    CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+}
+
+// ============================================================
+// ★★ v57U: 单一身份原则（Identity Coherence）★★
+//
+// 问题：cookie 里的 CUID 我们伪造了，但百度原生 SDK 还会把
+// 「SDK 自己算出来的 cuid」塞进 URL 参数 / POST body
+// （二进制取证：cuid=%@ / &cuid=%@ 拼接大量存在），
+// 以及从 keychain 共享组读原版 App 存的本机真实设备 ID
+// （同团队 App 共享 keychain —— 这正是"更换设备之后就正常了"的原因）。
+// 于是服务端看到：cookie=假，参数=真 → 矛盾 → 按真设备下单名额判限。
+//
+// 解法：捕获真实值，在**所有出口**统一替换为伪造值：
+//   1) 捕获：SDK 写设备 cookie 时，原始值经过我们手上先存下来
+//      （BdD1.real.CUID_FAMILY / BdD1.real.BAIDUID_FAMILY，持久化）
+//   2) keychain 出口：SecItemCopyMatching 返回数据含真实值 → 替换
+//   3) CFPreferences 出口：返回字符串含真实值 → 替换
+//   4) 请求出口：NSMutableURLRequest 的 URL/body、WKWebView loadRequest
+//      中的真实值 → 替换
+// 只按「值」替换（真实值是稳定长字符串，碰撞概率为零），不做 key 名猜测。
+// ============================================================
+
+// 捕获真实身份值（仅 CUID/BAIDUID 两个家族；只在写入路径调用）
+static void captureRealIdentity(NSString *name, NSString *value) {
+    if (!name || !value || value.length < 16) return;
+    @try {
+        NSString *ck = canonicalCookieKey(name);
+        BOOL isCUID = [ck isEqualToString:@"CUID_FAMILY"];
+        BOOL isBID  = [ck isEqualToString:@"BAIDUID_FAMILY"];
+        if (!isCUID && !isBID) return;
+        NSString *k = [NSString stringWithFormat:@"BdD1.real.%@", ck];
+        NSString *old = getPersistent(k, ^{ return @""; });
+        if (old.length == 0) {
+            setPersistent(k, value);   // 首次捕获，落盘
+        }
+        // 之后即使 SDK 换了值也不更新 —— 保持单一稳定真实值，避免
+        // 读路径误捕获伪造值（读路径不捕获，这里只兜底首次）
+    } @catch (id e) {}
+}
+
+// 把字符串里出现的「本机真实身份值」替换为「伪造值」（所有出口共用）
+#if MT_CLONE
+// ============================================================
+// ★ v75 出口兜底：已知本机真值的替换/告警 ★
+//
+// 上面 1)/2) 两条堵的是「读」通道（keychain 读回退、prefs 共享键）。
+// 但共享面不止这两处（App Group 文件、MMKV、未 hook 的 SDK 自研存储…），
+// 所以再加一层「出口按值兜底」——不依赖猜通道，只认值。
+//
+// 真值来源：2026-09-21 手机容器取证 + 原版 9/19 HAR 交叉验证。
+// 注意：dpid/dfpid 被 mtgsig 签名覆盖（a3 就是 dfpid），**不做替换**，
+//       只落诊断日志 —— 一旦日志里出现 MTID-LEAK DPID/DFPID，就说明
+//       「读」通道还有没堵住的，需要继续从存储层查，而不是改这里。
+// ============================================================
+#define ORIG_DEVICE_UUID @"000000000000011F129BC70EA4697A50968D9D4C404BDA165456959808621466"
+#define ORIG_DPID        @"c266bb5d3d3b49d79f297d3f689e44faa161867936417050000"
+#define ORIG_DFPID       @"d87187750bb3692e4cdfa00eed1538bca58ff988c6f4b8189e54176b"
+
+// 本克隆自己的 64 位设备 ID（与真值同形：16 hex 前缀 + 48 hex）
+static NSString *mtFakeDeviceUUID(void) {
+    return getPersistent(@"BdD1.mt.uuid64", ^{
+        static const char *H = "0123456789ABCDEF";
+        char b[49];
+        for (int i = 0; i < 48; i++) b[i] = H[arc4random_uniform(16)];
+        b[48] = 0;
+        // v76: 前缀不再复用原版的 011F —— 同前缀等于给服务端留了一个
+        // 「同批次/同机型码」聚类锚点。改为随机 4 位 hex，保持 16+48 同形。
+        unsigned p = arc4random_uniform(0xFFFE) + 1;
+        if (p == 0x011F) p = 0x011E;   // 明确避开原版值
+        return [NSString stringWithFormat:@"000000000000%04X%s", p, b];
+    });
+}
+
+static NSString *swapKnownDeviceIDs(NSString *s) {
+    if (!s || s.length < 40) return s;
+    @try {
+        if ([s rangeOfString:ORIG_DEVICE_UUID].location != NSNotFound) {
+            diagAppend([NSString stringWithFormat:@"\n[%@] MTID-LEAK DEVICE-UUID -> swapped\n", [NSDate date]]);
+            s = [s stringByReplacingOccurrencesOfString:ORIG_DEVICE_UUID
+                                            withString:mtFakeDeviceUUID()];
+        }
+        if ([s rangeOfString:ORIG_DPID].location != NSNotFound) {
+            diagAppend([NSString stringWithFormat:@"\n[%@] MTID-LEAK DPID (mtgsig-bound, not swapped)\n", [NSDate date]]);
+        }
+        if ([s rangeOfString:ORIG_DFPID].location != NSNotFound) {
+            diagAppend([NSString stringWithFormat:@"\n[%@] MTID-LEAK DFPID (mtgsig-bound, not swapped)\n", [NSDate date]]);
+        }
+    } @catch (id e) {}
+    return s;
+}
+#endif
+
+// ★ v84: 出口旧值兜底 —— 磁盘/内存里任何一路漏出的历史 cuid，
+//   在请求离机前统一换成本克隆当前 cuid。
+//
+// 2026-11-02 实测：v83 已把 prefs 全部改成 CC558E35…，但 push SDK 的
+// bind 请求仍带着 `old_cuid=A71DA648…`（v83 之前的 tempCUID 真值）。
+// 服务端看到 old_cuid ≠ device_id，等于客户端自己声明「我换过设备 ID」，
+// 这是比 ID 本身更强的关联信号。该值不出现在任何 plist 里
+// （全容器 1362 个文件扫描，仅浏览历史 db 与个人中心 json 命中），
+// 只可能来自 keychain 加密项或 SDK 内存缓存 —— 出入口统一抹掉最稳。
+// ============================================================
+// v91 ★ 度小满 aif 设备三元组 + 其它恒定设备号 ★
+// ------------------------------------------------------------
+// 实测（v84/v85/v86/v87/v88/v89/v90 七份日志逐条比对）：
+//   POST https://www.dxmpay.com/aif/sdk/init
+//     imei      = aac0ffa13f27c5bb46357f8a13fd9e65
+//     cu_short  = 10ea1c171f99bc4d382772d1dba4047c
+//   这两个值**从 v84 到 v90 一次都没变过**，跨 epoch 身份轮换、
+//   跨杀进程重启、跨 prefs 深度清理，全都纹丝不动。
+//   这是目前唯一一条真正能「认出本机」的通道，而且它归属的
+//   正是给出 errno 3523 的度小满反欺诈 SDK —— 也就是说：
+//   我们换了账号、换了 cuid、换了 cookie，度小满看到的还是同一台手机。
+//
+// 同样恒定未变的（同一份日志的「轮换前后交集」里筛出来的）：
+//   pan.baidu.com/shoubai/*        devuid = defb08c6cc4952d6dfb776a08cd3d1e63c124e3f
+//                                  （= prefs 键 mtj_bdpanapp_device_id）
+//   wappass.baidu.com/v8/sdkconfig/init  cuid = 264fcac0587ab84e7b885b219fb628be
+//                                  （passport 自己的设备号，不是主 cuid）
+//
+// 做法：出口按「值」替换成本克隆专属的持久随机值 ——
+//   同克隆重启保持不变（一个设备只能有一个身份），
+//   不同克隆互不相同（服务端无法据此串联）。
+// ============================================================
+static NSString *stableHexFor(const char *storeKey, int len) {
+    NSString *k = [NSString stringWithUTF8String:storeKey];
+    return getPersistent(k, ^{
+        static const char *H = "0123456789abcdef";
+        char b[65];
+        int n = len > 64 ? 64 : len;
+        for (int i = 0; i < n; i++) b[i] = H[arc4random_uniform(16)];
+        b[n] = 0;
+        return [NSString stringWithUTF8String:b];
+    });
+}
+
+// 旧值 → 本克隆新值。
+// ★ 只动度小满这两项 ★
+//   devuid（pan.baidu.com）属于网盘备份子系统，passport cuid 属于登录子系统，
+//   两者与下单风控无关，且请求体里带 sig（签名覆盖参数），
+//   改了会让签名对不上、反而打坏网盘/登录 —— 明确不动。
+static NSArray<NSArray<NSString *> *> *aifIdPairs(void) {
+    static NSArray *pairs = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pairs = @[
+            @[@"aac0ffa13f27c5bb46357f8a13fd9e65", stableHexFor("BdD1.ck.AIF_IMEI", 32)],
+            @[@"10ea1c171f99bc4d382772d1dba4047c", stableHexFor("BdD1.ck.AIF_CU", 32)],
+        ];
+    });
+    return pairs;
+}
+
+static NSString *swapAifDeviceIDs(NSString *s) {
+    if (!s || s.length < 24) return s;
+    for (NSArray *p in aifIdPairs()) {
+        if ([s rangeOfString:p[0]].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:p[0] withString:p[1]];
+        }
+    }
+    return s;
+}
+
+static NSString *swapLegacyCuidValues(NSString *s) {
+    if (!s || s.length < 20) return s;
+    static NSArray<NSString *> *legacy = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        legacy = @[
+            // v83 之前的 tempCUID / BIMPIMLogRegisterKeyCUID 真值
+            @"A71DA648AAEE97DFFB1AC3C736A7FD67D7B879526FLJNBFLEIB",
+            // BdD1.real.CUID_FAMILY（v57 时期捕获值）
+            @"33967FA4FB91506EBFB36D88DCBC44AB1C00385DPD129PU1D6E",
+            // 本机真实 cuid（百度地图/翻译共用值，绝不该出现在克隆请求里）
+            @"3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS",
+            // v57P~v83 的 69 位 b64url 假 cuid（错误格式，必须消失）
+            @"TV4-nInmlRIwIxgTxxfkMUdyfife7qqeL0Y0ATsaSp661tgu_AvyZ1MLxxSpIDoTvyMmA",
+            // ★ v90: v84~v89 的平台 cuid 真值 —— 实测残留两处：
+            //   1) push bind body `old_cuid=`（每启动一次就上报一次，等于
+            //      主动声明「我换过设备 ID」，是最强的关联信号）；
+            //   2) prefs `easyBrowserPageRecoveryCmdURLString` 缓存 URL。
+            //   BDWallet 的 bdwallet_device_uuid 已改走读路径拦截，这里只兜底。
+            @"CC558E35AE333746EDB52C56DD62C15E8C26BB87KP4IT40I0QM"
+        ];
+    });
+    NSString *fake = getFakeID(@"PLATCUID");
+    NSString *fakeLC = [fake lowercaseString];
+    for (NSString *v in legacy) {
+        if ([s rangeOfString:v].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:v withString:fake];
+            diagAppend([NSString stringWithFormat:@"\n[%@] CUID-LEGACY swapped (%@…)\n",
+                        [NSDate date], [v substringToIndex:8]]);
+        }
+        NSString *vl = [v lowercaseString];
+        if (![vl isEqualToString:v] && [s rangeOfString:vl].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:vl withString:fakeLC];
+        }
+    }
+    return s;
+}
+
+// ★ v92 实验开关 ★
+// 关闭 POST body 的出口改写，只保留读取路径（prefs/CFPreferences）的假身份。
+// 目的：验证 orders/create 的 sign、收银台的 sdkSign 是否被我们改写 body 之后失效。
+// 观察点：日志里 [BODY-NATIVE] 会显示 App 自己拼出来的 body 用的是真值还是假值。
+static BOOL g_bodyRewriteOff = YES;
+
+// ============================================================
+// v95 — 真值对照清单 + 出口全量取证
+// ------------------------------------------------------------
+// 前面的路线（v90→v94）都在猜「服务端读的是哪条通道」，每版改一处，
+// 每版都被 3523 打回，包括官方原版。猜是错的，取证才是对的。
+//
+// 这里换一个方法：把「这台机器绕不过 hook 的原始值」先收集成一张表，
+// 再拿这张表去扫 App 真正发出去的 URL / Header / Body。
+//   · 命中 → 该字段就是服务端能看到本机的地方，直接定位
+//   · 全不命中 → 客户端出口是干净的，判定依据在服务端历史数据（设备档案/账号维度）
+// 这样无论结论是哪一边，都不需要再发第二版去猜。
+// ============================================================
+static NSMutableArray *g_truthPairs = nil;   // @[@{@"k":通道名, @"v":真机原值}]
+static BOOL g_truthBuilt = NO;
+
+// 只读取，缺值时绝不回写（避免把空串写进持久域污染后续判断）
+static NSString *truthReadKey(NSString *k) {
+    if (!k) return nil;
+    CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)k,
+                                                    kCFPreferencesCurrentApplication);
+    if (!v) return nil;
+    NSString *s = nil;
+    if (CFGetTypeID(v) == CFStringGetTypeID()) s = (__bridge NSString *)v;
+    CFRelease(v);
+    return s;
+}
+
+static void truthAdd(NSString *k, id v) {
+    if (!g_truthPairs) g_truthPairs = [NSMutableArray array];
+    if (!v) return;
+    NSString *s = [v isKindOfClass:[NSString class]] ? v : [v description];
+    if (s.length < 6) return;                       // 太短会误命中（地区码/版本号）
+    if ([s isEqualToString:@"(null)"] || [s isEqualToString:@"0"]) return;
+    for (NSDictionary *p in g_truthPairs) {
+        if ([p[@"v"] isEqualToString:s]) return;    // 同一值只留首条
+    }
+    [g_truthPairs addObject:@{@"k": k ?: @"?", @"v": s}];
+}
+
+// 收集真机原值：全部走 orig_* 指针，绕过本 dylib 自己的 hook。
+static void buildTruthList(void) {
+    if (g_truthBuilt) return;
+    g_truthBuilt = YES;
+    @try {
+        // 1) 百度身份真值（历史捕获，v57 起持久化）
+        NSString *rc = truthReadKey(@"BdD1.real.CUID_FAMILY");
+        if (rc.length >= 16) truthAdd(@"baidu.cuid.real", rc);
+        NSString *rb = truthReadKey(@"BdD1.real.BAIDUID_FAMILY");
+        if (rb.length >= 16) truthAdd(@"baidu.baiduid.real", rb);
+
+        // 2) MobileGestalt —— 硬件级唯一标识，官方与 clone 必然同值
+        if (orig_MGCopyAnswer) {
+            NSArray *ks = @[@"UniqueDeviceID", @"SerialNumber", @"UniqueChipID",
+                            @"ProductType", @"HardwareModel", @"PhysicalMachineModel",
+                            @"DeviceName", @"DieId", @"MLBSerialNumber"];
+            for (NSString *k in ks) {
+                @try {
+                    CFTypeRef v = orig_MGCopyAnswer((__bridge CFStringRef)k, NULL);
+                    if (!v) continue;
+                    if (CFGetTypeID(v) == CFStringGetTypeID()) {
+                        truthAdd([@"MG." stringByAppendingString:k], (__bridge NSString *)v);
+                    } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                        truthAdd([@"MG." stringByAppendingString:k],
+                                 [(__bridge NSNumber *)v stringValue]);
+                    }
+                    CFRelease(v);
+                } @catch (id e) {}
+            }
+        }
+
+        // 3) uname —— 主机名/机器名，官方与 clone 必然同值
+        if (orig_uname) {
+            struct utsname uu;
+            memset(&uu, 0, sizeof(uu));
+            if (orig_uname(&uu) == 0) {
+                if (uu.nodename[0]) truthAdd(@"uname.nodename",
+                                             [NSString stringWithUTF8String:uu.nodename]);
+                if (uu.machine[0])  truthAdd(@"uname.machine",
+                                             [NSString stringWithUTF8String:uu.machine]);
+            }
+        }
+
+        // 4) sysctl —— 内存/CPU/开机时刻，官方与 clone 必然同值
+        int (*rs)(const char *, void *, size_t *, void *, size_t) = orig_sysctlbyname;
+        if (rs) {
+            char b[256];
+            size_t s;
+            s = sizeof(b); memset(b, 0, sizeof(b));
+            if (rs("kern.hostname", b, &s, NULL, 0) == 0 && b[0])
+                truthAdd(@"sysctl.kern.hostname", [NSString stringWithUTF8String:b]);
+            s = sizeof(b); memset(b, 0, sizeof(b));
+            if (rs("kern.osversion", b, &s, NULL, 0) == 0 && b[0])
+                truthAdd(@"sysctl.kern.osversion", [NSString stringWithUTF8String:b]);
+            uint64_t mem = 0; s = sizeof(mem);
+            if (rs("hw.memsize", &mem, &s, NULL, 0) == 0 && mem)
+                truthAdd(@"sysctl.hw.memsize", [NSString stringWithFormat:@"%llu", mem]);
+            struct timeval tv; size_t ts = sizeof(tv);
+            if (rs("kern.boottime", &tv, &ts, NULL, 0) == 0 && tv.tv_sec > 0)
+                truthAdd(@"sysctl.kern.boottime", [NSString stringWithFormat:@"%ld", (long)tv.tv_sec]);
+        }
+
+        // 5) IDFV 真值 —— IDFV hook 安装前落盘的原始 UUID
+        NSString *ivR = truthReadKey(@"BdD1.real.idfv");
+        if (ivR.length >= 20) truthAdd(@"idfv.real", ivR);
+
+        diagAppend([NSString stringWithFormat:
+            @"\n[TRUTH] list built, %lu entries\n", (unsigned long)g_truthPairs.count]);
+    } @catch (id e) {
+        diagAppend([NSString stringWithFormat:@"\n[TRUTH] build failed: %@\n", e]);
+    }
+}
+
+// 扫描一段文本里有没有出现真机原值。命中即「服务端能看到本机」。
+static void scanTruthHits(NSString *where, NSString *text) {
+    if (!text || text.length < 6) return;
+    buildTruthList();
+    @try {
+        for (NSDictionary *p in g_truthPairs) {
+            NSString *v = p[@"v"];
+            if (v.length < 6) continue;
+            if ([text rangeOfString:v].location != NSNotFound) {
+                diagAppend([NSString stringWithFormat:
+                    @"[TRUTH-HIT] %@   <%@> = %@\n", where, p[@"k"], v]);
+            }
+        }
+    } @catch (id e) {}
+}
+
+// v95: 最近一次请求 URL —— setHTTPBody: 拿不到 URL，靠这个定位是不是下单链路
+static NSString *g_lastReqURL = nil;
+static int g_fullDumpCount = 0;   // 全量取证的次数上限，防止日志爆炸
+
+// 全量落盘一段请求（分块，避免单行过长被截断）
+static void dumpBlob(NSString *tag, NSString *text) {
+    if (!text) return;
+    const NSUInteger CH = 900;
+    NSUInteger n = text.length;
+    diagAppend([NSString stringWithFormat:@"\n[%@] len=%lu\n", tag, (unsigned long)n]);
+    for (NSUInteger i = 0; i < n; i += CH) {
+        NSUInteger l = MIN(CH, n - i);
+        diagAppend([NSString stringWithFormat:@"[%@:%04lu] %@\n", tag,
+                    (unsigned long)i, [text substringWithRange:NSMakeRange(i, l)]]);
+    }
+}
+
+static NSString *rewriteIdentityString(NSString *s) {
+    if (!s || s.length < 20) return s;
+    @try {
+        s = swapLegacyCuidValues(s);
+        // ★ v91 ★ 度小满 aif / 网盘 devuid / passport cuid —— 恒定设备号换新
+        s = swapAifDeviceIDs(s);
+        NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
+        if (rc.length >= 16 && [s rangeOfString:rc].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:rc withString:getFakeID(@"BAIDUCUID")];
+        }
+        NSString *rb = getPersistent(@"BdD1.real.BAIDUID_FAMILY", ^{ return @""; });
+        if (rb.length >= 16 && [s rangeOfString:rb].location != NSNotFound) {
+            s = [s stringByReplacingOccurrencesOfString:rb withString:getFakeID(@"BAIDUID")];
+        }
+    } @catch (id e) {}
+    // v74: 克隆包名一律换成官方包名（URL query / 请求体是主要出口）
+#if MT_CLONE
+    s = swapKnownDeviceIDs(s);   // v75: 已知本机真值兜底
+#endif
+    s = maskCloneBundleID(s);
+    return s;
+}
+
+static NSData *rewriteIdentityData(NSData *d) {
+    if (!d || d.length < 16) return d;
+    @try {
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!s) return maskCloneBundleIDData(d);   // 非 UTF8：至少试一遍字节级包名消毒
+        NSString *r = rewriteIdentityString(s);
+        if (r == s) return maskCloneBundleIDData(d);
+        NSData *nd = [r dataUsingEncoding:NSUTF8StringEncoding];
+        return nd ?: d;
+    } @catch (id e) { return d; }
+}
+
 static NSString *genUUIDStr(void) { return [[NSUUID UUID] UUIDString]; }
 
 static NSString *genDeviceName(void) {
-    NSArray *surnames = @[@"张", @"王", @"李", @"赵", @"刘", @"陈", @"杨", @"黄", @"周", @"吴",
-                          @"徐", @"孙", @"马", @"朱", @"胡", @"林", @"郭", @"何", @"高", @"罗",
-                          @"郑", @"梁", @"谢", @"宋", @"唐", @"许", @"韩", @"冯", @"邓", @"曹"];
-    NSArray *givenNames = @[@"伟", @"芳", @"娜", @"洋", @"杰", @"磊", @"敏", @"强", @"婷", @"明",
-                            @"超", @"丽", @"军", @"静", @"峰", @"威", @"鹏", @"勇", @"华", @"宇",
-                            @"辉", @"平", @"刚", @"桂英", @"秀兰", @"建国", @"志强", @"俊杰",
-                            @"雨涵", @"子轩", @"浩然", @"嘉怡"];
-    NSString *surname = surnames[arc4random_uniform((uint32_t)surnames.count)];
-    NSString *given = givenNames[arc4random_uniform((uint32_t)givenNames.count)];
-    NSArray *formats = @[
-        [NSString stringWithFormat:@"%@%@的 iPhone", surname, given],
-        [NSString stringWithFormat:@"%@%@的iPhone", surname, given],
-        @"iPhone"
-    ];
-    return formats[arc4random_uniform((uint32_t)formats.count)];
+    // v82 ★P0★ 设备名/主机名必须是纯 ASCII。
+    //
+    // 真机实测（v81 PROFILE，13 Pro Max）：
+    //     kern.hostname = uname.nodename = gethostname = "1-4"
+    //   不含中文、不含空格。v81 把「张伟的 iPhone」这类中文串喂给
+    //   uname.nodename / kern.hostname / gethostname，日志里 FAKE_HOST
+    //   变成 `ËÆ∏Â≥∞ÁöÑiPhone`（UTF-8 多重编码），而真机 hostname
+    //   永远不会长这样 —— 乱码本身就是「被人工篡改」的直接证据，
+    //   比不伪装更糟。
+    //
+    //   改用 iOS 出厂默认设备名 "iPhone"：真机默认值、纯 ASCII、
+    //   与 hostname 同形，且全球数千万台设备同名，不构成指纹。
+    return @"iPhone";
 }
 
 static NSString *genRandStr(NSUInteger len, NSString *cs) {
@@ -218,184 +2224,188 @@ static NSString *genRandStr(NSUInteger len, NSString *cs) {
     return s;
 }
 
+#if !MT_CLONE
 // ============================================================
-// iOS 版本管理
 // ============================================================
-static NSString *getFakeSystemVersion(void) {
-    return getPersistent(FKEY(@"sv"), ^{
-        NSArray *versions = @[
-            @"15.4.1", @"15.5", @"15.6.1", @"15.7.4", @"15.7.8", @"15.8.3",
-            @"16.0", @"16.1.2", @"16.2", @"16.3.1", @"16.5", @"16.6.1",
-            @"16.7.2", @"16.7.4", @"16.7.8",
-            @"17.0", @"17.1.2", @"17.2", @"17.3", @"17.4.1", @"17.5.1", @"17.6"
-        ];
-        return versions[arc4random_uniform((uint32_t)versions.count)];
-    });
-}
+// UA 伪装 — v57N 必须替换（否则 UA 泄露真系统版本，与假机型矛盾）
+// 真机样本 UA: Mozilla/5.0 (iPhone; CPU iPhone OS 16_1 like Mac OS X)
+//              AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148
+//              SP-engine/3.61.0 light/1.0(WKWebView) them...
+// v57N 目标: iPhone OS 17_6_1（与伪造系统版本一致）
+// ============================================================
+// ★★ v57Q 关键修正：UA 必须保留 baiduboxapp/<版本> 段 ★★
+//
+// 血泪教训：此前 UA 被改成
+//   Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15
+//   (KHTML, like Gecko) Mobile/15E148 SP-engine/3.61.0 light/1.0(WKWebView) themecolor/1.0
+// 里面**没有 baiduboxapp/ 段** —— 这个 UA 看起来是「WKWebView 网页」而非
+// 「百度 App 内请求」。百度活动类接口（含农场 se-act.baidu.com）依赖 UA 中的
+// baiduboxapp/ 识别 App 环境；缺失时服务端判定非 App 环境，返回
+// 「活动太火爆，请稍后再试」这类兜底提示。
+//
+// 真机（农场自动化工具实测）UA 形态：
+//   ... Mobile/15E148 SP-engine/3.58.0 main/1.0 baiduboxapp/15.63.0.10
+// 本 App 版本为 15.69.0.10，故 UA 中 baiduboxapp 版本必须与之一致。
+//
+// ★ 关于 WKWebView 的三种 UA 设置方式与优先级（务必记牢）：
+//
+//   customUserAgent  >  NSUserDefaults["UserAgent"]  >  applicationNameForUserAgent
+//
+//   优先级高的生效时，低的**被完全忽略**（不是拼接）。
+//   其中只有 applicationNameForUserAgent 是「追加到默认 UA 后面」，
+//   另两种是「整体替换」。
+//
+//   因此本 hook 的设计：
+//     - 三条路全部覆盖，且**全部设成同一个完整 UA**（含 baiduboxapp 段）
+//     - 这样无论 App 走哪条路、无论哪个生效，最终 UA 都正确
+//     - 因为生效的只有一条，不存在「两段 baiduboxapp 重复」的问题
+//
+//   注意 applicationNameForUserAgent 是「追加」语义：若只靠它，
+//   它追加到的默认 UA 里没有 baiduboxapp，结果仍缺该段 —— 所以
+//   必须再配合 customUserAgent（优先级更高，整体替换）双保险。
+// ★★★ v61 UA 策略修正：从「整体覆盖」改为「只补缺段」 ★★★
+//
+// 血泪复盘：v57Q 起把 UA 硬编码成下面这条，三条通道全部强制覆盖。
+// 当时硬件人格也伪造 17.6.1，看着自洽；但 v58 把硬件改回真机后，
+// UIDevice / sysctl 报出的是**真机系统版本**，而 UA 仍写死 17_6_1
+// —— UA 与设备自身环境对不上。
+// 实测表现：原版 App 农场正常，克隆进去「原本能选榴莲，现在不给选」。
+//
+// 正确做法：不要覆盖 App 自己设好的 UA。百度 App 自己就会给 WKWebView
+// 配置带 baiduboxapp 段的 UA（这正是原版一切正常的原因）。我们只在
+// 某条通道的值**确实缺** baiduboxapp 段时才补上，其余原样透传。
+#define BAIDUBOXAPP_SEGMENT @" baiduboxapp/15.69.0.10"
 
-static NSString *versionToBuild(NSString *version) {
-    NSDictionary *map = @{
-        @"15.4.1": @"19E258", @"15.5": @"19F77", @"15.6.1": @"19G82",
-        @"15.7.4": @"19H321", @"15.7.8": @"19H406", @"15.8.3": @"19H386",
-        @"16.0": @"20A362", @"16.1.2": @"20B110", @"16.2": @"20C65",
-        @"16.3.1": @"20D67", @"16.5": @"20F66", @"16.6.1": @"20G81",
-        @"16.7.2": @"20H115", @"16.7.4": @"20H121", @"16.7.8": @"20H132",
-        @"17.0": @"21A329", @"17.1.2": @"21B101", @"17.2": @"21C62",
-        @"17.3": @"21D50", @"17.4.1": @"21E237", @"17.5.1": @"21F90",
-        @"17.6": @"21G80"
-    };
-    return map[version] ?: @"20F66";
-}
+// 仅作参考，不再用于覆盖
+#define FAKE_APP_UA_FULL  @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) " \
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 " \
+                          "SP-engine/3.61.0 main/1.0 baiduboxapp/15.69.0.10"
 
-static NSString *versionToMachine(NSString *version) {
-    NSInteger major = [[version componentsSeparatedByString:@"."][0] integerValue];
-    if (major == 15) {
-        NSArray *models = @[@"iPhone14,5", @"iPhone14,4", @"iPhone14,2", @"iPhone14,3",
-                            @"iPhone13,2", @"iPhone13,3"];
-        return models[arc4random_uniform((uint32_t)models.count)];
-    } else if (major == 16) {
-        NSArray *models = @[@"iPhone14,7", @"iPhone14,8", @"iPhone15,2", @"iPhone15,3",
-                            @"iPhone14,5", @"iPhone14,6", @"iPhone13,2", @"iPhone13,3"];
-        return models[arc4random_uniform((uint32_t)models.count)];
-    } else if (major == 17) {
-        NSArray *models = @[@"iPhone15,4", @"iPhone15,5", @"iPhone16,1", @"iPhone16,2",
-                            @"iPhone14,7", @"iPhone14,8", @"iPhone14,2", @"iPhone14,3"];
-        return models[arc4random_uniform((uint32_t)models.count)];
+// 只在缺 baiduboxapp 段时补一段；已含则原样返回（未做任何修改）
+static NSString *ensureBaiduboxAppUA(NSString *ua) {
+    if (ua.length > 0 && [ua rangeOfString:@"baiduboxapp"].location != NSNotFound) {
+        return ua;                                    // 已带该段 —— 一个字都不改
     }
-    return @"iPhone14,7";
-}
-
-static uint64_t machineToMemSize(NSString *machine) {
-    NSArray *fourGB = @[@"iPhone14,4", @"iPhone14,5", @"iPhone14,6",
-                        @"iPhone13,2", @"iPhone13,3", @"iPhone12,1", @"iPhone11,8"];
-    NSArray *sixGB = @[@"iPhone14,7", @"iPhone14,8", @"iPhone15,2", @"iPhone15,3",
-                       @"iPhone15,4", @"iPhone15,5", @"iPhone14,2", @"iPhone14,3"];
-    NSArray *eightGB = @[@"iPhone16,1", @"iPhone16,2"];
-    if ([eightGB containsObject:machine]) return 8589934592ULL;
-    if ([sixGB containsObject:machine]) return 6442450944ULL;
-    if ([fourGB containsObject:machine]) return 4294967296ULL;
-    return 6442450944ULL;
-}
-
-static NSString *versionToDarwinRelease(NSString *version) {
-    NSArray *parts = [version componentsSeparatedByString:@"."];
-    NSInteger major = [parts[0] integerValue];
-    NSInteger minor = parts.count > 1 ? [parts[1] integerValue] : 0;
-    NSInteger darwinMajor = major + 6;
-    return [NSString stringWithFormat:@"%ld.%ld.0", (long)darwinMajor, (long)minor];
-}
-
-static NSOperatingSystemVersion parseVersion(NSString *versionStr) {
-    NSOperatingSystemVersion v = {0, 0, 0};
-    NSArray *parts = [versionStr componentsSeparatedByString:@"."];
-    if (parts.count > 0) v.majorVersion = [parts[0] integerValue];
-    if (parts.count > 1) v.minorVersion = [parts[1] integerValue];
-    if (parts.count > 2) v.patchVersion = [parts[2] integerValue];
-    return v;
-}
-
-// ★ F2 ★ 注册/登录页是 H5（WKWebView）。v57f 的 UA 只有 Mobile/15E148，
-// 缺 baiduboxapp 段 —— 服务端会判定「非 App 环境」，注册直接失败。
-// 这是 v57Q（2026-09-12）在农场页踩过的同一个坑，这里补回来。
-#define BAIDUBOXAPP_SEGMENT @" SP-engine/3.61.0 main/1.0 baiduboxapp/15.69.0.10"
-
-static NSString *buildFakeUserAgent(void) {
-    NSString *sv = getFakeSystemVersion();
-    NSString *underscoreVersion = [sv stringByReplacingOccurrencesOfString:@"." withString:@"_"];
-    return [NSString stringWithFormat:
-        @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) "
-        @"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148%@",
-        underscoreVersion, BAIDUBOXAPP_SEGMENT];
-}
-
-// 整条 UA：缺 baiduboxapp 才补，已有则原样返回
-static NSString *ensureBaiduboxappSegment(NSString *ua) {
-    if (!ua || ua.length == 0) return buildFakeUserAgent();
-    if ([ua rangeOfString:@"baiduboxapp"].location != NSNotFound) return ua;
+    if (ua.length == 0) return @"baiduboxapp/15.69.0.10";
     return [ua stringByAppendingString:BAIDUBOXAPP_SEGMENT];
 }
 
-// applicationNameForUserAgent 是「追加段」，不能塞整条 UA，只补标记段
-static NSString *ensureAppNameSegment(NSString *name) {
-    if (!name || name.length == 0) return @"baiduboxapp/15.69.0.10";
-    if ([name rangeOfString:@"baiduboxapp"].location != NSNotFound) return name;
-    return [name stringByAppendingString:@" baiduboxapp/15.69.0.10"];
+// 兼容旧调用点：返回完整 App UA（仅在完全拿不到原值时兜底）
+static NSString *buildFakeUserAgent(void) {
+    return FAKE_APP_UA_FULL;
 }
 
-static NSString *modifyUserAgentVersion(NSString *ua) {
-    if (!ua || ua.length == 0) return ua;
-    NSString *fakeVersion = getFakeSystemVersion();
-    NSString *underscoreVersion = [fakeVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
-
-    NSRegularExpression *regex1 = [NSRegularExpression
-        regularExpressionWithPattern:@"CPU iPhone OS \\d+_\\d+(?:_\\d+)?"
-        options:0 error:nil];
-    ua = [regex1 stringByReplacingMatchesInString:ua options:0
-        range:NSMakeRange(0, ua.length)
-        withTemplate:[NSString stringWithFormat:@"CPU iPhone OS %@", underscoreVersion]];
-
-    NSRegularExpression *regex2 = [NSRegularExpression
-        regularExpressionWithPattern:@"Version/\\d+\\.\\d+(?:\\.\\d+)?"
-        options:0 error:nil];
-    ua = [regex2 stringByReplacingMatchesInString:ua options:0
-        range:NSMakeRange(0, ua.length)
-        withTemplate:[NSString stringWithFormat:@"Version/%@", fakeVersion]];
-
-    return ua;
+// 判定是否为「百度系 UA」——凡是百度 App/WebView 发出的 UA 都要整体替换为
+// 自洽的 App UA，避免只替换一部分造成同会话内 UA 不一致。
+static BOOL isUALike(NSString *s) {
+    if (!s || s.length < 20) return NO;
+    return [s rangeOfString:@"iPhone OS"].location != NSNotFound ||
+           [s rangeOfString:@"AppleWebKit"].location != NSNotFound ||
+           [s rangeOfString:@"baiduboxapp"].location != NSNotFound ||
+           [s rangeOfString:@"baidu"].location != NSNotFound;
 }
+#endif // !MT_CLONE
 
+// Cookie/设备标识生成（保持与真实格式一致）
+//
+// ★ v57M 关键修复：CUID 必须是真 base64url(随机50字节) + "mA"
+//   真机样本: giHau0iA-uj6iHilluvqi_uuSigpu2i0giSLi_ucSf_4i2uhji2Pf085HOpukHMuh18mA
+//   = base64url(50字节) 67字符 + "mA" 2字符 = 69字符
+//   v57L 用逐字符随机 → 虽字面像 base64 但解码非法 → 百度校验即识破
 // ============================================================
-// Cookie/设备标识生成
-// ============================================================
-static NSString *genCUID(void) {
-    NSString *cs = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 61; i++) {
-        uint32_t r = arc4random_uniform(100);
-        if (r < 5) {
-            [s appendString:@"_"];
-        } else if (r < 8) {
-            [s appendString:@"-"];
-        } else {
-            [s appendFormat:@"%C", [cs characterAtIndex:arc4random_uniform((uint32_t)cs.length)]];
-        }
-    }
-    [s appendString:@"mA"];
+__attribute__((unused))
+static NSString *b64urlEncode(NSData *data) {
+    NSString *s = [data base64EncodedStringWithOptions:0];
+    s = [s stringByReplacingOccurrencesOfString:@"+" withString:@"-"];
+    s = [s stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    // 去掉 padding（真机样本无 '='）
+    while ([s hasSuffix:@"="]) s = [s substringToIndex:s.length - 1];
     return s;
 }
 
+static NSString *genCUID(void) {
+    // ★ v84 ★P0★ 纠正 v57M/v57P 的方向性错误 ★
+    //
+    // v57M 依据一个「cookie BAIDUCUID 是 69 位 b64url + mA」的样本，
+    // 认定 cookie 层 cuid 与平台层 cuid 是两套不同格式，于是 v57P 起
+    // 所有 BAIDUCUID/MAWEBCUID/CUID_FAMILY 都生成 69 位 b64url，
+    // 而 App 内部 cuid 仍是 51 位 —— 同一次请求里两个身份。
+    //
+    // 2026-11-02 真机实证（本机未 hook 的百度翻译 / 百度地图容器）：
+    //   翻译 .baidu.com  Cookie BAIDUCUID = 3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS (51位)
+    //   翻译 prefs      tempCUID        = 3ecbab9d9aa6a11172c115567ca774a95f5b9e38cfbhrsarbqs (同值小写)
+    //   地图 prefs      temCUID/BIMPIMLogKeyCUID/kBMSPLASH_BBACUID = 同一个 3ECBAB9D…（51位）
+    //   → 真机全机只有一个 cuid，格式 = 40位大写HEX + 11位大写字母数字，共 51 字符。
+    //   cookie 与 prefs 只差大小写，不存在 69 位 b64url 这一说。
+    //
+    // 因此 v84 起 genCUID 与 genPlatformCUID 完全同源同格式。
+    NSString *hexCS = @"0123456789ABCDEF";
+    NSString *tailCS = @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    return [NSString stringWithFormat:@"%@%@",
+            genRandStr(40, hexCS), genRandStr(11, tailCS)];
+}
+
+// ★ v67: 平台层 cuid（NSUserDefaults "cuid" 键 / keychain baidumobile.cuid 项）
+//
+// WebDAV 真机取证（bm_prefs.plist，原版 App 共享域）实锤：
+//   cuid         = 3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS
+//   BNPush_cuid  = D1311D9D3FA6AD38816050093190DA2CA145C5073OIAJMHMNOI
+// 格式 = 40位大写HEX + 11位[0-9A-Z]尾巴，共 51 字符。
+// 而旧实现（v57M 起）把 cookie 的 b64url 格式（~70字符，含小写/-/_）也顶给
+// 了平台层 cuid —— 服务端一眼识别非法格式 → 果园只给基础功能、
+// 不下发浏览任务（用户实测：原版正常、克隆「看不到浏览任务」）。
+static NSString *genPlatformCUID(void) {
+    NSString *hexCS = @"0123456789ABCDEF";
+    NSString *tailCS = @"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    return [NSString stringWithFormat:@"%@%@",
+            genRandStr(40, hexCS), genRandStr(11, tailCS)];
+}
+
 static NSString *genBAIDUID(void) {
+    // 真机: 32位大写HEX + ":FG=1"  (例: 5A258432900A32B53931CFE922A7AF51:FG=1)
     NSString *hexCS = @"0123456789ABCDEF";
     return [genRandStr(32, hexCS) stringByAppendingString:@":FG=1"];
 }
 
 static NSString *genTcuid(void) {
+    // tcuid: 48位大写HEX（保持十六进制）
     NSString *hexCS = @"0123456789ABCDEF";
-    NSString *extraCS = @"ABCDEFGHIJ";
-    NSMutableString *s = [NSMutableString string];
-    for (int i = 0; i < 48; i++) {
-        uint32_t r = arc4random_uniform(100);
-        if (r < 15) {
-            [s appendFormat:@"%C", [extraCS characterAtIndex:arc4random_uniform((uint32_t)extraCS.length)]];
-        } else {
-            [s appendFormat:@"%C", [hexCS characterAtIndex:arc4random_uniform((uint32_t)hexCS.length)]];
-        }
-    }
-    return s;
+    return genRandStr(48, hexCS);
 }
-
-static NSString *getFakeID(NSString *name);
 
 static NSString *genFakeCookie(NSString *name) {
     NSString *cuidCS = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
     NSString *hexCS = @"0123456789abcdef";
+    NSString *upperHexCS = @"0123456789ABCDEF";
 
-    if ([name hasPrefix:@"BAIDUCUID"] || [name isEqualToString:@"MAWEBCUID"] || [name isEqualToString:@"cuid"])
+    // ★ v57P：先按「身份族」归一化，保证同族 cookie 拿到同一个值
+    NSString *fam = canonicalCookieKey(name);
+
+    // —— CUID 族：BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid / PLATCUID 全部同值 ——
+    if ([fam isEqualToString:@"CUID51"])
         return genCUID();
-    if ([name isEqualToString:@"BAIDUID"])
+
+    // —— BAIDUID 族 ——
+    if ([fam isEqualToString:@"BAIDUID_FAMILY"])
         return genBAIDUID();
-    if ([name isEqualToString:@"BAIDUID_BFESS"])
-        return getFakeID(@"BAIDUID");
+
+    // —— fuid 族 ——
+    if ([fam isEqualToString:@"FUID_FAMILY"])
+        return genRandStr(32, hexCS);
+
+    // —— ab_jid 族 ——
+    if ([fam isEqualToString:@"AB_JID_FAMILY"])
+        return genRandStr(40, hexCS);
+
+    // —— ab_bid 族 ——
+    if ([fam isEqualToString:@"AB_BID_FAMILY"])
+        return genRandStr(40, hexCS);
+
+    // —— 以下为各自独立的标识，不共享 ——
+    // ★ v67: 平台层 cuid —— 与 cookie CUID_FAMILY **不同值、不同格式**！
+    // 真机里 cookie BAIDUCUID（b64url）与 plist/keychain cuid（40大写HEX+尾）
+    // 本来就是两个 ID。旧实现把它们归一成一个 b64url 值是错误根源。
+    if ([name isEqualToString:@"PLATCUID"]) return genPlatformCUID();
     if ([name isEqualToString:@"DVIF"]) {
         NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)((uint64_t)arc4random() * arc4random() % 9000000000000000ULL + 1000000000000000ULL)];
         NSMutableData *d = [NSMutableData dataWithLength:300];
@@ -404,12 +2414,131 @@ static NSString *genFakeCookie(NSString *name) {
     }
     if ([name isEqualToString:@"tcuid"]) return genTcuid();
     if ([name isEqualToString:@"__bid_n"]) return genRandStr(22, hexCS);
-    if ([name isEqualToString:@"fuid"]) return genRandStr(32, hexCS);
+
+    // ---- v57M 新增：真机样本中实际存在的设备/环境标识 ----
+    // BDB2BVID: 32位hex 设备ID
+    if ([name isEqualToString:@"BDB2BVID"]) return genRandStr(32, hexCS);
+    // BA_HECTOR: 真机 848120240la12g8h810g04242ha1a41l73rr429 (35字符，数字+字母混合)
+    if ([name isEqualToString:@"BA_HECTOR"]) return genRandStr(35, @"abcdefghijklmnopqrstuvwxyz0123456789");
+    // BAIDU_WISE_UID: wapp_<13位时间戳>_<3位随机>
+    if ([name isEqualToString:@"BAIDU_WISE_UID"]) {
+        NSTimeInterval ts = [[NSDate date] timeIntervalSince1970] * 1000;
+        return [NSString stringWithFormat:@"wapp_%.0f_%u", ts, arc4random_uniform(1000)];
+    }
+    // ZFY: 真机 carCl1WCG0JXAY:Bb7F4:AobXjhVWSBtT7AemD91AW0z0:C (段用冒号分隔)
+    if ([name isEqualToString:@"ZFY"]) {
+        NSString *cs2 = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        return [NSString stringWithFormat:@"%@:%@:%@:C",
+                genRandStr(14, cs2), genRandStr(5, cs2), genRandStr(28, cs2)];
+    }
+    // RT: "z=1&dm=baidu.com&si=<uuid>&ss=<8位>&sl=1&tt=um&bcn=..."
+    if ([name isEqualToString:@"RT"]) {
+        NSString *uuid = [[NSUUID UUID] UUIDString];
+        return [NSString stringWithFormat:@"\"z=1&dm=baidu.com&si=%@&ss=%@&sl=1&tt=um\"",
+                [uuid lowercaseString], genRandStr(8, @"abcdefghijklmnopqrstuvwxyz0123456789")];
+    }
+    // H_WISE_SIDS: 数字下划线串（版本特征，非唯一标识，用固定值即可）
+    //
+    // ★★ v57Q 修正：AFD_IP / BAIDULOCNEW 必须「原样放行」，不碰 ★★
+    //
+    // 依据 38 个真机账号 cookie 实测统计：
+    //   AFD_IP      出现 34/38，全部为真实公网 IP
+    //   BAIDULOCNEW 出现 34/38，格式统一 __100000_317_<13位毫秒时间戳>_1
+    //   其中 112.81.241.* 一个网段就有 28 个账号共用，且全部能正常进农场
+    //
+    // 由此确认两件事：
+    //   1) 百度不校验 AFD_IP 与真实出口 IP 是否一致
+    //   2) 百度不在乎多账号共用同一 IP（同 IP 是常态）
+    //
+    // 因此此前"清空 AFD_IP 防聚类"是无根据的，清除后反而让字段变为空值，
+    // 而正常 App 从不写入空值 —— "存在但为空"本身就是篡改特征。
+    // 生成假 IP 同样错误（会与真实出口 IP 矛盾，凭空制造不一致）。
+    //
+    // 正确处理：这两个字段不进入 isDeviceCookie 名单，本函数不会被调用，
+    // 由 App 自行写入真实值。此处保留分支仅为显式文档化该决策。
+    if ([name isEqualToString:@"AFD_IP"] || [name isEqualToString:@"BAIDULOCNEW"]) {
+        // 不应到达此处（不在 isDeviceCookie 名单内）。若到达则原值无法获取，
+        // 返回空串并依赖上层跳过改写。
+        return @"";
+    }
     return genRandStr(32, cuidCS);
 }
 
 static NSString *getFakeID(NSString *name) {
-    return getPersistent(FKEY([NSString stringWithFormat:@"ck.%@", name]), ^{ return genFakeCookie(name); });
+    NSString *fam = canonicalCookieKey(name);
+
+    // ★ v84: 全部 cuid 共用同一份持久化值 —— 并且**沿用 v83 已用的
+    //   平台 cuid**（BdD1.ck.PLATCUID = CC558E35…），不再新造设备 ID。
+    //   当前账号已在这个 ID 下完成登录、农场可进，换新值等于又给账号
+    //   挂一台"新设备"；只把它接到 cookie 侧，是修正矛盾而不是换设备。
+    if ([fam isEqualToString:@"CUID51"]) {
+        static NSString *legacy = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            legacy = getPersistent(@"BdD1.ck.PLATCUID", ^{ return genPlatformCUID(); });
+            if (legacy.length != 51) legacy = genPlatformCUID();
+        });
+        return getPersistent(@"BdD1.ck.CUID51", ^{ return legacy; });
+    }
+
+    return getPersistent([NSString stringWithFormat:@"BdD1.ck.%@", fam],
+                         ^{ return genFakeCookie(name); });
+}
+
+// ============================================================
+// ★ v57P 修复：Cookie 身份族归一化
+//
+// 问题：genFakeCookie 按 cookie 原始名生成并缓存，导致同一个「设备身份」
+//       在不同 cookie 名下分裂成多个互不相干的值：
+//         BAIDUCUID        -> BdD1.ck.BAIDUCUID        (值 A)
+//         BAIDUCUID_BFESS  -> BdD1.ck.BAIDUCUID_BFESS  (值 B)  ✗ 应等于 A
+//         MAWEBCUID        -> BdD1.ck.MAWEBCUID        (值 C)  ✗ 应等于 A
+//         cuid             -> BdD1.ck.cuid             (值 D)  ✗ 应等于 A
+//         CUID             -> BdD1.ck.CUID             (值 E)  ✗ 应等于 A
+//       百度农场激活的硬性前置就是 BAIDUCUID，App 后续请求携带的 MAWEBCUID/
+//       cuid 却是另一个值 → 服务端判定「设备身份不一致」→ 拒绝激活。
+//       原版 App 能进农场，正因为它所有 CUID 名都是同一个真值。
+//
+// 方案：把语义等价的 cookie 名映射到同一个规范键，保证同族同值。
+// ============================================================
+static NSString *canonicalCookieKey(NSString *name) {
+    if (!name) return @"";
+    NSString *u = [name uppercaseString];
+
+    // —— CUID 族：全部共用同一个 CUID（农场激活依赖此一致性）——
+    // BAIDUCUID / BAIDUCUID_BFESS / MAWEBCUID / cuid / CUID / cuid_galaxy2
+    // ★ v84: PLATCUID 也并入同一族 —— 真机只有一个 cuid，
+    //   cookie 与 prefs/keychain 必须拿到完全相同的字符串。
+    //   规范键改名 CUID51，避开磁盘上已存在的 BdD1.ck.CUID_FAMILY（69 位旧值）。
+    if ([u hasPrefix:@"BAIDUCUID"]) return @"CUID51";
+    if ([u isEqualToString:@"MAWEBCUID"]) return @"CUID51";
+    if ([u hasPrefix:@"CUID"]) return @"CUID51";
+    if ([u isEqualToString:@"PLATCUID"]) return @"CUID51";
+
+    // —— BAIDUID 族（浏览器/账号侧 ID，非设备指纹）——
+    if ([u hasPrefix:@"BAIDUID"]) return @"BAIDUID_FAMILY";
+
+    // —— fuid 族 ——
+    if ([u isEqualToString:@"FUID"]) return @"FUID_FAMILY";
+
+    // —— ab_jid 族 ——
+    if ([u hasPrefix:@"AB_JID"]) return @"AB_JID_FAMILY";
+
+    // —— ab_bid 族 ——
+    if ([u hasPrefix:@"AB_BID"]) return @"AB_BID_FAMILY";
+
+    return name;
+}
+
+// 会话凭证类：绝不伪造（伪造会直接破坏登录态与 CSRF 校验）
+static BOOL isSessionCookie(NSString *cookieName) {
+    if (!cookieName) return NO;
+    NSString *u = [cookieName uppercaseString];
+    // BDUSS / BDUSS_BFESS 是登录会话 + CSRF 镜像，篡改会导致会话失效
+    if ([u hasPrefix:@"BDUSS"]) return YES;
+    if ([u hasPrefix:@"STOKEN"]) return YES;
+    if ([u hasPrefix:@"PTOKEN"]) return YES;
+    return NO;
 }
 
 // ============================================================
@@ -417,10 +2546,16 @@ static NSString *getFakeID(NSString *name) {
 // ============================================================
 static BOOL isDeviceCookie(NSString *cookieName) {
     if (!cookieName) return NO;
+    // ★ v57P：会话凭证绝不伪造（BDUSS/BDUSS_BFESS/STOKEN/PTOKEN）
+    //   篡改 BDUSS_BFESS 会破坏 CSRF 镜像 → 会话失效 → 农场/支付认证失败
+    if (isSessionCookie(cookieName)) return NO;
     NSString *lk = [cookieName lowercaseString];
     NSArray *names = @[@"baiducuid", @"baiducuid_bfess", @"mawebcuid",
                        @"dvif", @"tcuid", @"__bid_n", @"fuid", @"cuid",
-                       @"baiduid", @"baiduid_bfess"];
+                       @"baiduid", @"baiduid_bfess",
+                       // v57M 新增（真机样本确认存在）
+                       @"bdb2bvid", @"ab_bid", @"ab_jid", @"ab_jid_bfess",
+                       @"ba_hector", @"zfy", @"rt"];
     for (NSString *n in names) { if ([lk isEqualToString:n]) return YES; }
     return NO;
 }
@@ -450,11 +2585,374 @@ static NSArray *modifiedCookies(NSArray *cookies) {
 }
 
 // ============================================================
+// ★ v85 ★P0★ WebKit 侧 cookie 对齐（WK-COOKIE-ALIGN）
+//
+// 2026-11-02 22:28:44 取证（13pm / D10 容器 6BEAEFDA）：
+//   Library/Cookies/Cookies.binarycookies 里 .baidu.com BAIDUID
+//   = 02CB8C58…:FG=1，而原生侧伪造值是 FBE4B00D…:FG=1 —— 同机两个设备 ID。
+//   原因：WKWebView 的请求跑在独立的 WebKit 网络进程里，dylib 注入不到，
+//   它只认自己 cookie 库里的值；而 App 的下单页正是 H5（日志里 22:26:07
+//   之后一条 REQ 都没有，NSURLSession/NSURLConnection/NSURLProtocol 三层
+//   全装也没抓到 → 请求根本没进本进程）。
+//
+// 做法：在 App 进程内（WKWebsiteDataStore 的 API 是可用的）读回 WebKit
+//   全部 cookie，把身份类条目按 getFakeID 覆写成与原生一致的假值再写回。
+//   只改值，不动 domain/path/expires，不碰 BDUSS/STOKEN 等会话凭证。
+// ============================================================
+static void alignWebKitCookieStore(void) {
+    static volatile int running = 0;
+    if (running) return;
+    running = 1;
+    @try {
+        Class wdsCls = NSClassFromString(@"WKWebsiteDataStore");
+        Class hcsCls = NSClassFromString(@"WKHTTPCookieStore");
+        if (!wdsCls || !hcsCls) { running = 0; return; }
+        id store = ((id (*)(id, SEL))objc_msgSend)(wdsCls,
+                        NSSelectorFromString(@"defaultDataStore"));
+        if (!store) { running = 0; return; }
+        id cs = ((id (*)(id, SEL))objc_msgSend)(store,
+                        NSSelectorFromString(@"httpCookieStore"));
+        SEL getAll = NSSelectorFromString(@"getAllCookies:");
+        SEL setOne = NSSelectorFromString(@"setCookie:completionHandler:");
+        if (!cs || ![cs respondsToSelector:getAll] || ![cs respondsToSelector:setOne]) {
+            running = 0; return;
+        }
+        ((void (*)(id, SEL, id))objc_msgSend)(cs, getAll, ^(NSArray *cookies) {
+            @try {
+                NSMutableArray *todo = [NSMutableArray array];
+                for (id obj in cookies) {
+                    if (![obj isKindOfClass:[NSHTTPCookie class]]) continue;
+                    NSHTTPCookie *c = (NSHTTPCookie *)obj;
+                    if (!isDeviceCookie(c.name)) continue;
+                    NSString *fake = getFakeID(c.name);
+                    if (!fake.length || [c.value isEqualToString:fake]) continue;
+                    NSMutableDictionary *p = [NSMutableDictionary dictionary];
+                    p[NSHTTPCookieName] = c.name;
+                    p[NSHTTPCookieValue] = fake;
+                    if (c.domain) p[NSHTTPCookieDomain] = c.domain;
+                    if (c.path) p[NSHTTPCookiePath] = c.path;
+                    if (c.expiresDate) p[NSHTTPCookieExpires] = c.expiresDate;
+                    p[NSHTTPCookieVersion] = @(c.version);
+                    if (c.secure) p[NSHTTPCookieSecure] = @YES;
+                    NSHTTPCookie *nc = [[NSHTTPCookie alloc] initWithProperties:p];
+                    if (nc) [todo addObject:nc];
+                }
+                for (NSHTTPCookie *nc in todo) {
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(cs, setOne, nc, nil);
+                }
+                diagAppend([NSString stringWithFormat:
+                    @"\n[%@] WK-COOKIE-ALIGN scanned=%lu fixed=%lu\n",
+                    [NSDate date], (unsigned long)cookies.count, (unsigned long)todo.count]);
+            } @catch (id e) {
+            } @finally {
+                running = 0;
+            }
+        });
+    } @catch (id e) {
+        running = 0;
+    }
+}
+
+// ============================================================
+// ★ v86 ★P0★ WKWebView H5 探针（WK-H5-PROBE）
+//
+// 背景（2026-11-02 22:26 / 22:28 / 22:39 三次取证）：
+//   点「下单」后 bd_diag.log 一字不增（md5 三次完全相同），而 D10 容器的
+//   Cookies.binarycookies 里反复出现 22:28:44 / 22:37:42 的新 cookie。
+//   → 下单由 WKWebView 的独立网络进程发出，dylib 注入不到那个进程；
+//     证书代理方案在百度 SP-engine 下握手被客户端拒绝（不信任代理根证书），
+//     也走不通。
+//
+// 做法：不碰网络栈，直接给页面注入 JS。hook -[WKWebView initWithFrame:configuration:]，
+//   向该配置的 WKUserContentController 挂一段 documentStart 脚本，包装
+//   fetch / XMLHttpRequest，把命中「下单类」关键词的请求与响应体通过
+//   webkit.messageHandlers 回传到本进程，写进 bd_diag.log。
+//   JS 只做旁路复制（response.clone / 只读 responseText），不改原请求与返回值。
+// ============================================================
+static void diagAppend(NSString *s);   // 与文件内前置声明一致，重复声明合法
+
+static NSString *const kBDProbeHandlerName = @"bdprobe9x";
+
+static const char *kBDProbeJS =
+"(function(){"
+"if(window.__bdProbe)return;window.__bdProbe=1;"
+"function P(o){try{window.webkit.messageHandlers.bdprobe9x.postMessage(JSON.stringify(o));}catch(e){}}"
+"var F=/(order|trade|cashier|pay|nuomi|jrmall|dxm|submit|create|confirm|book)/i;"
+"function S(x,n){try{return String(x==null?'':x).slice(0,n||1200);}catch(e){return '';}}"
+"var of=window.fetch;"
+"if(of){window.fetch=function(req,opt){"
+"var u='',b='',m='GET';"
+"try{u=(typeof req==='string')?req:(req&&req.url)||'';b=(opt&&opt.body)||'';m=(opt&&opt.method)||'GET';}catch(e){}"
+"var hit=F.test(u);"
+"if(hit)P({t:'req',m:m,u:S(u,600),b:S(b,1200)});"
+"var p=of.apply(this,arguments);"
+"if(hit&&p&&p.then){p.then(function(r){try{var c=r.clone();c.text().then(function(t){P({t:'resp',u:S(u,600),s:r.status,b:S(t,2000)});}).catch(function(){});}catch(e){}return r;}).catch(function(){});}"
+"return p;};}"
+"var OO=XMLHttpRequest.prototype.open,OS=XMLHttpRequest.prototype.send;"
+"XMLHttpRequest.prototype.open=function(m,u){this.__u=u;this.__m=m;return OO.apply(this,arguments);};"
+"XMLHttpRequest.prototype.send=function(b){"
+"try{var u=this.__u||'';if(F.test(u)){P({t:'xreq',m:this.__m,u:S(u,600),b:S(b,1200)});"
+"var x=this;x.addEventListener('load',function(){try{P({t:'xresp',u:S(u,600),s:x.status,b:S(x.responseText,2000)});}catch(e){}});}}catch(e){}"
+"return OS.apply(this,arguments);};"
+"P({t:'init',u:S(location.href,600)});"
+"})();";
+
+@interface BDProbeHandler : NSObject
+@end
+@implementation BDProbeHandler
+- (void)userContentController:(id)ucc didReceiveScriptMessage:(id)msg {
+    @try {
+        NSString *body = nil;
+        @try { body = [msg valueForKey:@"body"]; } @catch (id e) {}
+        if (![body isKindOfClass:[NSString class]] || body.length == 0) return;
+        if (body.length > 2600) body = [body substringToIndex:2600];
+        diagAppend([NSString stringWithFormat:@"\n[%@] H5-PROBE %@\n", [NSDate date], body]);
+    } @catch (id e) {}
+}
+@end
+
+static BDProbeHandler *g_probeHandler = nil;
+
+static void installWKProbe(void) {
+    Class wk = NSClassFromString(@"WKWebView");
+    if (!wk) return;
+    static char kAssocKey;
+    SEL sel = @selector(initWithFrame:configuration:);
+    Method m = class_getInstanceMethod(wk, sel);
+    if (!m) { diagAppend(@"\nWK-H5-PROBE: WKWebView 不可用\n"); return; }
+    IMP orig = method_getImplementation(m);
+    IMP imp = imp_implementationWithBlock(^id(id s, CGRect f, id cfg) {
+        @try {
+            if (cfg && !objc_getAssociatedObject(cfg, &kAssocKey)) {
+                objc_setAssociatedObject(cfg, &kAssocKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                id ucc = nil;
+                @try { ucc = [cfg valueForKey:@"userContentController"]; } @catch (id e) {}
+                if (!ucc) {
+                    Class uccCls = NSClassFromString(@"WKUserContentController");
+                    if (uccCls) {
+                        ucc = [[uccCls alloc] init];
+                        @try { [cfg setValue:ucc forKey:@"userContentController"]; } @catch (id e) {}
+                    }
+                }
+                Class usCls = NSClassFromString(@"WKUserScript");
+                if (ucc && usCls) {
+                    NSString *src = [NSString stringWithUTF8String:kBDProbeJS];
+                    id script = ((id (*)(id, SEL, NSString *, NSInteger, BOOL))objc_msgSend)(
+                                    [usCls alloc],
+                                    NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:"),
+                                    src, (NSInteger)0 /* atDocumentStart */, (BOOL)NO);
+                    if (script) {
+                        @try { [ucc addUserScript:script]; } @catch (id e) {}
+                    }
+                    if (!g_probeHandler) g_probeHandler = [[BDProbeHandler alloc] init];
+                    @try {
+                        [ucc addScriptMessageHandler:g_probeHandler name:kBDProbeHandlerName];
+                    } @catch (id e) {}
+                    diagAppend([NSString stringWithFormat:
+                        @"\n[%@] WK-H5-PROBE installed (ucc=%s)\n",
+                        [NSDate date], ucc ? "yes" : "no"]);
+                }
+            }
+        } @catch (id e) {}
+        return ((id (*)(id, SEL, CGRect, id))orig)(s, sel, f, cfg);
+    });
+    method_setImplementation(m, imp);
+}
+
+// ============================================================
 // NSUserDefaults device key detection
 // ============================================================
+
+// ============================================================
+// ★ v83 ★P0★ 身份统一（Identity Coherence）
+//
+// 2026-11-02 设备取证（13pm / D10 容器 6BEAEFDA）：
+//   App 私有域 com.baidu.BaiduMobile.BdD10.plist 里同时存在 5 套 cuid：
+//     BdD1.ck.CUID_FAMILY              = TV4-nInm… (69位, dylib cookie 层)
+//     BdD1.ck.PLATCUID                 = CC558E35… (51位, dylib 平台层)
+//     BdD1.real.CUID_FAMILY            = 33967FA4… (捕获的真值)
+//     com.baidu.baidumobile.tempCUID   = a71da648… (App 自己生成)
+//     BIMPIMLogRegisterKeyCUID         = A71DA648… (App 自己生成，上报用)
+//   而实际网络请求里：
+//     pim.baidu.com generate_lcm_token body  "cuid" = A71DA648…
+//     mbd.baidu.com/mapping/update      uid  = A71DA648…
+//     Cookie BAIDUCUID                       = TV4-nInm…
+//   → 同一次请求里 body 与 cookie 的 cuid 不同，服务端判定「设备身份不一致」。
+//
+// 根因：isStrictIdentityKeyStr 命中后只做「域重定向」，读的仍是私有域里
+//   App 自己写入的值；isDeviceKey 只做精确匹配（cuid/CUID/BAIDUCUID…），
+//   tempCUID / BIMPIMLogRegisterKeyCUID / BNPush_cuid 全部漏网。
+//
+// 修法：所有 cuid 语义的键在读层直接返回本克隆统一假值，不再看存储。
+//   cookie 族（BAIDUCUID/MAWEBCUID/CUID_FAMILY）→ 69 位 b64url
+//   平台族（tempCUID/PLATCUID/BNPush_cuid…） → 51 位 HEX+尾
+// ============================================================
+static BOOL isCuidValueKey(NSString *k) {
+    if (!k.length || [k hasPrefix:@"BdD1"]) return NO;      // 自建持久化键不动
+    NSString *lk = k.lowercaseString;
+    if ([lk containsString:@"seed"]) return NO;             // cuidsdkSeedid
+    if ([lk containsString:@"deviceinfo"]) return NO;       // cuidDeviceInfo
+    if ([lk containsString:@"sdk_version"]) return NO;
+    if ([lk isEqualToString:@"cuid"]) return YES;
+    if ([lk hasSuffix:@"cuid"]) return YES;                 // tempcuid/bnpush_cuid/…keycuid
+    if ([lk containsString:@"baiducuid"]) return YES;
+    if ([lk containsString:@"mawebcuid"]) return YES;
+    if ([lk containsString:@"cuid_family"]) return YES;
+    // ★ v90 ★ 度小满 / BDWallet 设备号 —— 值就是平台 cuid（51 位），
+    //   duxiaodian 的 orders/create 请求体里 `cuid=…|mobilebaidu` 直接取它。
+    //   v89 轮换只清了 BdD1.ck.*，没动这个键 → 轮换后下单仍带旧设备号，
+    //   与 URL 里的新 uid 打架（服务端一致性校验直接回 3523「人数过多」）。
+    if ([lk isEqualToString:@"bdwallet_device_uuid"]) return YES;
+    if ([lk hasPrefix:@"bdwallet_"] && [lk hasSuffix:@"uuid"]) return YES;
+    if ([lk hasPrefix:@"bdwallet_"] && [lk hasSuffix:@"cuid"]) return YES;
+    return NO;
+}
+
+static NSString *fakeIdentityValueForKey(NSString *key) {
+    if (!isCuidValueKey(key)) return nil;
+    NSString *lk = key.lowercaseString;
+    if (g_inUDHook) return nil;
+    g_inUDHook = YES;
+    __block NSString *v = nil;
+    @try {
+        // ★ v84: 不再区分 cookie/平台两套值 —— 真机只有一个 cuid。
+        v = getFakeID(@"PLATCUID");
+        // 真机实证：prefs 里的 tempCUID 存的是小写，而 cookie / 请求参数
+        // 是大写。值相同、大小写不同，照抄真机形态。
+        if ([lk isEqualToString:@"tempcuid"] || [lk hasSuffix:@".tempcuid"]) {
+            v = [v lowercaseString];
+        }
+    } @catch (id e) {
+        v = nil;
+    } @finally {
+        g_inUDHook = NO;
+    }
+    return v;
+}
+
+// 启动时校准：把私有域里历史遗留的 cuid 值全部改写成本克隆统一假值。
+// 走 CFPreferences 直接读改写，绕过 NSUserDefaults hook（防递归）。
+static void normalizeIdentityPrefs(void) {
+    @try {
+        CFArrayRef keys = CFPreferencesCopyKeyList(kCFPreferencesCurrentApplication,
+                                                   kCFPreferencesCurrentUser,
+                                                   kCFPreferencesAnyHost);
+        if (!keys) return;
+        CFIndex n = CFArrayGetCount(keys);
+        for (CFIndex i = 0; i < n; i++) {
+            CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+            if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+            NSString *key = (__bridge NSString *)k;
+            NSString *fv = fakeIdentityValueForKey(key);
+            if (!fv) continue;
+            CFPropertyListRef cur = CFPreferencesCopyAppValue(k, kCFPreferencesCurrentApplication);
+            BOOL need = YES;
+            if (cur && CFGetTypeID(cur) == CFStringGetTypeID()) {
+                if ([(__bridge NSString *)cur isEqualToString:fv]) need = NO;
+            }
+            if (cur) CFRelease(cur);
+            if (need) {
+                CFPreferencesSetAppValue(k, (__bridge CFStringRef)fv,
+                                         kCFPreferencesCurrentApplication);
+            }
+        }
+        CFRelease(keys);
+
+        // v84: cuidDeviceInfo 形态校正。
+        // 真机实证（百度地图 / 百度翻译，均未 hook）：
+        //   com.baidu.baidumobile.cuidDeviceInfo = iPhone14,3  ← 大写 I
+        // 而 v80 起写成了小写 iphone13,4（sysctl hw.machine 才是小写）。
+        // 该键不参与 cuid 替换（被 isCuidValueKey 排除），单独校正。
+        CFPreferencesSetAppValue(CFSTR("com.baidu.baidumobile.cuidDeviceInfo"),
+                                 (__bridge CFStringRef)[NSString stringWithUTF8String:FAKE_MACHINE],
+                                 kCFPreferencesCurrentApplication);
+
+        // ★ v90 ★ BDWallet 设备号显式落盘（不依赖上面的遍历命不命中），
+        //   并回读一次写进日志，确认轮换后下单链路拿到的是新值。
+        @try {
+            NSString *wc = getFakeID(@"PLATCUID");
+            CFPreferencesSetAppValue(CFSTR("bdwallet_device_uuid"),
+                                     (__bridge CFStringRef)wc,
+                                     kCFPreferencesCurrentApplication);
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+            CFPropertyListRef back = CFPreferencesCopyAppValue(CFSTR("bdwallet_device_uuid"),
+                                                               kCFPreferencesCurrentApplication);
+            NSString *bs = (back && CFGetTypeID(back) == CFStringGetTypeID())
+                         ? (__bridge NSString *)back : @"(null)";
+            diagAppend([NSString stringWithFormat:
+                @"\n[WALLET] bdwallet_device_uuid = %@ (expect %@)%@\n",
+                bs, wc, [bs isEqualToString:wc] ? @" OK" : @" ✗MISMATCH"]);
+            if (back) CFRelease(back);
+        } @catch (id e) {}
+
+        // ★ v91 ★ 度小满 aif 设备号：生成并落盘，同时打一行日志便于核对
+        @try {
+            NSMutableString *line = [NSMutableString stringWithString:@"\n[DEV-ID]"];
+            NSArray *names = @[@"AIF_IMEI", @"AIF_CU"];
+            NSArray *pairs = aifIdPairs();
+            for (NSUInteger i = 0; i < pairs.count; i++) {
+                [line appendFormat:@" %@=%@", names[i], pairs[i][1]];
+            }
+            [line appendString:@"\n"];
+            diagAppend(line);
+        } @catch (id e) {}
+
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+
+        // ★ v90 ★ 本地缓存 URL 净化 —— 实测 prefs 里
+        //   `easyBrowserPageRecoveryCmdURLString` 存着一整条带 uid=旧cuid 的
+        //   baiduboxapp:// 恢复链接，App 一旦用它还原页面就会拿旧设备号发请求。
+        //   只清「缓存/恢复链接」类键，不动账号与功能数据。
+        @try {
+            NSArray *tokens = @[
+                @"CC558E35AE333746EDB52C56DD62C15E8C26BB87KP4IT40I0QM",
+                @"33967FA4FB91506EBFB36D88DCBC44AB1C00385DPD129PU1D6E",
+                @"A71DA648AAEE97DFFB1AC3C736A7FD67D7B879526FLJNBFLEIB",
+                @"3ECBAB9D9AA6A11172C115567CA774A95F5B9E38CFBHRSARBQS"
+            ];
+            CFArrayRef kl2 = CFPreferencesCopyKeyList(kCFPreferencesCurrentApplication,
+                                                      kCFPreferencesCurrentUser,
+                                                      kCFPreferencesAnyHost);
+            NSUInteger scrubbed = 0;
+            if (kl2) {
+                CFIndex n2 = CFArrayGetCount(kl2);
+                for (CFIndex i = 0; i < n2; i++) {
+                    CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(kl2, i);
+                    if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+                    NSString *key = (__bridge NSString *)k;
+                    if ([key hasPrefix:@"BdD1."]) continue;
+                    NSString *lk = key.lowercaseString;
+                    BOOL cacheLike = ([lk containsString:@"url"] || [lk containsString:@"cache"]
+                                   || [lk containsString:@"recovery"] || [lk containsString:@"history"]);
+                    if (!cacheLike) continue;
+                    CFPropertyListRef cv = CFPreferencesCopyAppValue(k, kCFPreferencesCurrentApplication);
+                    if (!cv) continue;
+                    BOOL hit = NO;
+                    if (CFGetTypeID(cv) == CFStringGetTypeID()) {
+                        NSString *sv = (__bridge NSString *)cv;
+                        for (NSString *t in tokens) {
+                            if ([sv containsString:t]) { hit = YES; break; }
+                        }
+                    }
+                    CFRelease(cv);
+                    if (hit) {
+                        CFPreferencesSetAppValue(k, NULL, kCFPreferencesCurrentApplication);
+                        scrubbed++;
+                    }
+                }
+                CFRelease(kl2);
+            }
+            if (scrubbed) {
+                diagAppend([NSString stringWithFormat:@"\n[SCRUB] dropped %lu cached keys holding legacy cuid\n",
+                            (unsigned long)scrubbed]);
+            }
+        } @catch (id e) {}
+    } @catch (id e) {}
+}
+
 static BOOL isDeviceKey(NSString *key) {
     if (!key || g_inUDHook) return NO;
-    if ([key hasPrefix:fpx()]) return NO;
+    if ([key hasPrefix:@"BdD1"]) return NO;
     NSArray *exactKeys = @[@"cuid", @"CUID", @"cuid_galaxy2", @"cuid_gid", @"cuid_loc",
                            @"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
                            @"DVIF", @"tcuid", @"__bid_n", @"fuid",
@@ -465,1136 +2963,209 @@ static BOOL isDeviceKey(NSString *key) {
 }
 
 // ============================================================
-// v59F: group 域身份键隔离
-//
-// 背景（D 系列真机取证，2026-11）：
-//   共享容器 .../Shared/AppGroup/E2DB4240.../Library/Preferences/
-//       group.com.baidu.BaiduMobile.plist
-//   → cuid / devuid / idfv / user_id / is_login / bdpanCookie /
-//     channel_prefix / SAPI_* / kLocationIPHistoryInfoForWidget /
-//     source_userid_<uid> / BNPush_*  全部在这里。
-//   A 系列此前完全没隔离 group 域 → 克隆读到的仍是原机身份。
-//
-// 做法与 D 系列 v64 相同：
-//   suite 名整体改写行不通（会把 72 个功能键一起藏掉，H5 活动页拿不到
-//   渠道/活动参数），所以只把「身份键」重定向到本克隆私有域：
-//       group.com.baidu.BaiduMobile.BdF3
-//   非身份键继续读写共享域，功能不受影响。
+// v58: NSProcessInfo / UIScreen 硬件伪造已整体移除 —— 硬件人格跟真机，
+// 只保留身份伪造（cuid/UDID/IDFV/ECID/设备名）。历史教训见 git v57S/v57T。
+
+// v59: NSFileManager App Group 容器方法原始实现（容器 URL 隔离用）
+static NSURL *(*orig_containerURL)(id, SEL, NSString *) = NULL;
+
 // ============================================================
-static BOOL isGroupDomainStr(NSString *dom) {
-    if (dom.length == 0) return NO;
-    return [dom hasPrefix:@"group."] || [dom hasPrefix:@"group:"];
-}
-
-static NSString *mapGroupSuite(NSString *suite) {
-    if (suite.length == 0) return nil;
-    if (!isGroupDomainStr(suite)) return nil;
-    NSString *suf = fpx();
-    if (suf.length == 0) return nil;
-    if ([suite hasSuffix:suf]) return nil;          // 已映射，幂等
-    return [suite stringByAppendingFormat:@".%@", suf];
-}
-
-static CFStringRef mapGroupAppID(CFStringRef appID) {
-    if (!appID) return NULL;
-    NSString *m = mapGroupSuite((__bridge NSString *)appID);
-    if (!m) return NULL;
-    return (__bridge_retained CFStringRef)m;        // 调用方负责 CFRelease
-}
-
-static BOOL isIdentityKeyStr(NSString *k) {
-    if (k.length == 0) return NO;
-    static NSSet *exact = nil;
+// ★ v68: 诊断日志（T7 专用）★
+//
+// 目的：抓果园相关网络请求的 URL / 请求头 / 请求体 / 响应体，
+// 对比克隆与原版的参数差异，定位「浏览任务不下发」的服务端判定依据。
+// 日志写 /var/mobile/Documents/bd_diag.log（Filza/WebDAV 可直读），
+// 无权限时退回 App 沙盒 Documents/bd_diag.log。
+// 上限 3MB，超过即停写（防止无限膨胀）。
+// ============================================================
+static NSFileHandle *diagFH(void) {
+    static NSFileHandle *fh = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        exact = [NSSet setWithArray:@[
-            @"cuid", @"devuid", @"idfv", @"user_id", @"is_login", @"bdpanCookie",
-            @"BNPush_cuid", @"BNPush_cacheCuid", @"BNPush_token", @"BNPush_channelid",
-            @"channel_prefix", @"zid", @"bduss", @"BDUSS", @"stoken", @"STOKEN",
-            @"ptoken", @"PTOKEN", @"cuid_galaxy2", @"cuid_gid",
-        ]];
-    });
-    if ([exact containsObject:k]) return YES;
-    NSString *lk = k.lowercaseString;
-    static NSArray *subs = nil;
-    static dispatch_once_t once2;
-    dispatch_once(&once2, ^{
-        subs = @[@"cuid", @"devuid", @"idfv", @"sapi_", @"loginmodel", @"user_id",
-                 @"userid", @"channel_prefix", @"locationiphistory", @"bnpush",
-                 @"baiduid", @"bduss", @"stoken", @"ptoken"];
-    });
-    for (NSString *t in subs) {
-        if ([lk rangeOfString:t].location != NSNotFound) return YES;
-    }
-    return NO;
-}
-
-// ---- 私有域镜像实例 ----
-static IMP g_origISS = NULL;              // 原始 -[NSUserDefaults initWithSuiteName:]
-static char kUDGroupSuiteKey;             // 关联对象：记录实例的 group 域名
-static BOOL g_inPrivPeer = NO;            // 构造重入哨兵
-
-static NSUserDefaults *udRaw(NSString *suite) {
-    if (!g_origISS || suite.length == 0) return nil;
-    Class uc = objc_getClass("NSUserDefaults");
-    if (!uc) return nil;
-    id o = [uc alloc];
-    return ((id (*)(id, SEL, NSString *))g_origISS)(o, @selector(initWithSuiteName:), suite);
-}
-
-static NSUserDefaults *privPeerFor(id s) {
-    if (!s || g_inPrivPeer) return nil;
-    NSString *suite = objc_getAssociatedObject(s, &kUDGroupSuiteKey);
-    if (suite.length == 0) return nil;
-    NSString *mapped = mapGroupSuite(suite);
-    if (mapped.length == 0) return nil;
-    static NSMutableDictionary *cache = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
-    @synchronized (cache) {
-        NSUserDefaults *d = cache[mapped];
-        if (d) return d;
-        g_inPrivPeer = YES;
         @try {
-            d = udRaw(mapped);
-            if (d) cache[mapped] = d;
-        } @catch (id e) {}
-        g_inPrivPeer = NO;
-        return d;
-    }
-}
-
-// ---- CFPreferences 层（SDK 直接调公开 API 时走这条） ----
-static CFPropertyListRef (*orig_CFPrefCopyAppValue)(CFStringRef, CFStringRef) = NULL;
-static CFPropertyListRef (*orig_CFPrefCopyValue)(CFStringRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
-static Boolean (*orig_CFPrefSetValue)(CFStringRef, CFPropertyListRef, CFStringRef, CFStringRef, CFStringRef) = NULL;
-static void (*orig_CFPrefSetAppValue)(CFStringRef, CFPropertyListRef, CFStringRef) = NULL;
-
-static CFPropertyListRef hook_CFPrefCopyAppValue(CFStringRef key, CFStringRef appID) {
-    @try {
-        if (key && isIdentityKeyStr((__bridge NSString *)key)) {
-            CFStringRef m = mapGroupAppID(appID);
-            CFPropertyListRef v = orig_CFPrefCopyAppValue(key, m ? m : appID);
-            if (m) CFRelease(m);
-            return v;
-        }
-    } @catch (id e) {}
-    return orig_CFPrefCopyAppValue(key, appID);
-}
-
-static CFPropertyListRef hook_CFPrefCopyValue(CFStringRef key, CFStringRef appID,
-                                              CFStringRef user, CFStringRef host) {
-    @try {
-        if (key && isIdentityKeyStr((__bridge NSString *)key)) {
-            CFStringRef m = mapGroupAppID(appID);
-            CFPropertyListRef v = orig_CFPrefCopyValue(key, m ? m : appID, user, host);
-            if (m) CFRelease(m);
-            return v;
-        }
-    } @catch (id e) {}
-    return orig_CFPrefCopyValue(key, appID, user, host);
-}
-
-static Boolean hook_CFPrefSetValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID,
-                                   CFStringRef user, CFStringRef host) {
-    @try {
-        if (key && isIdentityKeyStr((__bridge NSString *)key)) {
-            CFStringRef m = mapGroupAppID(appID);
-            Boolean ok = orig_CFPrefSetValue(key, value, m ? m : appID, user, host);
-            if (m) CFRelease(m);
-            return ok;
-        }
-    } @catch (id e) {}
-    return orig_CFPrefSetValue(key, value, appID, user, host);
-}
-
-static void hook_CFPrefSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID) {
-    @try {
-        if (orig_CFPrefSetAppValue && key && isIdentityKeyStr((__bridge NSString *)key)) {
-            CFStringRef m = mapGroupAppID(appID);
-            orig_CFPrefSetAppValue(key, value, m ? m : appID);
-            if (m) CFRelease(m);
-            return;
-        }
-    } @catch (id e) {}
-    if (orig_CFPrefSetAppValue) orig_CFPrefSetAppValue(key, value, appID);
-}
-
-// ============================================================
-// v60F: Keychain 命名空间隔离
-//
-// 为什么要做：
-//   keychain 条目的可见范围由 entitlements 的 keychain-access-groups 决定。
-//   所有 clone 与官方 App 若落在同一 access group，物理上就是同一份数据 ——
-//   BAIDUCUID / BDUSS / STOKEN / 设备指纹条目全部共享。
-//   F3 只隔离了 App Group 的 plist，keychain 仍是漏的。
-//
-// 做法（不动 access group，避免 errSecMissingEntitlement）：
-//   写：service / account 追加 ".BdFn" 后缀 → 落进本克隆私有命名空间
-//   读：先查私有；miss 且条目「非身份类」→ 回退共享（只读，保证推送/证书
-//       等功能键不丢）；身份类一律不回退，逼出登录流程 → 干净的新身份
-//   删：只删私有；无定位键的全量删除直接忽略，避免误伤官方 App / 其他 clone
-//
-// 说明：后缀由 fpx() 运行时派生，一份 dylib 打进 F1..F10 各自独立命名空间。
-// ============================================================
-
-// ---- v69F: 本 clone 写过的 keychain 条目白名单 ----
-// 思路：keychain 的写入/查询字段**全部原样透传**（保住度小满收银台），
-// 只在「读取结果」这一层判断：属于 passport 共享登录组、且不是本 clone 写的条目，
-// 一律剔除。这样既不碰支付，也不会把别的 clone 的 BDUSS 交出去。
-static NSString *kcKeyOf(NSDictionary *d) {
-    id svc = d[(__bridge id)kSecAttrService];
-    id acct = d[(__bridge id)kSecAttrAccount];
-    if (![svc isKindOfClass:[NSString class]]) svc = @"-";
-    if (![acct isKindOfClass:[NSString class]]) acct = @"-";
-    return [NSString stringWithFormat:@"%@\x1f%@", svc, acct];
-}
-
-static NSMutableSet *kcOwned(void) {
-    static NSMutableSet *st = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        st = [NSMutableSet set];
-        @try {
-            CFPropertyListRef v = CFPreferencesCopyAppValue(
-                (__bridge CFStringRef)FKEY(@"kcown"), kCFPreferencesCurrentApplication);
-            if (v) {
-                if (CFGetTypeID(v) == CFArrayGetTypeID()) {
-                    for (id x in (__bridge NSArray *)v)
-                        if ([x isKindOfClass:[NSString class]]) [st addObject:x];
+            NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            NSArray *cands = @[
+                @"/var/mobile/Documents/bd_diag.log",
+                [doc stringByAppendingPathComponent:@"bd_diag.log"],
+            ];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *path = nil;
+            for (NSString *p in cands) {
+                if (![fm isWritableFileAtPath:[p stringByDeletingLastPathComponent]]) continue;
+                if (![fm fileExistsAtPath:p]) {
+                    [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
                 }
-                CFRelease(v);
+                if ([fm fileExistsAtPath:p]) { path = p; break; }
             }
-        } @catch (id e) {}
-    });
-    return st;
-}
-
-static void kcRemember(NSDictionary *d) {
-    @try {
-        if (![d isKindOfClass:[NSDictionary class]]) return;
-        NSMutableSet *st = kcOwned();
-        NSString *k = kcKeyOf(d);
-        if ([st containsObject:k]) return;
-        [st addObject:k];
-        NSArray *a = st.allObjects;
-        if (a.count > 400) a = [a subarrayWithRange:NSMakeRange(a.count - 400, 400)];
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcown"),
-                                 (__bridge CFPropertyListRef)a,
-                                 kCFPreferencesCurrentApplication);
-        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-    } @catch (id e) {}
-}
-
-static BOOL kcIsOwned(NSDictionary *d) {
-    @try { return [kcOwned() containsObject:kcKeyOf(d)]; } @catch (id e) {}
-    return NO;
-}
-
-// v71F: 清空白名单（重跑认领时用）
-static void kcForgetAll(void) {
-    @try {
-        [kcOwned() removeAllObjects];
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcown"),
-                                 (__bridge CFArrayRef)@[],
-                                 kCFPreferencesCurrentApplication);
-        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-    } @catch (id e) {}
-}
-
-static NSString *kcSuffix(void) {
-    static NSString *s = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [@"." stringByAppendingString:fpx()]; });
-    return s;
-}
-
-static NSArray *kcLocatorKeys(void) {
-    static NSArray *a = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        a = @[(__bridge id)kSecAttrService, (__bridge id)kSecAttrAccount];
-    });
-    return a;
-}
-
-// v63F: 前置声明（kcPayNS 定义在后面，kcDictIsIdentity 需要先引用）
-static BOOL kcPayNS(NSDictionary *d);
-
-// 身份类判定：service / account / server 命中关键词即视为「账号或设备身份载体」
-static BOOL kcStrIsIdentity(NSString *v) {
-    if (v.length == 0) return NO;
-    NSString *l = v.lowercaseString;
-    static NSArray *ks = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ks = @[@"bduss", @"stoken", @"ptoken", @"baiduid", @"cuid", @"bdudid",
-               @"passport", @"baidu", @"login", @"token", @"session", @"cookie",
-               @"credential", @"auth", @"account", @"user", @"uid",
-               @"device", @"imei", @"oaid", @"idfa", @"idfv", @"udid", @"uuid",
-               @"risk", @"secsdk", @"sfp", @"keychain"];
-    });
-    for (NSString *k in ks) {
-        if ([l rangeOfString:k].location != NSNotFound) return YES;
-    }
-    return NO;
-}
-
-static BOOL kcDictIsIdentity(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    // v63F: 支付 SDK 的命名空间一律不算「账号身份」。
-    // 度小满的服务名常含 account / device / token / uuid，旧逻辑会把它
-    // 误判成身份类而禁止回退共享域 → 读不到既有设备凭证 → 渠道列表为空。
-    if (kcPayNS(d)) return NO;
-    for (id k in kcLocatorKeys()) {
-        id v = d[k];
-        if ([v isKindOfClass:[NSString class]] && kcStrIsIdentity((NSString *)v)) return YES;
-    }
-    id srv = d[(__bridge id)kSecAttrServer];
-    if ([srv isKindOfClass:[NSString class]] && kcStrIsIdentity((NSString *)srv)) return YES;
-    return NO;
-}
-
-// 是否带了可用于定位的条件（service / account / server）
-static BOOL kcHasLocator(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    for (id k in kcLocatorKeys()) {
-        id v = d[k];
-        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return YES;
-    }
-    id srv = d[(__bridge id)kSecAttrServer];
-    if ([srv isKindOfClass:[NSString class]] && [(NSString *)srv length] > 0) return YES;
-    return NO;
-}
-
-// 返回 +1 的新字典；无需改写时返回 NULL
-static CFDictionaryRef kcRewrite(CFDictionaryRef src) {
-    if (!src) return NULL;
-    if (![(__bridge id)src isKindOfClass:[NSDictionary class]]) return NULL;
-    NSMutableDictionary *m = [(__bridge NSDictionary *)src mutableCopy];
-    NSString *sfx = kcSuffix();
-    BOOL changed = NO;
-    for (id k in kcLocatorKeys()) {
-        id v = m[k];
-        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
-            NSString *str = (NSString *)v;
-            if (![str hasSuffix:sfx]) {
-                m[k] = [str stringByAppendingString:sfx];
-                changed = YES;
+            if (!path) return;
+            // ★ v87: 按次轮转 —— 上一轮日志超 16MB 就改名挪走，重新开一个空文件。
+            // 避免单文件无限膨胀（v86 之前已经涨到 16MB），也保证每次启动
+            // 都能从干净的起点记录，不再被历史内容挤占配额。
+            @try {
+                NSDictionary *at = [fm attributesOfItemAtPath:path error:nil];
+                if ([[at objectForKey:NSFileSize] longLongValue] > 8LL * 1024 * 1024) {
+                    NSString *prev = [[path stringByDeletingLastPathComponent]
+                                        stringByAppendingPathComponent:@"bd_diag.prev.log"];
+                    [fm removeItemAtPath:prev error:nil];
+                    [fm moveItemAtPath:path toPath:prev error:nil];
+                    [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+            } @catch (id e) {}
+            if (![fm fileExistsAtPath:path]) {
+                [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
             }
-        }
-    }
-    if (!changed) return NULL;
-    return (__bridge_retained CFDictionaryRef)[m copy];
-}
-
-// ---- v61F: 度小满/钱包命名空间直通 ----
-// 第三方支付 SDK 用自身命名空间的 keychain 条目保存软令牌与设备凭证，
-// 这些是功能键而非百度账号身份，必须 1:1 保留原行为，否则收银台拿不到渠道。
-static BOOL kcPayNS(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    static NSArray *ks = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ks = @[@"dxm", @"duxiaoman", @"wallet", @"paydxm", @"baidupay", @"com.baidu.pay",
-               @"cashier", @"cashdesk", @"ecard", @"unionpay", @"alipay", @"weixin",
-               @"tenpay", @"bep", @"bdpay", @"licai", @"youqian", @"axiamsdk", @"loan"];
+            fh = [NSFileHandle fileHandleForUpdatingAtPath:path];
+            [fh seekToEndOfFile];
+            NSString *hdr = [NSString stringWithFormat:
+                @"==== BD DIAG v68 start %@\n==== sandbox=%@\n==== fakeCookieCUID=%@\n==== fakePlatformCUID=%@\n",
+                [NSDate date], NSHomeDirectory(), getFakeID(@"BAIDUCUID"), getFakeID(@"PLATCUID")];
+            [fh writeData:[hdr dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data]];
+        } @catch (id e) { fh = nil; }
     });
-    NSArray *fields = @[(__bridge id)kSecAttrService,
-                        (__bridge id)kSecAttrAccount,
-                        (__bridge id)kSecAttrServer];
-    for (id key in fields) {
-        id v = d[key];
-        if (![v isKindOfClass:[NSString class]]) continue;
-        NSString *l = [(NSString *)v lowercaseString];
-        for (NSString *k in ks) {
-            if ([l rangeOfString:k].location != NSNotFound) return YES;
-        }
-    }
-    return NO;
+    return fh;
 }
 
-static void kcLogPay(const char *op, NSDictionary *d, OSStatus st) {
+static long long g_diagSize = 0;
+
+static void diagAppend(NSString *s) {
+    NSFileHandle *fh = diagFH();
+    if (!fh || !s) return;
     @try {
-        NSString *svc = d[(__bridge id)kSecAttrService];
-        NSString *acct = d[(__bridge id)kSecAttrAccount];
-        if (![svc isKindOfClass:[NSString class]]) svc = @"-";
-        if (![acct isKindOfClass:[NSString class]]) acct = @"-";
-        if (svc.length > 64) svc = [svc substringToIndex:64];
-        if (acct.length > 64) acct = [acct substringToIndex:64];
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                            NSUserDomainMask, YES) firstObject];
-        if (dir.length == 0) return;
-        NSString *p = [dir stringByAppendingPathComponent:@"bd_pay.log"];
-        FILE *f = fopen(p.UTF8String, "a");
-        if (!f) return;
-        fprintf(f, "[KC-%s] st=%d svc=%s acct=%s\n", op, (int)st,
-                svc.UTF8String, acct.UTF8String);
-        fclose(f);
+        @synchronized (fh) {
+            // ★ v87 ★P0★ 原为 3MB 上限：v86 启动 5 秒就打满（启动爆发 + 埋点洪水），
+            // 之后整场会话一条不写 —— 22:57:52 之后用户进商城/点下单全部丢日志，
+            // 导致「下单走 WebKit 独立进程」的错误结论。现放宽到 64MB，
+            // 同时在 diagFH 里做按次轮转（>16MB 转 bd_diag.prev.log）。
+            if (g_diagSize > 64LL * 1024 * 1024) return;
+            NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+            if (!d) return;
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            g_diagSize += d.length;
+        }
     } @catch (id e) {}
 }
 
-// ============================================================
-// v64F: Keychain 层改为「白名单隔离」
-//
-// v60F/v61F/v63F 都是黑名单思路：默认隔离，命中钱包关键词才放行。
-// 这要求猜对度小满的 service 命名 —— 猜错就会把支付凭证挡在私有域之外，
-// 收银台拿不到渠道列表（F4 实测：kc 版不能付款，F2「完全无隔离」可付款）。
-//
-// 白名单版：只有「百度账号登录票据」被加后缀隔离，
-// 其余所有 keychain 操作（度小满、推送、证书、系统服务）1:1 原样透传。
-// 多开隔离的主体仍由 A 系列的随机硬件人格承担，keychain 只兜住登录票据。
-// ============================================================
-static BOOL kcBaiduIDStr(NSString *v) {
-    if (![v isKindOfClass:[NSString class]] || v.length == 0) return NO;
-    NSString *l = v.lowercaseString;
-    static NSArray *ks = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ks = @[@"shareloginaccount", @"sapi_share_login", @"baiducuid", @"passport.bduss",
-               @"bduss", @"stoken", @"ptoken",
-               // v77F: keychain 里的设备 ID 组，全机共享，必须一起私有化
-               @"baidumobile.cuid", @"baidumobile.maincuid"];
-    });
-    for (NSString *k in ks) {
-        if ([l rangeOfString:k].location != NSNotFound) return YES;
+// ★ v69: 排除法过滤 —— 果园接口 URL 关键词猜不准，改为只排除静态资源/CDN，
+// 其余全部记录（3MB 上限兜底）。宁可多记，遗漏才是最大成本。
+static BOOL diagInteresting(NSURL *u) {
+    if (!u) return NO;
+    NSString *s = u.absoluteString;
+    if (s.length == 0) return NO;
+    NSString *l = [[s lowercaseString] stringByRemovingPercentEncoding] ?: [s lowercaseString];
+    if ([l rangeOfString:@"bd_diag"].location != NSNotFound) return NO;
+    // 静态资源扩展名
+    NSArray *ext = @[@".png", @".jpg", @".jpeg", @".gif", @".webp", @".css", @".js",
+                     @".ico", @".woff", @".woff2", @".ttf", @".mp4", @".m3u8", @".svg"];
+    for (NSString *e in ext) {
+        if ([l hasSuffix:e]) return NO;
     }
-    return NO;
-}
-
-// 判定：必须是「登录票据」才隔离。
-//   account 命中关键词，或 service 显式带登录语义；
-//   仅凭 service = com.baidu.BaiduMobile 不隔离 —— 钱包也用这条 service。
-static BOOL kcBaiduIDDict(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    id acct = d[(__bridge id)kSecAttrAccount];
-    if (kcBaiduIDStr(acct)) return YES;
-    id svc = d[(__bridge id)kSecAttrService];
-    if ([svc isKindOfClass:[NSString class]]) {
-        NSString *l = [(NSString *)svc lowercaseString];
-        if ([l rangeOfString:@"shareloginaccount"].location != NSNotFound) return YES;
-        if ([l rangeOfString:@"passport.bduss"].location != NSNotFound) return YES;
-        if ([l rangeOfString:@"baiducuid"].location != NSNotFound) return YES;
-        // v77F: com.baidu.baidumobile.mainCUID / cuidDeviceInfo / cuidPrevious
-        if ([l rangeOfString:@"baidumobile.cuid"].location != NSNotFound) return YES;
-        if ([l rangeOfString:@"baidumobile.maincuid"].location != NSNotFound) return YES;
+    // 静态 CDN / 推送等无关通道
+    NSArray *cdn = @[@"bdstatic.com", @"bdimg.com", @"bcebos.com", @"baidubce.com",
+                     @"bdurl.net", @"mipcdn.com", @"push", @"mtj", @"apoll"];
+    for (NSString *c in cdn) {
+        if ([l rangeOfString:c].location != NSNotFound) return NO;
     }
-    return NO;
-}
-
-static BOOL kcShareLoginItem(NSDictionary *item) {
-    if (![item isKindOfClass:[NSDictionary class]]) return NO;
-    id ag = item[(__bridge id)kSecAttrAccessGroup];
-    if (![ag isKindOfClass:[NSString class]]) return NO;
-    return [((NSString *)ag).lowercaseString rangeOfString:@"shareloginaccount"].location != NSNotFound;
-}
-
-// v77F: keychain 设备 ID 组（B83JBVZ6M5.com.baidu.baidumobile.cuid）
-// 里面是 mainCUID(50 字符 32hex+18字母)、cuidDeviceInfo(机型)、cuidPrevious。
-// 全机共享一份，所有 clone 上报同一个设备 ID —— 这是多开被识别的根因。
-static BOOL kcCuidItem(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    id ag = d[(__bridge id)kSecAttrAccessGroup];
-    if (![ag isKindOfClass:[NSString class]]) return NO;
-    return [((NSString *)ag).lowercaseString rangeOfString:@"baidumobile.cuid"].location != NSNotFound;
-}
-
-// 只剔除「别人写进共享登录组」的条目；本 clone 写过的放行
-// ---- v73F: 实例私有 service 命名空间 ----
-// 登录票据统一存到 "原名.BdFn" 下，读取时再还原成原名返回上层。
-// 这样每个 clone 物理上只有自己那一份，不会互相看见，也不影响支付链路。
-static BOOL kcIsPrivSvc(NSString *s) {
-    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
-    return [s hasSuffix:kcSuffix()];
-}
-
-static NSString *kcBaseStr(NSString *s) {
-    if (![s isKindOfClass:[NSString class]] || s.length == 0) return s;
-    NSString *t = s;
-    NSString *sfx = kcSuffix();
-    if ([t hasSuffix:sfx] && t.length > sfx.length)
-        t = [t substringToIndex:t.length - sfx.length];
-    NSString *pre = [NSString stringWithFormat:@"bdpriv.%@.", fpx()];
-    if ([t hasPrefix:pre] && t.length > pre.length)
-        t = [t substringFromIndex:pre.length];
-    return t;
-}
-
-// 判定 service/account 是否带「别的实例」后缀（.BdF3 / .BdF4 ...）
-// v73F 迁移时把这类条目也当源复制了，导致 F6 把 F3/F4 的票据也吃进来。
-static BOOL kcIsForeignSvc(NSString *s) {
-    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
-    NSString *b = kcBaseStr(s);
-    NSRange r = [b rangeOfString:@".BdF" options:NSBackwardsSearch];
-    if (r.location == NSNotFound) return NO;
-    NSString *tail = [b substringFromIndex:r.location + 4];
-    if (tail.length == 0) return NO;
-    for (NSUInteger i = 0; i < tail.length; i++) {
-        unichar c = [tail characterAtIndex:i];
-        if (c < '0' || c > '9') return NO;
+    // ★ v87: 埋点/心跳洪水不再入库。
+    //   v86 实测：启动 5 秒内 ztbox(190) + k.gif/v.gif/j.gif(150) + 各类 gif
+    //   就吃掉 3MB 配额的绝大部分，真正要看的商城/下单请求被淹在后面。
+    //   这些通道不在身份链路上（cuid 一致性已单独验证过），直接排除。
+    NSArray *beacon = @[@"ztbox", @"/k.gif", @"/v.gif", @"/j.gif", @"/hm.gif",
+                        @"hm.baidu.com", @"nsclick", @"fclog.baidu.com", @"/log/jmy"];
+    for (NSString *c in beacon) {
+        if ([l rangeOfString:c].location != NSNotFound) return NO;
     }
     return YES;
 }
 
-static BOOL kcIsPrivLogin(NSDictionary *d) {
-    id svc  = d[(__bridge id)kSecAttrService];
-    id acct = d[(__bridge id)kSecAttrAccount];
-    // 只认 "原名.BdFn" 这一种私有形式。
-    // bdpriv.BdFn.* 是 v67F 的遗留副本，仅作迁移来源，不再对外暴露。
-    return (kcIsPrivSvc(svc) || kcIsPrivSvc(acct));
+static void diagDumpRequest(NSURLRequest *req, NSString *tag) {
+    if (!req || !diagInteresting(req.URL)) return;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] %@ %@\n",
+                          [NSDate date], tag, req.HTTPMethod ?: @"GET"];
+    [m appendFormat:@"  URL: %@\n", req.URL.absoluteString];
+    NSDictionary *h = req.allHTTPHeaderFields;
+    for (NSString *k in h) {
+        NSString *v = h[k];
+        if (v.length > 300) v = [[v substringToIndex:300] stringByAppendingString:@"..."];
+        [m appendFormat:@"  H %@: %@\n", k, v];
+    }
+    NSData *b = req.HTTPBody;
+    if (b) {
+        NSString *bs = [[NSString alloc] initWithData:b encoding:NSUTF8StringEncoding];
+        if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)b.length];
+        if (bs.length > 2500) bs = [[bs substringToIndex:2500] stringByAppendingString:@"...<trunc>"];
+        [m appendFormat:@"  BODY: %@\n", bs];
+    } else if (req.HTTPBodyStream) {
+        [m appendString:@"  BODY: <stream>\n"];
+    }
+    diagAppend(m);
 }
 
-// 总是返回 +1 的新字典，service/account 去掉后缀
-static CFTypeRef kcStripCopy(NSDictionary *d) {
-    NSMutableDictionary *m = [d mutableCopy];
-    id svc  = d[(__bridge id)kSecAttrService];
-    id acct = d[(__bridge id)kSecAttrAccount];
-    if ([svc isKindOfClass:[NSString class]]) {
-        NSString *b = kcBaseStr((NSString *)svc);
-        if (b) m[(__bridge id)kSecAttrService] = b;
-    }
-    if ([acct isKindOfClass:[NSString class]]) {
-        NSString *b = kcBaseStr((NSString *)acct);
-        if (b) m[(__bridge id)kSecAttrAccount] = b;
-    }
-    return (__bridge_retained CFTypeRef)[m copy];
-}
-
-// 共享登录组：只放行本实例私有条目；其它一律剔除（防串号）
-static CFTypeRef kcFilterLoginShared(CFTypeRef res) {
-    if (!res) return res;
-    if (CFGetTypeID(res) == CFDictionaryGetTypeID()) {
-        NSDictionary *d = (__bridge NSDictionary *)res;
-        if ((kcShareLoginItem(d) || kcCuidItem(d)) && !kcIsPrivLogin(d)) { CFRelease(res); return NULL; }
-        CFTypeRef out = kcStripCopy(d);
-        CFRelease(res);
-        return out;
-    }
-    if (CFGetTypeID(res) != CFArrayGetTypeID()) return res;
-    CFArrayRef arr = (CFArrayRef)res;
-    CFIndex n = CFArrayGetCount(arr);
-    CFMutableArrayRef out = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
-    if (!out) return res;
-    for (CFIndex i = 0; i < n; i++) {
-        CFTypeRef o = CFArrayGetValueAtIndex(arr, i);
-        if (!o || CFGetTypeID(o) != CFDictionaryGetTypeID()) { CFArrayAppendValue(out, o); continue; }
-        NSDictionary *d = (__bridge NSDictionary *)o;
-        if ((kcShareLoginItem(d) || kcCuidItem(d)) && !kcIsPrivLogin(d)) continue;
-        CFTypeRef so = kcStripCopy(d);
-        CFArrayAppendValue(out, so);
-        CFRelease(so);
-    }
-    CFRelease(res);
-    return out;
-}
-
-static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
-static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef) = NULL;
-static OSStatus (*orig_SecItemDelete)(CFDictionaryRef) = NULL;
-
-// ============================================================
-// v71F: 认领共享登录组票据（只抓本实例的）+ 诊断日志
-//
-// v70F 不加区分地把共享组里所有票据都认领成本实例的，结果 F3 把 F2
-// 刚登录写进去的 BDUSS 也吃进来 → 直接串号。
-//
-// v71F 挑选顺序：
-//   1. service/account 里带本实例后缀（BdF3）的 → 只认领这些；
-//   2. 一条都没有时才退回全量认领（保证不掉登录）。
-// 同时把共享组每条票据的 service/account/agrp 明文写进 Documents/kc_dump.log。
-// ============================================================
-static void kcDumpLine(NSString *line) {
+static void diagDumpResponse(NSURLRequest *req, NSHTTPURLResponse *resp, NSData *data) {
+    NSURL *u = resp.URL ?: req.URL;
+    if (!resp || !diagInteresting(u)) return;
+    NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] RESP %ld %@\n",
+                          [NSDate date], (long)resp.statusCode, u.absoluteString];
+    // v74: 响应头落盘 —— 风控/账号接口的令牌经常只走响应头
+    //      （Set-Cookie / 自定义 token 头），只记 body 会得出
+    //      「返回空 data」这种误导性结论
     @try {
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                            NSUserDomainMask, YES) firstObject];
-        if (dir.length == 0) return;
-        NSString *p = [dir stringByAppendingPathComponent:@"kc_dump.log"];
-        FILE *f = fopen(p.UTF8String, "a");
-        if (!f) return;
-        fprintf(f, "%s\n", line.UTF8String);
-        fclose(f);
-    } @catch (id e) {}
-}
-
-// ============================================================
-// v73F: 把共享登录票据迁移进本实例私有命名空间（只做一次）
-//
-// 源优先级：
-//   3  sapi_xxx.BdFn            （本实例此前已私有化，最可信）
-//   2  bdpriv.BdFn.sapi_xxx.BdFn（v67F 时代留下的私有副本）
-//   1  基名 sapi_xxx             （共享，最后才用）
-// 每个逻辑键只取一个源，已有私有条目的跳过。
-// ============================================================
-// ============================================================
-// v75F: cuid 组取证（只读，不改行为）
-//
-// keychain 里 B83JBVZ6M5.com.baidu.baidumobile.cuid 是全机共享的，
-// 7 条，所有 clone 读到同一个设备 ID —— 这是「多开几个就被检测到」的直接原因。
-// 先把这个组的 service/account/data 明文抓出来，再决定怎么派生独立值。
-// ============================================================
-static void kcDumpCuidGroup(void) {
-    @try {
-        NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-                            (__bridge id)kSecReturnAttributes: @YES,
-                            (__bridge id)kSecReturnData: @YES};
-        CFTypeRef all = NULL;
-        OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, &all);
-        if (st != errSecSuccess || !all) { if (all) CFRelease(all); return; }
-
-        NSArray *arr = nil;
-        if (CFGetTypeID(all) == CFArrayGetTypeID()) arr = (__bridge NSArray *)all;
-        else if (CFGetTypeID(all) == CFDictionaryGetTypeID()) arr = @[(__bridge id)all];
-
-        NSString *udCuid = [[NSUserDefaults standardUserDefaults] stringForKey:FKEY(@"ck.cuid")];
-        NSString *udBcuid = [[NSUserDefaults standardUserDefaults] stringForKey:FKEY(@"ck.BAIDUCUID")];
-        kcDumpLine([NSString stringWithFormat:@"[CUID-HEAD] fpx=%@ ud.cuid=%@ ud.BAIDUCUID=%@",
-                    fpx(), udCuid ?: @"-", udBcuid ?: @"-"]);
-
-        int n = 0;
-        for (id o in arr) {
-            if (![o isKindOfClass:[NSDictionary class]]) continue;
-            NSDictionary *d = (NSDictionary *)o;
-            id ag = d[(__bridge id)kSecAttrAccessGroup];
-            if (![ag isKindOfClass:[NSString class]]) continue;
-            if ([((NSString *)ag).lowercaseString rangeOfString:@"baidumobile.cuid"].location == NSNotFound) continue;
-
-            id svc  = d[(__bridge id)kSecAttrService];
-            id acct = d[(__bridge id)kSecAttrAccount];
-            NSData *data = d[(__bridge id)kSecValueData];
-            NSString *ds = @"-";
-            NSString *extra = @"";
-            if ([data isKindOfClass:[NSData class]]) {
-                NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (t && t.length) {
-                    ds = t;
-                } else {
-                    ds = [data base64EncodedStringWithOptions:0];
-                    NSString *u16 = [[NSString alloc] initWithData:data
-                                                          encoding:NSUTF16LittleEndianStringEncoding];
-                    if (u16.length && u16.length < 500)
-                        extra = [NSString stringWithFormat:@" u16=%@", u16];
-                    NSMutableString *hx = [NSMutableString string];
-                    const uint8_t *bp = data.bytes;
-                    NSUInteger lim = MIN(data.length, (NSUInteger)48);
-                    for (NSUInteger i = 0; i < lim; i++) [hx appendFormat:@"%02x", bp[i]];
-                    extra = [extra stringByAppendingFormat:@" hex=%@", hx];
-                }
+        NSDictionary *rh = resp.allHeaderFields;
+        if (rh.count > 0) {
+            NSUInteger n = 0;
+            for (NSString *k in rh) {
+                if (n++ >= 12) { [m appendString:@"  RH <more...>\n"]; break; }
+                NSString *v = [rh[k] description];
+                if (v.length > 200) v = [[v substringToIndex:200] stringByAppendingString:@"..."];
+                [m appendFormat:@"  RH %@: %@\n", k, v];
             }
-            if (ds.length > 500) ds = [ds substringToIndex:500];
-            kcDumpLine([NSString stringWithFormat:@"[CUID] svc=%@ acct=%@ len=%lu data=%@%@",
-                        svc, acct, (unsigned long)([data isKindOfClass:[NSData class]] ? [(NSData *)data length] : 0),
-                        ds, extra]);
-            n++;
         }
-        CFRelease(all);
-        kcDumpLine([NSString stringWithFormat:@"[CUID-TAIL] total=%d", n]);
     } @catch (id e) {}
+    NSData *d = data;
+    if (d.length > 4000) d = [d subdataWithRange:NSMakeRange(0, 4000)];
+    NSString *bs = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)(data ? data.length : 0)];
+    [m appendFormat:@"  BODY: %@\n", bs];
+    diagAppend(m);
 }
 
-
-// ============================================================
-// v78F: App Group 容器隔离 + 推送设备 ID 重写
-//
-// 为什么：
-//   设备上 group.com.baidu.BaiduMobile 只有一个物理容器
-//   （/private/var/mobile/Containers/Shared/AppGroup/BAE9285C-...），
-//   所有 clone 共用同一份 Library/Preferences/group.com.baidu.BaiduMobile.plist。
-//   里面 BNPush_cuid = 431D8F7F709192B450E8B66066346C917CCC81615OLJCPRRFGN，
-//   格式与 keychain mainCUID 完全一致，是百度侧真正的设备 ID。
-//   之前只映射了 CFPreferences 的 suite 名，SDK 只要拿 group 路径直接读文件就绕过。
-//
-// 做法：
-//   1. hook -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]
-//      → 返回 App 沙盒内 Library/PrivGroups/<group>.<BdFn> 的私有容器；
-//      首次调用时把真实容器整份复制过来，此后各 clone 各自演化。
-//   2. 私有容器里的 group plist 把 BNPush_cuid / BNPush_cacheCuid
-//      改成本实例派生值（40 hex + 10 字母，与百度格式一致，稳定不漂移）。
-//   3. 同步写入私有 CFPreferences 域，保证两条读取路径一致。
-// ============================================================
-static IMP g_origGroupURL = NULL;
-
-static NSString *agSeed(void) {
-    static NSString *s = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        @try {
-            CFPropertyListRef v = CFPreferencesCopyAppValue(
-                (__bridge CFStringRef)FKEY(@"gseed"), kCFPreferencesCurrentApplication);
-            if (v) {
-                if (CFGetTypeID(v) == CFStringGetTypeID()) s = [(__bridge NSString *)v copy];
-                CFRelease(v);
-            }
-            if (s.length == 0) {
-                s = [[NSUUID UUID] UUIDString];
-                CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"gseed"),
-                                         (__bridge CFStringRef)s,
-                                         kCFPreferencesCurrentApplication);
-                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-            }
-        } @catch (id e) {}
-        if (s.length == 0) s = fpx();
-    });
-    return s;
-}
-
-static uint32_t agMix(const char *str, uint32_t seed) {
-    uint32_t h = 2166136261u ^ seed;
-    if (!str) return h;
-    while (*str) {
-        h ^= (uint32_t)(unsigned char)(*str++);
-        h *= 16777619u;
-    }
-    h ^= h >> 13;
-    h *= 0x5bd1e995u;
-    h ^= h >> 15;
-    return h;
-}
-
-// 40 位大写 HEX + 10 位小写字母，与 BNPush_cuid / mainCUID 同构
-static NSString *agFakeCuid(void) {
-    static NSString *c = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *seed = [NSString stringWithFormat:@"%@|%@|devid", agSeed(), fpx()];
-        const char *p = seed.UTF8String;
-        NSMutableString *hex = [NSMutableString stringWithCapacity:40];
-        for (uint32_t i = 0; i < 5; i++) [hex appendFormat:@"%08X", agMix(p, i * 0x9E3779B9u + 1)];
-        NSMutableString *tail = [NSMutableString stringWithCapacity:10];
-        uint32_t v = agMix(p, 0xDEADBEEFu);
-        for (int i = 0; i < 10; i++) {
-            uint32_t sh = (uint32_t)((i * 5) % 25);
-            [tail appendFormat:@"%c", (char)('a' + ((v >> sh) & 0x1F) % 26)];
-        }
-        c = [hex stringByAppendingString:tail];
-    });
-    return c;
-}
-
-static NSString *agPrivRoot(void) {
-    static NSString *r = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        r = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/PrivGroups"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:r
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:NULL];
-    });
-    return r;
-}
-
-static NSString *agPrivPath(NSString *gid) {
-    NSString *safe = [gid stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
-    return [agPrivRoot() stringByAppendingPathComponent:
-            [safe stringByAppendingFormat:@".%@", fpx()]];
-}
-
-static void agSyncPrefs(NSString *gid, NSString *devid) {
+// v73: 连接层错误落盘 —— 错误码/域名/描述/URL 全记
+static void diagDumpError(NSURLRequest *req, NSError *e, NSString *tag) {
+    if (!e) return;
     @try {
-        NSString *ms = mapGroupSuite(gid);
-        if (ms.length == 0 || !orig_CFPrefSetAppValue) return;
-        CFStringRef msRef = (__bridge CFStringRef)ms;
-        orig_CFPrefSetAppValue((__bridge CFStringRef)@"BNPush_cuid",
-                               (__bridge CFStringRef)devid, msRef);
-        orig_CFPrefSetAppValue((__bridge CFStringRef)@"BNPush_cacheCuid",
-                               (__bridge CFStringRef)devid, msRef);
-        CFPreferencesAppSynchronize(msRef);
-    } @catch (id e) {}
+        NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] %@-ERR %ld %@\n",
+                              [NSDate date], tag, (long)e.code, e.domain ?: @"?"];
+        [m appendFormat:@"  DESC: %@\n", e.localizedDescription ?: @""];
+        NSURL *u = req.URL;
+        if (u) [m appendFormat:@"  URL: %@\n", u.absoluteString];
+        diagAppend(m);
+    } @catch (id ex) {}
 }
 
-static void agRewritePlist(NSString *privBase, NSString *gid) {
-    @try {
-        NSString *pp = [privBase stringByAppendingPathComponent:
-                        [NSString stringWithFormat:@"Library/Preferences/%@.plist", gid]];
-        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithContentsOfFile:pp];
-        if (!m) return;
-        NSString *devid = agFakeCuid();
-        BOOL changed = NO;
-        for (NSString *k in [m allKeys]) {
-            if (![k isKindOfClass:[NSString class]]) continue;
-            if ([k.lowercaseString rangeOfString:@"cuid"].location == NSNotFound) continue;
-            if (![m[k] isKindOfClass:[NSString class]]) continue;
-            if ([m[k] isEqualToString:devid]) continue;
-            m[k] = devid;
-            changed = YES;
-        }
-        if (changed) {
-            [m writeToFile:pp atomically:YES];
-            kcDumpLine([NSString stringWithFormat:@"[AG] rewrite %@ cuid=%@", gid, devid]);
-        }
-    } @catch (id e) {}
-}
+// 构造函数里安装：
+//   - NSURLSession dataTaskWithRequest:completionHandler:（原生接口层，含响应）
+//   - NSURLSession dataTaskWithRequest:（v69: delegate 型，请求侧）
+//   - uploadTaskWithRequest:fromData:completionHandler:（v69）
+//   - sessionWithConfiguration:delegate:delegateQueue:（v69: 抓 delegate 并 swizzle
+//     URLSession:dataTask:didReceiveData: / URLSession:task:didCompleteWithError:）
+//   - WKWebView loadRequest:（H5 页面导航 URL）
+//   - addScriptMessageHandler:name:（v69: 记录 H5↔原生 JSBridge 名单）
+// 注：WKWebView 内部 XHR 在 WebKit 网络进程，App 内 hook 看不到；
+//     JSBridge 消息是 H5 数据的主要通道之一，先记录名单。
 
-// 递归复制，跳过容器元数据（复制它一定会因 identifier 不匹配被拒）
-static void agCopyTree(NSString *src, NSString *dst) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:dst withIntermediateDirectories:YES attributes:nil error:NULL];
-    NSArray *items = [fm contentsOfDirectoryAtPath:src error:NULL];
-    int okN = 0, failN = 0;
-    for (NSString *it in items) {
-        if ([it hasPrefix:@".com.apple.mobile_container_manager"]) continue;
-        NSString *sp = [src stringByAppendingPathComponent:it];
-        NSString *dp = [dst stringByAppendingPathComponent:it];
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:sp isDirectory:&isDir]) continue;
-        if (isDir) {
-            agCopyTree(sp, dp);
-            okN++;
-        } else {
-            if (![fm fileExistsAtPath:dp]) {
-                if ([fm copyItemAtPath:sp toPath:dp error:NULL]) okN++; else failN++;
-            } else okN++;
-        }
-    }
-    if (failN > 0) {
-        kcDumpLine([NSString stringWithFormat:@"[AG] tree %@ ok=%d fail=%d",
-                    [src lastPathComponent], okN, failN]);
-    }
-}
-
-static void agPrepare(NSString *realBase, NSString *privBase, NSString *gid) {
-    @try {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (realBase.length == 0 || privBase.length == 0) return;
-
-        NSString *privPrefs = [privBase stringByAppendingPathComponent:@"Library/Preferences"];
-        BOOL needCopy = ![fm fileExistsAtPath:privPrefs];
-        if (needCopy) {
-            // v79F: v78F 用 copyItemAtPath 整目录复制，被 .metadata.plist 的权限卡住，
-            // 结果私有容器一直是空的 —— SDK 读不到配置，功能反而更差。
-            // 改为递归复制并跳过元数据文件。
-            [fm removeItemAtPath:privBase error:NULL];
-            [fm createDirectoryAtPath:agPrivRoot()
-          withIntermediateDirectories:YES attributes:nil error:NULL];
-            agCopyTree(realBase, privBase);
-            kcDumpLine([NSString stringWithFormat:@"[AG] copy done %@ -> %@", gid, privBase]);
-        }
-        agRewritePlist(privBase, gid);
-        agSyncPrefs(gid, agFakeCuid());
-    } @catch (id e) {}
-}
-
-static NSURL *hook_groupContainerURL(id self, SEL _cmd, NSString *gid) {
-    NSURL *real = NULL;
-    if (g_origGroupURL)
-        real = ((NSURL *(*)(id, SEL, NSString *))g_origGroupURL)(self, _cmd, gid);
-    @try {
-        if (gid.length && isGroupDomainStr(gid) && real.path.length) {
-            NSString *priv = agPrivPath(gid);
-            agPrepare(real.path, priv, gid);
-            return [NSURL fileURLWithPath:priv isDirectory:YES];
-        }
-    } @catch (id e) {}
-    return real;
-}
-
-static void kcMigrate(void) {
-    @try {
-        // v75F: 一次性抓 cuid 组结构
-        CFPropertyListRef vd = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcvd3"), kCFPreferencesCurrentApplication);
-        if (!vd) {
-            if (orig_SecItemCopyMatching) kcDumpCuidGroup();
-            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcvd3"),
-                                     kCFBooleanTrue, kCFPreferencesCurrentApplication);
-            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-        } else { CFRelease(vd); }
-
-        // v74F: kcv5 控制。v73F 已写过 kcv4 的机器要重跑一次清理。
-        CFPropertyListRef v5 = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcv5"), kCFPreferencesCurrentApplication);
-        if (v5) { CFRelease(v5); return; }
-        if (!orig_SecItemCopyMatching) return;
-
-        NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-                            (__bridge id)kSecReturnAttributes: @YES,
-                            (__bridge id)kSecReturnData: @YES};
-        CFTypeRef all = NULL;
-        OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, &all);
-        if (st != errSecSuccess || !all) { if (all) CFRelease(all); return; }
-
-        NSArray *arr = nil;
-        if (CFGetTypeID(all) == CFArrayGetTypeID()) arr = (__bridge NSArray *)all;
-        else if (CFGetTypeID(all) == CFDictionaryGetTypeID()) arr = @[(__bridge id)all];
-
-        // ---- 1. 先清掉 v73F 复制出来的伪私有票据 ----
-        //   判据：① 带别的实例后缀（.BdF3.BdF6 这类）；
-        //         ② 内容与共享池里的基名条目完全相同（说明是复制品，不是自己登录写的）。
-        NSMutableDictionary *baseData = [NSMutableDictionary dictionary];
-        for (id o in arr) {
-            if (![o isKindOfClass:[NSDictionary class]]) continue;
-            NSDictionary *d = (NSDictionary *)o;
-            if (!kcShareLoginItem(d)) continue;
-            id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
-            if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
-            if (kcIsPrivSvc(svc) || [(NSString *)svc hasPrefix:@"bdpriv."]) continue;
-            id v = d[(__bridge id)kSecValueData];
-            if (v) baseData[[NSString stringWithFormat:@"%@\x1f%@", svc, acct]] = v;
-        }
-
-        int purged = 0;
-        for (id o in arr) {
-            if (![o isKindOfClass:[NSDictionary class]]) continue;
-            NSDictionary *d = (NSDictionary *)o;
-            if (!kcShareLoginItem(d)) continue;
-            id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
-            if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
-            if (!kcIsPrivSvc(svc) && !kcIsPrivSvc(acct)) continue;
-            // v67F 的 bdpriv.BdFn.* 是真实历史副本，保留不动
-            if ([(NSString *)svc hasPrefix:@"bdpriv."]) continue;
-
-            BOOL foreign = kcIsForeignSvc((NSString *)svc) || kcIsForeignSvc((NSString *)acct);
-            BOOL copied = NO;
-            if (!foreign) {
-                NSString *bk = [NSString stringWithFormat:@"%@\x1f%@",
-                                kcBaseStr((NSString *)svc), kcBaseStr((NSString *)acct)];
-                NSData *bv = baseData[bk];
-                id pv = d[(__bridge id)kSecValueData];
-                copied = (bv && pv && [pv isKindOfClass:[NSData class]] && [bv isEqualToData:(NSData *)pv]);
-            }
-            if (!foreign && !copied) continue;
-
-            NSMutableDictionary *dq = [NSMutableDictionary dictionary];
-            dq[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-            dq[(__bridge id)kSecAttrService] = svc;
-            dq[(__bridge id)kSecAttrAccount] = acct;
-            id ag = d[(__bridge id)kSecAttrAccessGroup];
-            if (ag) dq[(__bridge id)kSecAttrAccessGroup] = ag;
-            if (orig_SecItemDelete((__bridge CFDictionaryRef)dq) == errSecSuccess) purged++;
-        }
-
-        // ---- 2. 只认本实例真实私有源，不再用共享池兜底 ----
-        NSString *pre = [NSString stringWithFormat:@"bdpriv.%@.", fpx()];
-        NSMutableDictionary *best = [NSMutableDictionary dictionary];
-        NSMutableSet *hasPriv = [NSMutableSet set];
-
-        for (id o in arr) {
-            if (![o isKindOfClass:[NSDictionary class]]) continue;
-            NSDictionary *d = (NSDictionary *)o;
-            if (!kcShareLoginItem(d)) continue;
-            id svc = d[(__bridge id)kSecAttrService], acct = d[(__bridge id)kSecAttrAccount];
-            if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
-            if (kcIsForeignSvc((NSString *)svc) || kcIsForeignSvc((NSString *)acct)) continue;
-
-            NSString *lsvc = kcBaseStr((NSString *)svc), *lacct = kcBaseStr((NSString *)acct);
-            NSString *key = [NSString stringWithFormat:@"%@\x1f%@", lsvc, lacct];
-
-            int pri = 0;
-            if (kcIsPrivSvc((NSString *)svc) && ![(NSString *)svc hasPrefix:@"bdpriv."]) pri = 3;
-            else if ([(NSString *)svc hasPrefix:pre]) pri = 2;
-            if (pri == 0) continue;   // 基名与其它来源一律不用
-            if (pri == 3) [hasPriv addObject:key];
-
-            NSArray *cur = best[key];
-            if (!cur || [(NSNumber *)cur[0] intValue] < pri) best[key] = @[@(pri), d];
-        }
-
-        int added = 0, skipped = 0, failed = 0;
-        for (NSString *key in best) {
-            if ([hasPriv containsObject:key]) { skipped++; continue; }
-            NSDictionary *d = best[key][1];
-            NSString *svc = d[(__bridge id)kSecAttrService], *acct = d[(__bridge id)kSecAttrAccount];
-            NSMutableDictionary *a = [NSMutableDictionary dictionary];
-            a[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-            a[(__bridge id)kSecAttrService] = [kcBaseStr(svc) stringByAppendingString:kcSuffix()];
-            a[(__bridge id)kSecAttrAccount] = [kcBaseStr(acct) stringByAppendingString:kcSuffix()];
-            id v = d[(__bridge id)kSecValueData];
-            if (v) a[(__bridge id)kSecValueData] = v;
-            id ag = d[(__bridge id)kSecAttrAccessGroup];
-            if (ag) a[(__bridge id)kSecAttrAccessGroup] = ag;
-            id acc = d[(__bridge id)kSecAttrAccessible];
-            if (acc) a[(__bridge id)kSecAttrAccessible] = acc;
-            OSStatus s2 = orig_SecItemAdd((__bridge CFDictionaryRef)a, NULL);
-            if (s2 == errSecSuccess || s2 == errSecDuplicateItem) added++;
-            else failed++;
-        }
-        CFRelease(all);
-
-        kcDumpLine([NSString stringWithFormat:@"[MIGRATE2] fpx=%@ keys=%lu purged=%d added=%d skipped=%d failed=%d",
-                    fpx(), (unsigned long)best.count, purged, added, skipped, failed]);
-
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv5"),
-                                 kCFBooleanTrue, kCFPreferencesCurrentApplication);
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcadopt"),
-                                 kCFBooleanTrue, kCFPreferencesCurrentApplication);
-        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
-    } @catch (id e) {}
-}
-
-static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
-    if (!orig_SecItemAdd) return errSecParam;
-    // 非登录票据：原样透传
-    if (!kcBaiduIDDict((__bridge NSDictionary *)attrs)) {
-        OSStatus st0 = orig_SecItemAdd(attrs, result);
-        if (st0 == errSecSuccess) kcRemember((__bridge NSDictionary *)attrs);
-        if (attrs && kcPayNS((__bridge NSDictionary *)attrs))
-            kcLogPay("ADD-PASS", (__bridge NSDictionary *)attrs, st0);
-        return st0;
-    }
-    @try {
-        CFDictionaryRef ra = kcRewrite(attrs);
-        if (ra) {
-            OSStatus st = orig_SecItemAdd(ra, result);
-            CFRelease(ra);
-            return st;
-        }
-    } @catch (id e) {}
-    return orig_SecItemAdd(attrs, result);
-}
-
-static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    if (!orig_SecItemCopyMatching) return errSecParam;
-    BOOL ident = query && kcBaiduIDDict((__bridge NSDictionary *)query);
-    if (!ident) {
-        OSStatus st0 = orig_SecItemCopyMatching(query, result);
-        if (query && kcPayNS((__bridge NSDictionary *)query))
-            kcLogPay("GET-PASS", (__bridge NSDictionary *)query, st0);
-        if (st0 == errSecSuccess && result && *result) {
-            @try {
-                CFTypeRef f = kcFilterLoginShared(*result);
-                *result = f;
-                if (!f) return errSecItemNotFound;
-            } @catch (id e) {}
-        }
-        return st0;
-    }
-    @try {
-        CFDictionaryRef rq = kcRewrite(query);
-        OSStatus st = rq ? orig_SecItemCopyMatching(rq, result)
-                         : orig_SecItemCopyMatching(query, result);
-        if (rq) CFRelease(rq);
-        // v73F: 不再回退共享域。私有域就是唯一来源，读不到即未登录，
-        // 但迁移做了兜底，正常情况下登录态不会丢。
-        if (st != errSecSuccess) return st;
-        if (result && *result) {
-            CFTypeRef f = kcFilterLoginShared(*result);
-            *result = f;
-            if (!f) return errSecItemNotFound;
-        }
-        return st;
-    } @catch (id e) {}
-    return orig_SecItemCopyMatching(query, result);
-}
-
-static OSStatus hook_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef toUpdate) {
-    if (!orig_SecItemUpdate) return errSecParam;
-    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
-        return orig_SecItemUpdate(query, toUpdate);
-    }
-    @try {
-        NSDictionary *q = (__bridge NSDictionary *)query;
-        CFDictionaryRef rq = kcRewrite(query);
-        if (!rq) return orig_SecItemUpdate(query, toUpdate);
-        // attributesToUpdate 里若也带 service/account，必须同步加后缀，
-        // 否则更新后条目会「跑」回共享域
-        CFDictionaryRef ru = kcRewrite(toUpdate);
-        OSStatus st = orig_SecItemUpdate(rq, ru ? ru : toUpdate);
-        if (ru) CFRelease(ru);
-        CFRelease(rq);
-        return st;
-    } @catch (id e) {}
-    return orig_SecItemUpdate(query, toUpdate);
-}
-
-static OSStatus hook_SecItemDelete(CFDictionaryRef query) {
-    if (!orig_SecItemDelete) return errSecParam;
-    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
-        // 共享登录组：只允许删本 clone 写过的条目，避免把官方/其他 clone 的登录态删掉
-        @try {
-            NSDictionary *q = (__bridge NSDictionary *)query;
-            if (kcShareLoginItem(q) && !kcIsOwned(q)) return errSecSuccess;
-        } @catch (id e) {}
-        return orig_SecItemDelete(query);
-    }
-    @try {
-        NSDictionary *q = (__bridge NSDictionary *)query;
-
-        CFDictionaryRef rq = kcRewrite(query);
-        if (!rq) return orig_SecItemDelete(query);
-        OSStatus st = orig_SecItemDelete(rq);
-        CFRelease(rq);
-        return st;
-    } @catch (id e) {}
-    return orig_SecItemDelete(query);
-}
-
-
-// ============================================================
-// v62F: 收银台网络只读观测（不改任何报文）
-// ============================================================
-#include <stdarg.h>
-
-static NSString *pnLogPath(void) {
-    static NSString *p = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                            NSUserDomainMask, YES) firstObject];
-        if (dir.length) p = [dir stringByAppendingPathComponent:@"bd_pay.log"];
-    });
-    return p;
-}
-
-static void pnLog(NSString *fmt, ...) {
-    @try {
-        NSString *p = pnLogPath();
-        if (p.length == 0) return;
-        va_list ap;
-        va_start(ap, fmt);
-        NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
-        va_end(ap);
-        if (body.length == 0) return;
-        NSDateFormatter *df = [NSDateFormatter new];
-        df.dateFormat = @"HH:mm:ss.SSS";
-        NSString *line = [NSString stringWithFormat:@"\n[%@] %@", [df stringFromDate:[NSDate date]], body];
-        FILE *f = fopen(p.UTF8String, "a");
-        if (!f) return;
-        fputs(line.UTF8String, f);
-        fclose(f);
-    } @catch (id e) {}
-}
-
-static NSString *pnBodyStr(id data) {
-    if (![data isKindOfClass:[NSData class]]) return @"-";
-    NSData *d = (NSData *)data;
-    if (d.length == 0) return @"<empty>";
-    NSData *sub = d.length > 3000 ? [d subdataWithRange:NSMakeRange(0, 3000)] : d;
-    NSString *t = [[NSString alloc] initWithData:sub encoding:NSUTF8StringEncoding];
-    if (!t) return [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)d.length];
-    return d.length > 3000 ? [t stringByAppendingString:@"…(truncated)"] : t;
-}
-
-static BOOL pnInteresting(NSURL *u) {
-    if (!u) return NO;
-    NSString *h = u.host.lowercaseString ?: @"";
-    NSString *path = u.path.lowercaseString ?: @"";
-    if ([h containsString:@"dxmpay"] || [h containsString:@"duxiaoman"] ||
-        [h containsString:@"dxmjuhe"] || [h containsString:@"paydxm"] ||
-        [h containsString:@"dxmstatic"] || [h containsString:@"dxmbaoxian"]) return YES;
-    if ([path containsString:@"orders/create"] || [path containsString:@"order/create"] ||
-        [path containsString:@"cashier"] || [path containsString:@"cashdesk"]) return YES;
-    return NO;
-}
-
-// delegate 型响应体暂存
-static NSMutableDictionary *pnTaskBuf(void) {
+// ---- v69: delegate 型响应体收集（per-task 缓存）----
+static NSMutableDictionary *diagTaskData(void) {
     static NSMutableDictionary *d = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ d = [NSMutableDictionary new]; });
     return d;
 }
 
-static NSString *pnTaskKey(NSURLSessionTask *t) {
-    return [NSString stringWithFormat:@"%p-%lu", (void *)t, (unsigned long)t.taskIdentifier];
-}
-
-static void pnSwizzleDelegate(id dg) {
-    if (!dg) return;
+// 对 delegate 类做一次性 swizzle（记录响应体）
+static void diagSwizzleNetDelegate(id d) {
+    if (!d) return;
     @try {
-        Class c = object_getClass(dg);
+        Class c = object_getClass(d);
         static NSMutableSet *done = nil;
         static dispatch_once_t once;
         dispatch_once(&once, ^{ done = [NSMutableSet new]; });
@@ -1603,357 +3174,765 @@ static void pnSwizzleDelegate(id dg) {
             if ([done containsObject:ck]) return;
             [done addObject:ck];
         }
+        diagAppend([NSString stringWithFormat:@"\n[%@] SWIZZLE-DELEG %@\n", [NSDate date], ck]);
         SEL s1 = @selector(URLSession:dataTask:didReceiveData:);
         SEL s2 = @selector(URLSession:task:didCompleteWithError:);
         Method m1 = class_getInstanceMethod(c, s1);
         Method m2 = class_getInstanceMethod(c, s2);
         if (m1) {
             IMP orig = method_getImplementation(m1);
-            IMP imp = imp_implementationWithBlock(^void(id me, NSURLSession *se, NSURLSessionDataTask *task, NSData *data) {
-                @try {
-                    if (task && data.length) {
-                        NSString *k = pnTaskKey(task);
-                        @synchronized (pnTaskBuf()) {
-                            NSMutableData *b = pnTaskBuf()[k];
-                            if (!b) { b = [NSMutableData data]; pnTaskBuf()[k] = b; }
-                            [b appendData:data];
+            IMP imp = imp_implementationWithBlock(
+                ^(id selfdg, NSURLSession *session, NSURLSessionDataTask *task, NSData *data) {
+                    @try {
+                        if (task && data.length) {
+                            NSString *tid = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+                            // ★ v88 ★P0★ 原实现 [[dict objectForKey:tid] appendData:data]：
+                            //   缓冲区从未创建，objectForKey 返回 nil，[nil appendData:] 静默无操作
+                            //   → 640 条 delegate 响应正文全部丢失，下单回包「人数过多」的原因看不到。
+                            @synchronized (diagTaskData()) {
+                                NSMutableData *buf = [diagTaskData() objectForKey:tid];
+                                if (!buf) {
+                                    buf = [NSMutableData data];
+                                    [diagTaskData() setObject:buf forKey:tid];
+                                }
+                                [buf appendData:data];
+                            }
                         }
-                    }
-                } @catch (id e) {}
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))orig)(me, s1, se, task, data);
-            });
+                    } @catch (id e) {}
+                    ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))orig)(
+                        selfdg, s1, session, task, data);
+                });
             method_setImplementation(m1, imp);
         }
         if (m2) {
             IMP orig = method_getImplementation(m2);
-            IMP imp = imp_implementationWithBlock(^void(id me, NSURLSession *se, NSURLSessionTask *task, NSError *err) {
-                @try {
-                    if (task) {
-                        NSURLRequest *req = task.originalRequest ?: task.currentRequest;
-                        if (pnInteresting(req.URL)) {
-                            NSHTTPURLResponse *r = (NSHTTPURLResponse *)task.response;
-                            NSString *k = pnTaskKey(task);
-                            NSData *acc = nil;
-                            @synchronized (pnTaskBuf()) {
-                                acc = pnTaskBuf()[k];
-                                [pnTaskBuf() removeObjectForKey:k];
+            IMP imp = imp_implementationWithBlock(
+                ^(id selfdg, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+                    @try {
+                        if (task) {
+                            NSURLRequest *req = task.originalRequest ?: task.currentRequest;
+                            NSHTTPURLResponse *resp = (NSHTTPURLResponse *)task.response;
+                            // v73: 失败任务必须留痕（resp 非 HTTP 或为空 = 连接层错误）
+                            if (error) diagDumpError(req, error, @"DELEG");
+                            NSString *tid = [NSString stringWithFormat:@"%lu", (unsigned long)task.taskIdentifier];
+                            NSData *acc = [diagTaskData() objectForKey:tid];
+                            [diagTaskData() removeObjectForKey:tid];
+                            if (req) diagDumpRequest(req, @"DELEG-REQ");
+                            if (resp && [resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]
+                                && diagInteresting(resp.URL)) {
+                                NSMutableString *m = [NSMutableString stringWithFormat:@"\n[%@] DELEG-RESP %ld %@\n",
+                                                      [NSDate date], (long)resp.statusCode, resp.URL.absoluteString];
+                                if (acc) {
+                                    NSData *d2 = acc.length > 8000 ? [acc subdataWithRange:NSMakeRange(0, 8000)] : acc;
+                                    NSString *bs = [[NSString alloc] initWithData:d2 encoding:NSUTF8StringEncoding];
+                                    if (!bs) bs = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)acc.length];
+                                    [m appendFormat:@"  BODY: %@\n", bs];
+                                }
+                                diagAppend(m);
                             }
-                            pnLog(@"[D-RESP] %ld %@ %@\n  REQ: %@ %@\n  ERR: %@\n  BODY: %@",
-                                  (long)r.statusCode, req.HTTPMethod, req.URL.absoluteString,
-                                  req.HTTPMethod, req.URL.absoluteString,
-                                  err.localizedDescription ?: @"-", pnBodyStr(acc));
                         }
-                    }
-                } @catch (id e) {}
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))orig)(me, s2, se, task, err);
-            });
+                    } @catch (id e) {}
+                    ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))orig)(
+                        selfdg, s2, session, task, error);
+                });
             method_setImplementation(m2, imp);
         }
     } @catch (id e) {}
 }
 
-static void pnInstall(void) {
+// v74: 登录通道盲区补漏 —— 三次抓包（v1/v3/v4）里「获取验证码」没有产生
+// 任何 NSURLSession 任务，但美团账号 SDK（SAKNetworkRequestOperation /
+// SAKURLDelegate）与 csec 安全 SDK 都引用了 NSURLConnection、NSURLProtocol，
+// 且主二进制里有 CFReadStream 系直连符号。因此在 Session 之外再罩一层：
+//   NSURLConnection 四个入口 + NSURLProtocol 初始化（所有走 URL 加载系统的
+//   请求最后都会过 NSURLProtocol，是最靠后的兜底观测点）。
+// 纯观测：只写日志，不改请求（不影响签名/行为）。
+static void diagDumpConnRequest(NSURLRequest *req, NSString *tag) {
+    if (!req) return;
+    // 与 REQ 日志同一套排除法（静态资源/CDN 不记），否则 PROTO 兜底层
+    // 会把图片/CDN 流量全写进来，3MB 上限几分钟就挤满
+    if (!diagInteresting(req.URL)) return;
     @try {
-        pnLog(@"\n===== v62F PAY-NET OBSERVER INSTALLED =====");
-        Class se = objc_getClass("NSURLSession");
-        if (se) {
-            // 1) completionHandler 型
-            SEL s1 = @selector(dataTaskWithRequest:completionHandler:);
-            Method m1 = class_getInstanceMethod(se, s1);
-            if (m1) {
-                IMP orig = method_getImplementation(m1);
-                IMP imp = imp_implementationWithBlock(
-                    ^NSURLSessionDataTask *(id me, NSURLRequest *req,
-                                            void (^cb)(NSData *, NSURLResponse *, NSError *)) {
-                        if (!pnInteresting(req.URL)) {
-                            return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(me, s1, req, cb);
-                        }
-                        @try {
-                            pnLog(@"[C-REQ] %@ %@\n  HDR: %@\n  BODY: %@",
-                                  req.HTTPMethod, req.URL.absoluteString,
-                                  req.allHTTPHeaderFields, pnBodyStr(req.HTTPBody));
-                        } @catch (id e) {}
-                        void (^wrap)(NSData *, NSURLResponse *, NSError *) =
-                        ^(NSData *data, NSURLResponse *resp, NSError *err) {
-                            @try {
-                                NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
-                                pnLog(@"[C-RESP] %ld %@\n  ERR: %@\n  BODY: %@",
-                                      (long)code, req.URL.absoluteString,
-                                      err.localizedDescription ?: @"-", pnBodyStr(data));
-                            } @catch (id e) {}
-                            if (cb) cb(data, resp, err);
-                        };
-                        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(me, s1, req, wrap);
-                    });
-                method_setImplementation(m1, imp);
-            }
-            // 2) 取 session 时挂上 delegate 观测
-            SEL s2 = @selector(sessionWithConfiguration:delegate:delegateQueue:);
-            Method m2 = class_getClassMethod(se, s2);
-            if (m2) {
-                IMP orig = method_getImplementation(m2);
-                IMP imp = imp_implementationWithBlock(
-                    ^NSURLSession *(id cls, NSURLSessionConfiguration *cfg, id dg, NSOperationQueue *q) {
-                        pnSwizzleDelegate(dg);
-                        return ((NSURLSession *(*)(id, SEL, NSURLSessionConfiguration *, id, id))orig)(cls, s2, cfg, dg, q);
-                    });
-                method_setImplementation(m2, imp);
-            }
-            SEL s3 = @selector(initWithConfiguration:delegate:delegateQueue:);
-            Method m3 = class_getInstanceMethod(se, s3);
-            if (m3) {
-                IMP orig = method_getImplementation(m3);
-                IMP imp = imp_implementationWithBlock(
-                    ^id(id me, NSURLSessionConfiguration *cfg, id dg, NSOperationQueue *q) {
-                        pnSwizzleDelegate(dg);
-                        return ((id (*)(id, SEL, NSURLSessionConfiguration *, id, id))orig)(me, s3, cfg, dg, q);
-                    });
-                method_setImplementation(m3, imp);
-            }
-        }
-        // 3) WKWebView 导航（收银台若是 H5）
-        Class wv = objc_getClass("WKWebView");
-        if (wv) {
-            SEL s4 = @selector(loadRequest:);
-            Method m4 = class_getInstanceMethod(wv, s4);
-            if (m4) {
-                IMP orig = method_getImplementation(m4);
-                IMP imp = imp_implementationWithBlock(^id(id me, NSURLRequest *req) {
-                    @try {
-                        if (pnInteresting(req.URL)) {
-                            pnLog(@"[WEBVIEW] %@ %@", req.HTTPMethod ?: @"GET", req.URL.absoluteString);
-                        }
-                    } @catch (id e) {}
-                    return ((id (*)(id, SEL, NSURLRequest *))orig)(me, s4, req);
-                });
-                method_setImplementation(m4, imp);
-            }
-        }
-        pnLog(@"===== observer hooks ready =====");
-    } @catch (id e) {
-        pnLog(@"observer install error: %@", e);
-    }
+        diagAppend([NSString stringWithFormat:@"\n[%@] %@ %@\n  URL: %@\n",
+                    [NSDate date], tag, req.HTTPMethod ?: @"GET",
+                    req.URL.absoluteString ?: @"?"]);
+    } @catch (id e) {}
 }
 
 // ============================================================
-// Constructor — v57 结构：简单清理 + 只 hook 主程序
+// v77: 已安装应用枚举过滤 ★多开检测核心★
+//
+// 百度主二进制引用了 LSApplicationWorkspace（私有框架 MobileCoreServices）。
+// 通过 -allInstalledApplications 可以拿到本机**全部** App 的 bundle id ——
+// 我们的克隆是 com.baidu.BaiduMobile.BdD1 … .BdD10 / .BdE1 … .BdE10 /
+// .BdT1 …，一眼就是「同一台机装了 20+ 个百度多开」。
+// 服务端拿到这份名单 → 直接判定设备多开 → 整机拉黑（连原版一起）。
+//
+// 这个信号完美解释「新克隆第一天能下单、隔天全灭」：名单是静态的，
+// 首次上报可能随日活/结算批次走，过夜后才被风控消化。
+//
+// 处理：枚举结果里剔掉所有 com.baidu.BaiduMobile.<后缀> 克隆，
+// 只保留官方原版 com.baidu.BaiduMobile（如果装了）与系统 App。
+// 不伪造 bundleIdentifier 本身，避免 v60 那种 NSBundle 递归风险。
 // ============================================================
+static BOOL isOurCloneBundleID(NSString *bid) {
+    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) return NO;
+    if ([bid isEqualToString:@"com.baidu.BaiduMobile"]) return NO;   // 官方原版保留
+    return [bid hasPrefix:@"com.baidu.BaiduMobile."];
+}
+
+// ★ v94 ★P0★ 设备指纹层：整条百度家族从枚举结果里剔除。
+//
+// v77 只剔掉了 clone 自己（com.baidu.BaiduMobile.BdDx），却**保留了官方
+// 原版 com.baidu.BaiduMobile** 以及 com.baidu.map / netdisk / tieba 等
+// 全家桶。后果是致命的：
+//
+//   同一台物理机上，clone 上报的 App 列表
+//   = 官方原版上报的 App 列表（一个不差）
+//   → 服务端拿这份名单一比，立刻确认「同一台设备」
+//   → cuid / imei / devuid / idfv / 机型 改多少遍都没用
+//
+// 这也解释了 2026-11-03 的实测：官方 App 与 v71/v93 clone 全部 3523
+// —— 因为三者的设备指纹本来就是同一份。
+//
+// v94 起：凡 com.baidu.* / com.baidubce.* 一律不出现在枚举结果里。
+// 服务端看到的是一台「只装了当前这一个 App」的干净设备。
+// 副作用：App 内跳转百度地图/网盘的一键唤起会失效（可接受）。
+static BOOL isBaiduFamilyApp(NSString *bid) {
+    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) return NO;
+    static NSArray *prefixes = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        prefixes = @[@"com.baidu.", @"com.baidubce.", @"com.baidu.BaiduMobile"];
+    });
+    for (NSString *p in prefixes) {
+        if ([bid hasPrefix:p]) return YES;
+    }
+    return NO;
+}
+
+static NSArray *filterCloneApps(NSArray *arr) {
+    if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return arr;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    NSUInteger baiduHidden = 0;
+    for (id app in arr) {
+        NSString *bid = nil;
+        @try { bid = [app valueForKey:@"bundleIdentifier"]; } @catch (id e) {}
+        if (isBaiduFamilyApp(bid)) { baiduHidden++; continue; }   // v94: 整个百度家族
+        [out addObject:app];
+    }
+    if (!g_appsDiagLogged) {
+        g_appsDiagLogged = YES;
+        @try {
+            diagAppend([NSString stringWithFormat:
+                @"\n[APPS] installed=%lu afterFilter=%lu baiduHidden=%lu\n",
+                (unsigned long)arr.count, (unsigned long)out.count,
+                (unsigned long)baiduHidden]);
+            // v95: 完整名单落盘 —— v94 只剔了百度系，非百度 App（微信/支付宝/
+            //   淘宝…）仍与官方原版完全相同，依然是设备锚点。这份名单要看清。
+            @try {
+                NSMutableArray *bids = [NSMutableArray array];
+                for (id app in out) {
+                    NSString *b = nil;
+                    @try { b = [app valueForKey:@"bundleIdentifier"]; } @catch (id e2) {}
+                    if (b.length) [bids addObject:b];
+                }
+                diagAppend([NSString stringWithFormat:@"[APPS-LIST] %@\n",
+                            [bids componentsJoinedByString:@", "]]);
+            } @catch (id e3) {}
+        } @catch (id e) {}
+    }
+    return (out.count == arr.count) ? arr : out;
+}
+
+// ============================================================
+// ★ v89 ★P0★ 身份轮换（Identity Epoch）
+//
+// 背景（2026-11-02 实测）：
+//   v83/v84 把全链路 cuid 统一成 CC558E35…，但那是**沿用**早已存在的
+//   旧假值。这个值在本机已经跑了大量失败下单，服务端对
+//   duxiaodian.baidu.com/api/trade/v2.0/orders/create 的判定是
+//   {"errno":3523,"errmsg":"当前下单人数过多，请稍后再试"}。
+//   confirm / calculateInit 全 errno=0、库存 150 正常，说明不是库存、
+//   不是账号、不是支付，而是 create 这一层的设备风险门。
+//
+//   一个被判定过的 cuid 再怎么"保持一致性"也还是那个被判定过的 cuid。
+//   所以这里做一次**整套身份轮换**：换新值，而不是修旧值。
+//
+// 轮换范围（只换我们自己生成的假身份，不碰登录票据）：
+//   BdD1.ck.*   —— CUID51 / BAIDUID / tcuid / DVIF / AB_* / FUID / ZFY …
+//   BdD1.iv     —— IDFV
+//   BdD1.ai     —— IDFA
+// 保留：
+//   BdD1.real.* —— 真机原值，出口消毒仍需要它
+//   BdD1.dn2    —— 设备名，与身份无关
+//   BdD1.bo     —— 开机偏移
+//   BDUSS/STOKEN 等登录 Cookie —— 不清，避免强迫重新登录
+//
+// 用 BdD1.epoch 做幂等：只在版本号变化时轮换一次，之后稳定不变
+// （同一"设备"多次启动必须是同一个身份，否则又制造新的不一致）。
+// ============================================================
+#define IDENTITY_EPOCH @"2"
+
+static void rotateIdentityIfNeeded(void) {
+    @try {
+        CFStringRef epKey = CFSTR("BdD1.epoch");
+        CFPropertyListRef epVal = CFPreferencesCopyAppValue(epKey, kCFPreferencesCurrentApplication);
+        NSString *ep = nil;
+        if (epVal) {
+            if (CFGetTypeID(epVal) == CFStringGetTypeID()) ep = (__bridge NSString *)epVal;
+            CFRelease(epVal);
+        }
+        if (ep && [ep isEqualToString:IDENTITY_EPOCH]) return;   // 已轮换过
+
+        CFArrayRef keys = CFPreferencesCopyKeyList(kCFPreferencesCurrentApplication,
+                                                   kCFPreferencesCurrentUser,
+                                                   kCFPreferencesAnyHost);
+        NSUInteger removed = 0;
+        if (keys) {
+            CFIndex n = CFArrayGetCount(keys);
+            for (CFIndex i = 0; i < n; i++) {
+                CFStringRef k = (CFStringRef)CFArrayGetValueAtIndex(keys, i);
+                if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+                NSString *key = (__bridge NSString *)k;
+                BOOL drop = NO;
+                if ([key hasPrefix:@"BdD1.ck."]) drop = YES;
+                if ([key isEqualToString:@"BdD1.iv"] || [key isEqualToString:@"BdD1.ai"]) drop = YES;
+                if (drop) {
+                    // 置 NULL 即删除该键
+                    CFPreferencesSetAppValue(k, NULL, kCFPreferencesCurrentApplication);
+                    removed++;
+                }
+            }
+            CFRelease(keys);
+        }
+
+        // 服务端下发的设备 Cookie 一并清掉（保留登录票据），
+        // 否则旧的 BAIDUID/BAIDUCUID 会继续顶在 Cookie 头上。
+        NSInteger kept = 0;
+        @try {
+            NSHTTPCookieStorage *st = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+            for (NSHTTPCookie *c in [[st cookies] copy]) {
+                NSString *nm = c.name ?: @"";
+                BOOL isLogin = [nm isEqualToString:@"BDUSS"] || [nm isEqualToString:@"BDUSS_BFESS"]
+                            || [nm isEqualToString:@"STOKEN"] || [nm isEqualToString:@"PTOKEN"]
+                            || [nm isEqualToString:@"PToken"];
+                if (isLogin) { kept++; continue; }
+                [st deleteCookie:c];
+            }
+        } @catch (id e) {}
+
+        CFPreferencesSetAppValue(epKey, (__bridge CFStringRef)IDENTITY_EPOCH,
+                                 kCFPreferencesCurrentApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+
+        @try {
+            diagAppend([NSString stringWithFormat:
+                @"\n[EPOCH] rotated -> %@ (dropped %lu identity keys, kept %ld login cookies)\n",
+                IDENTITY_EPOCH, (unsigned long)removed, (long)kept]);
+        } @catch (id e) {}
+    } @catch (id e) {}
+}
+
+// ============================================================
+// Constructor — v58
+// ============================================================
+// v72: UIPasteboard 私有化 —— 保存 pasteboardWithNamespace: 原始 IMP + 防自递归标记
+static IMP g_origPBNamespace = NULL;
+static IMP g_origPWName = NULL;
+static BOOL g_inPBCall = NO;
+
 __attribute__((constructor))
 static void initPrivacyHook(void) {
     @autoreleasepool {
 
-        // ---- 0. 诊断标记：确认本 dylib 版本已启用 keychain 隔离 ----
-        //   NSUserDefaults 里能看到 BdFn.kcv = 1
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv"),
-                                 (__bridge CFStringRef)@"1",
-                                 kCFPreferencesCurrentApplication);
-        // v61F 标记：度小满 keychain 直通版
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcp"),
-                                 (__bridge CFStringRef)@"1",
-                                 kCFPreferencesCurrentApplication);
-        // v69F 标记：keychain 全透传 + owned 白名单过滤共享登录组
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kco"),
-                                 (__bridge CFStringRef)@"1",
-                                 kCFPreferencesCurrentApplication);
+        // ---- 0. v63: 先把克隆标签算好，再装任何 hook ----
+        // cloneTag() 会被 initWithSuiteName / CFPreferences / keychain 各处
+        // 在很深的调用栈上（甚至初始化过程中）触发。此刻尚未安装任何
+        // hook，NSBundle 读取路径最干净，提前固定下来可彻底避免
+        // 「惰性计算 → 重入 → 递归爆栈」这一类风险。
+        // v74: 同时把「克隆真实 bundle id」固定下来 —— 包标识伪装装上之后
+        //      NSBundle 读到的就是官方包名了，出口消毒必须用这个快照值。
+        g_cloneBundleID = [realBundleIdentifier() copy];
+        (void)cloneTag();
 
-        // ---- 0. 预计算内核级伪装值 (C 字符串) ----
-        NSString *fakeSV = getFakeSystemVersion();
-        NSString *fakeBuild = versionToBuild(fakeSV);
-        NSString *fakeMachine = getPersistent(FKEY(@"hw"), ^{ return versionToMachine(fakeSV); });
-        NSString *fakeDarwin = versionToDarwinRelease(fakeSV);
+        // ---- 0a. v89: 身份轮换（必须早于任何 getFakeID 调用）----
+        rotateIdentityIfNeeded();
 
-        NSString *persistedMachine = fakeMachine;
-        NSString *memStr = getPersistent(FKEY(@"mem"), ^{
-            return [NSString stringWithFormat:@"%llu", machineToMemSize(persistedMachine)];
-        });
-        uint64_t fakeMem = [memStr longLongValue];
-
-        strlcpy(g_fakeMachine, [fakeMachine UTF8String], sizeof(g_fakeMachine));
-        strlcpy(g_fakeBuild, [fakeBuild UTF8String], sizeof(g_fakeBuild));
-        strlcpy(g_fakeOSVersion, [fakeSV UTF8String], sizeof(g_fakeOSVersion));
-        strlcpy(g_fakeDarwinRel, [fakeDarwin UTF8String], sizeof(g_fakeDarwinRel));
-        g_fakeMemSize = fakeMem;
-
-        // ---- 1. v57 简单清理：Cookie storage + Keychain ----
+        // ---- 0a2. v96: 延迟枚举安全/指纹类（放后台，不阻塞启动）----
         @try {
-            CFPropertyListRef cleared = CFPreferencesCopyAppValue((__bridge CFStringRef)FKEY(@"reset"), kCFPreferencesCurrentApplication);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                v96DumpSecurityClasses();
+            });
+        } @catch (id e) {}
+
+        // ---- 0b. v77: 设备聚类偏移量（必须在装 hook 之前算好）----
+        // 每个克隆一组持久化随机值：开机时刻偏移 + 磁盘容量偏移。
+        // 同克隆重启/升级都是同一组值（伪造的「设备」保持稳定）；
+        // 不同克隆之间互不相同（服务端无法据此串联）。
+        @try {
+            g_bootOffset = [getPersistent(@"BdD1.bo", ^{
+                return [NSString stringWithFormat:@"%lld",
+                        (long long)(3600 + arc4random_uniform(6 * 86400))];
+            }) longLongValue];
+            // v78 ★撤销★ 磁盘容量伪装。
+            //   v77 只改了 NSFileManager 的 NSFileSystemSize，但主二进制
+            //   同时导入了 _statfs / _statvfs —— 一条系统调用就读到真容量。
+            //   结果是同机两条通道给出两个答案，属于自曝篡改。
+            //   而磁盘容量的聚类价值很低（同型号同容量机器成千上万），
+            //   收益远小于矛盾风险 → 回到透传真值，保持全通道自洽。
+            //   （若要重启此功能，必须同时 hook statfs/statvfs 并保证
+            //     与 NSFileManager 只扣减一次，不能两层各扣一遍。）
+            g_diskDelta = 0;
+
+            // v81: 统一假主机名 —— ObjC 侧（NSProcessInfo.hostName /
+            //   UIDevice.name / MG DeviceName）与 C 侧（gethostname /
+            //   uname.nodename / sysctl kern.hostname）共用同一份持久化值。
+            @try {
+                NSString *dn = getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
+                const char *u = dn.length ? [dn UTF8String] : NULL;
+                if (u && u[0]) strlcpy(g_fakeHost, u, sizeof(g_fakeHost));
+            } @catch (id e) {}
+            if (!g_fakeHost[0]) strlcpy(g_fakeHost, "iPhone", sizeof(g_fakeHost));
+
+            // v83 ★P0★ 身份统一：启动即把所有历史 cuid 校准为同一假值
+            normalizeIdentityPrefs();
+        } @catch (id e) {}
+
+        // ---- 1. v59: 首启只清 Cookie ----
+        // ★ 教训：此前这里 SecItemDelete 删「所有类别」的 keychain 项，
+        //   而 keychain 访问组是所有克隆共享的 → 装/开一个克隆会把
+        //   原版 App 和其他克隆的登录票据一起删掉（D2 一开 D1 就异常）。
+        //   v59 起所有 keychain 项都带克隆后缀，历史无后缀项对本克隆
+        //   天然不可见，已无需全量清理。
+        @try {
+            CFPropertyListRef cleared = CFPreferencesCopyAppValue(CFSTR("BdD1.reset"), kCFPreferencesCurrentApplication);
             if (!cleared) {
-                // 1a. 清除 Cookie storage
                 NSHTTPCookieStorage *storage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                 for (NSHTTPCookie *cookie in [storage cookies]) {
                     [storage deleteCookie:cookie];
                 }
-
-                // 1b. v60F: 不再做全类别 SecItemDelete
-                //   keychain 条目在同一 access group 内物理共享，
-                //   「按 class 全删」会连带清掉官方 App 与其他 clone 的登录态。
-                //   新命名空间（service/account 追加 .BdFn 后缀）天然为空，无需清理；
-                //   旧的无后缀条目由读路径按「身份类不回退」拦截。
-
-                // 1c. 设标记
-                CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+                CFPreferencesSetAppValue(CFSTR("BdD1.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
                 CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
             } else { CFRelease(cleared); }
         } @catch (id e) {
-            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+            CFPreferencesSetAppValue(CFSTR("BdD1.reset"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         }
 
-        // ---- 1z. v78F: App Group 容器隔离 ----
-        @try {
-            Class fmc = objc_getClass("NSFileManager");
-            if (fmc) {
-                SEL gs = @selector(containerURLForSecurityApplicationGroupIdentifier:);
-                Method gm = class_getInstanceMethod(fmc, gs);
-                if (gm) {
-                    g_origGroupURL = method_getImplementation(gm);
-                    class_replaceMethod(fmc, gs, (IMP)hook_groupContainerURL,
-                                        method_getTypeEncoding(gm));
-                }
-            }
-        } @catch (id e) {}
-
-        // ---- 2. UIDevice hooks ----
+        // ---- 2. UIDevice hooks — v57N 全套人格对齐（Pro Max 自洽） ----
         @try {
             Class dc = objc_getClass("UIDevice");
             if (dc) {
                 Method nameM = class_getInstanceMethod(dc, @selector(name));
                 if (nameM) {
                     IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getPersistent(FKEY(@"dn"), ^{ return genDeviceName(); });
+                        return getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
                     });
                     class_replaceMethod(dc, @selector(name), imp, method_getTypeEncoding(nameM));
                 }
                 Method idfvM = class_getInstanceMethod(dc, @selector(identifierForVendor));
                 if (idfvM) {
+                    // v95: 替换前先把真 IDFV 落盘 —— 真值扫描要用它判断
+                    //   「发出去的报文里有没有本机 IDFV」。此时 hook 尚未生效，
+                    //   这里读到的就是系统真值；每次启动覆盖写一次，值恒定。
+                    @try {
+                        NSUUID *ru = [[UIDevice currentDevice] identifierForVendor];
+                        if (ru.UUIDString.length >= 20) {
+                            setPersistent(@"BdD1.real.idfv", ru.UUIDString);
+                        }
+                    } @catch (id e) {}
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(FKEY(@"iv"), ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdD1.iv", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(dc, @selector(identifierForVendor), imp, method_getTypeEncoding(idfvM));
                 }
-                Method lmM = class_getInstanceMethod(dc, @selector(localizedModel));
-                if (lmM) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
-                    class_replaceMethod(dc, @selector(localizedModel), imp, method_getTypeEncoding(lmM));
+                // 型号字串 — 必须与 sysctl hw.machine 一致
+                for (NSString *sel in @[@"model", @"localizedModel"]) {
+                    SEL sl = NSSelectorFromString(sel);
+                    Method m = class_getInstanceMethod(dc, sl);
+                    if (m) {
+                        IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                            return @"iPhone";
+                        });
+                        class_replaceMethod(dc, sl, imp, method_getTypeEncoding(m));
+                    }
                 }
-                Method modelM = class_getInstanceMethod(dc, @selector(model));
-                if (modelM) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) { return @"iPhone"; });
-                    class_replaceMethod(dc, @selector(model), imp, method_getTypeEncoding(modelM));
-                }
-                Method svM = class_getInstanceMethod(dc, @selector(systemVersion));
-                if (svM) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        return getFakeSystemVersion();
-                    });
-                    class_replaceMethod(dc, @selector(systemVersion), imp, method_getTypeEncoding(svM));
-                }
+                // v58: systemVersion 不再伪造 —— 真机系统版本全通道自洽
+                // （教训：XS 上假报 17.6.1 + 假大屏尺寸导致页面渲染异常）
             }
         } @catch (id e) {}
 
-        // ---- 3. NSProcessInfo hooks ----
+        // ---- 2b. v58: UIScreen hooks 全部移除 ----
+        // ★ 这是 XS 上「页面变大」的根因：强制所有设备返回 430x932/1284x2778，
+        //   XS 真实 375x812，布局按大屏算 → 内容溢出/过大。
+        //   硬件人格策略改为「跟真机」，屏幕永远真实。
+
+        // ---- 2c. v58: NSProcessInfo hooks 全部移除 ----
+        // 系统版本/内存返回真值，与 sysctl/UIDevice 全通道自洽。
+        // （v57S 的纯 C IMP 方案保留在历史版本，若需恢复见 git）
+
+        // ---- 2d. v59: App Group 容器隔离 ----
+        // entitlement: com.apple.security.application-groups = group.com.baidu.BaiduMobile
+        // → 所有克隆拿到同一个容器目录，文件级数据互相可见。
+        // 给返回 URL 追加克隆专属子目录，读写路径一致改写即实现物理隔离。
+        // ---- 2d. v61: App Group 容器隔离 —— 【已回退，重要】 ----
+        // v59 曾把 containerURLForSecurityApplicationGroupIdentifier 的返回值
+        // 追加克隆子目录，想隔离文件级共享数据。两个硬伤：
+        //   1) URLByAppendingPathComponent 只拼路径、**不建目录** —— App 拿到
+        //      之后直接写入会静默失败，共享数据全写不进去；
+        //   2) 就算把目录建出来，App 原本写在共享容器里的历史数据也全部不可见，
+        //      App 会当成全新环境重新初始化。
+        // 实测症状：原版 App 农场正常，克隆进去「原本能选榴莲，现在不给选」。
+        // 结论：App Group 容器是 App 自身读写依赖的目录，**不能整体重定向**；
+        // 设备身份与登录态的隔离交给 keychain 层（service 后缀）就够了。
+        // 原实现保留在 git 历史（v59/v60），需要时再取回。
+#if 0
         @try {
-            Class pi = objc_getClass("NSProcessInfo");
-            if (pi) {
-                Method osvM = class_getInstanceMethod(pi, @selector(operatingSystemVersion));
-                if (osvM) {
-                    IMP imp = imp_implementationWithBlock(^NSOperatingSystemVersion(id s) {
-                        return parseVersion(getFakeSystemVersion());
+            Class fmc = objc_getClass("NSFileManager");
+            if (fmc) {
+                SEL gsel = NSSelectorFromString(@"containerURLForSecurityApplicationGroupIdentifier:");
+                Method gm = class_getInstanceMethod(fmc, gsel);
+                if (gm) {
+                    orig_containerURL = (void *)method_getImplementation(gm);
+                    IMP imp = imp_implementationWithBlock(^NSURL *(id s, NSString *gid) {
+                        NSURL *u = orig_containerURL ? orig_containerURL(s, gsel, gid) : nil;
+                        if (!u) return nil;
+                        NSURL *sub = [u URLByAppendingPathComponent:cloneTag() isDirectory:YES];
+                        [[NSFileManager defaultManager] createDirectoryAtURL:sub
+                                                  withIntermediateDirectories:YES
+                                                                   attributes:nil error:nil];
+                        return sub;
                     });
-                    class_replaceMethod(pi, @selector(operatingSystemVersion), imp, method_getTypeEncoding(osvM));
-                }
-                Method osvsM = class_getInstanceMethod(pi, @selector(operatingSystemVersionString));
-                if (osvsM) {
-                    IMP imp = imp_implementationWithBlock(^NSString *(id s) {
-                        NSString *sv = getFakeSystemVersion();
-                        NSString *build = versionToBuild(sv);
-                        return [NSString stringWithFormat:@"Version %@ (Build %@)", sv, build];
-                    });
-                    class_replaceMethod(pi, @selector(operatingSystemVersionString), imp, method_getTypeEncoding(osvsM));
-                }
-                Method ialvM = class_getInstanceMethod(pi, @selector(isOperatingSystemAtLeastVersion:));
-                if (ialvM) {
-                    IMP imp = imp_implementationWithBlock(^BOOL(id s, NSOperatingSystemVersion v) {
-                        NSOperatingSystemVersion cur = parseVersion(getFakeSystemVersion());
-                        if (cur.majorVersion != v.majorVersion)
-                            return cur.majorVersion > v.majorVersion;
-                        if (cur.minorVersion != v.minorVersion)
-                            return cur.minorVersion > v.minorVersion;
-                        return cur.patchVersion >= v.patchVersion;
-                    });
-                    class_replaceMethod(pi, @selector(isOperatingSystemAtLeastVersion:), imp, method_getTypeEncoding(ialvM));
-                }
-                Method pmM = class_getInstanceMethod(pi, @selector(physicalMemory));
-                if (pmM) {
-                    IMP imp = imp_implementationWithBlock(^unsigned long long(id s) {
-                        return g_fakeMemSize;
-                    });
-                    class_replaceMethod(pi, @selector(physicalMemory), imp, method_getTypeEncoding(pmM));
-                }
-                Method pcM = class_getInstanceMethod(pi, @selector(processorCount));
-                if (pcM) {
-                    IMP imp = imp_implementationWithBlock(^NSUInteger(id s) { return 6; });
-                    class_replaceMethod(pi, @selector(processorCount), imp, method_getTypeEncoding(pcM));
-                }
-                Method apcM = class_getInstanceMethod(pi, @selector(activeProcessorCount));
-                if (apcM) {
-                    IMP imp = imp_implementationWithBlock(^NSUInteger(id s) { return 6; });
-                    class_replaceMethod(pi, @selector(activeProcessorCount), imp, method_getTypeEncoding(apcM));
+                    class_replaceMethod(fmc, gsel, imp, method_getTypeEncoding(gm));
                 }
             }
         } @catch (id e) {}
+#endif
 
-        // ---- 4. IDFA hook ----
+        // ---- 3. IDFA hook — 每克隆独立 ----
         @try {
             Class ac = objc_getClass("ASIdentifierManager");
             if (ac) {
                 Method m = class_getInstanceMethod(ac, @selector(advertisingIdentifier));
                 if (m) {
                     IMP imp = imp_implementationWithBlock(^NSUUID *(id s) {
-                        return [[NSUUID alloc] initWithUUIDString:getPersistent(FKEY(@"ai"), ^{ return genUUIDStr(); })];
+                        return [[NSUUID alloc] initWithUUIDString:getPersistent(@"BdD1.ai", ^{ return genUUIDStr(); })];
                     });
                     class_replaceMethod(ac, @selector(advertisingIdentifier), imp, method_getTypeEncoding(m));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 5. NSUserDefaults hooks ----
+        // ---- 3a-2. v77: 设备聚类信号 ★P0★ ----
+        // 四条同机完全一致、跨天稳定的信号，v72 之前一条都没堵：
+        //   1) systemUptime / kern.boottime —— 开机时刻精确到秒
+        //   2) NSProcessInfo.hostName       —— 真实设备名
+        //   3) 磁盘总容量                   —— 硬件属性
+        //   4) 已安装 App 枚举              —— 能直接列出所有 BdDx/BdEx 克隆
+        @try {
+            // 1) + 2) NSProcessInfo
+            Class pic = objc_getClass("NSProcessInfo");
+            if (pic) {
+                Method um = class_getInstanceMethod(pic, @selector(systemUptime));
+                if (um) {
+                    IMP ou = method_getImplementation(um);
+                    IMP iu = imp_implementationWithBlock(^NSTimeInterval(id s) {
+                        NSTimeInterval t = ((NSTimeInterval (*)(id, SEL))ou)(s, @selector(systemUptime));
+                        return t + (NSTimeInterval)g_bootOffset;
+                    });
+                    class_replaceMethod(pic, @selector(systemUptime), iu, method_getTypeEncoding(um));
+                }
+                Method hm = class_getInstanceMethod(pic, @selector(hostName));
+                if (hm) {
+                    IMP ih = imp_implementationWithBlock(^NSString *(id s) {
+                        NSString *n = getPersistent(@"BdD1.dn2", ^{ return genDeviceName(); });
+                        return n ?: @"iPhone";
+                    });
+                    class_replaceMethod(pic, @selector(hostName), ih, method_getTypeEncoding(hm));
+                }
+            }
+
+            // 3) 磁盘总容量（只改总量，不动可用空间 —— 避免影响 App 的空间判断）
+            Class fmc = objc_getClass("NSFileManager");
+            SEL fsel = @selector(attributesOfFileSystemForPath:error:);
+            Method fmm = class_getInstanceMethod(fmc, fsel);
+            if (fmm) {
+                IMP of = method_getImplementation(fmm);
+                IMP iff = imp_implementationWithBlock(^NSDictionary *(id s, NSString *path, NSError **err) {
+                    NSDictionary *d = ((NSDictionary *(*)(id, SEL, NSString *, NSError **))of)(s, fsel, path, err);
+                    if (!d || g_diskDelta <= 0) return d;
+                    NSNumber *sz = d[@"NSFileSystemSize"];
+                    if (![sz isKindOfClass:[NSNumber class]]) return d;
+                    long long nv = [sz longLongValue] - g_diskDelta;
+                    if (nv <= 0) return d;
+                    NSMutableDictionary *md = [d mutableCopy];
+                    md[@"NSFileSystemSize"] = @(nv);
+                    // v78: 可用空间同步下调同样的量 —— total 与 free 一起平移，
+                    //   已用空间 (total-free) 保持不变。只改 total 会让
+                    //   「已用 > 总量」或「可用 > 总量」出现在某些调用方眼里。
+                    NSNumber *fr = d[@"NSFileSystemFreeSize"];
+                    if ([fr isKindOfClass:[NSNumber class]]) {
+                        long long nf = [fr longLongValue] - g_diskDelta;
+                        if (nf > 0 && nf <= nv) md[@"NSFileSystemFreeSize"] = @(nf);
+                    }
+                    return md;
+                });
+                class_replaceMethod(fmc, fsel, iff, method_getTypeEncoding(fmm));
+            }
+
+            // 4) 已安装 App 枚举 —— 剔除所有 com.baidu.BaiduMobile.<克隆后缀>
+            Class lsw = objc_getClass("LSApplicationWorkspace");
+            if (!lsw) {
+                // 构造函数执行时该私有类可能尚未加载；MobileCoreServices 是
+                // 百度自己也会用的系统私有框架，主动加载不构成异常特征。
+                dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+                lsw = objc_getClass("LSApplicationWorkspace");
+            }
+            if (lsw) {
+                for (NSString *sn in @[@"allInstalledApplications",
+                                       @"allApplications",
+                                       @"installedApplications"]) {
+                    SEL sl = NSSelectorFromString(sn);
+                    Method m = class_getInstanceMethod(lsw, sl);
+                    if (!m) continue;
+                    IMP o = method_getImplementation(m);
+                    IMP imp = imp_implementationWithBlock(^NSArray *(id s) {
+                        NSArray *a = ((NSArray *(*)(id, SEL))o)(s, sl);
+                        return filterCloneApps(a);
+                    });
+                    class_replaceMethod(lsw, sl, imp, method_getTypeEncoding(m));
+                }
+                SEL qs = NSSelectorFromString(@"applicationsForBundleIdentifier:");
+                Method qm = class_getInstanceMethod(lsw, qs);
+                if (qm) {
+                    IMP oq = method_getImplementation(qm);
+                    IMP impq = imp_implementationWithBlock(^NSArray *(id s, NSString *bid) {
+                        if (isBaiduFamilyApp(bid)) return @[];   // v94
+                        return ((NSArray *(*)(id, SEL, NSString *))oq)(s, qs, bid);
+                    });
+                    class_replaceMethod(lsw, qs, impq, method_getTypeEncoding(qm));
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3a-3. v94: URL scheme 探测封堵 ★P0★ ----
+        // 枚举被过滤后还有一条绕路：-canOpenURL:。baidumap:// /
+        // baidunetdisk:// / baiduboxapp:// 任一返回 YES，等于直接告诉风控
+        // 「这台机器上装了百度全家桶」，结论与官方原版上报的完全一致。
+        // v77 只堵了 LSApplicationWorkspace，canOpenURL 在文件里 0 处覆盖。
+        // v94：百度系 scheme 一律 NO；其他 scheme 透传原实现。
+        @try {
+            Class uia = objc_getClass("UIApplication");
+            if (uia) {
+                SEL cs = @selector(canOpenURL:);
+                Method cm = class_getInstanceMethod(uia, cs);
+                if (cm) {
+                    IMP oc = method_getImplementation(cm);
+                    IMP ic = imp_implementationWithBlock(^BOOL(id s, NSURL *u) {
+                        if ([u isKindOfClass:[NSURL class]]) {
+                            NSString *sch = u.scheme.lowercaseString;
+                            if (sch.length && [sch hasPrefix:@"baidu"]) return NO;
+                        }
+                        return ((BOOL (*)(id, SEL, NSURL *))oc)(s, cs, u);
+                    });
+                    class_replaceMethod(uia, cs, ic, method_getTypeEncoding(cm));
+                    diagAppend(@"\n[SCHEME] canOpenURL hook on (baidu* -> NO)\n");
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3b. v72: UIPasteboard 克隆私有化 ★P0★ ----
+        // 审计：主二进制 UIPasteboard ×22，风控 SDK TalosPro 就在调。所有克隆
+        // 与原版共享同一物理剪贴板 → 风控写入的设备标识跨 App 串回真机。
+        // 做法：generalPasteboard 重定向到克隆专属 namespace（bdclone.general.<tag>）；
+        //       App 发起的 pasteboardWithNamespace: / pasteboardWithName:create:
+        //       名字追加克隆后缀（同克隆重启后名字稳定，App 内持久性不受影响；
+        //       与原版/其他克隆物理隔离）。
+        @try {
+            Class pbc = objc_getClass("UIPasteboard");
+            if (pbc) {
+                Class meta = object_getClass(pbc);
+                SEL pnSel = NSSelectorFromString(@"pasteboardWithNamespace:");
+                Method pnM = class_getInstanceMethod(meta, pnSel);
+                if (pnM) {
+                    g_origPBNamespace = method_getImplementation(pnM);
+                    IMP impPN = imp_implementationWithBlock(^UIPasteboard *(id s, NSString *ns) {
+                        if (!g_inPBCall && ns.length > 0 && ![ns hasPrefix:@"bdclone."]) {
+                            g_inPBCall = YES;
+                            @try {
+                                return ((UIPasteboard *(*)(id, SEL, NSString *))g_origPBNamespace)(
+                                    s, pnSel, [[@"bdclone." stringByAppendingString:ns]
+                                               stringByAppendingString:[@"." stringByAppendingString:cloneTag()]]);
+                            } @finally { g_inPBCall = NO; }
+                        }
+                        return ((UIPasteboard *(*)(id, SEL, NSString *))g_origPBNamespace)(s, pnSel, ns);
+                    });
+                    class_replaceMethod(meta, pnSel, impPN, method_getTypeEncoding(pnM));
+
+                    SEL gpSel = @selector(generalPasteboard);
+                    Method gpM = class_getInstanceMethod(meta, gpSel);
+                    if (gpM) {
+                    IMP impGP = imp_implementationWithBlock(^UIPasteboard *(id s) {
+                        g_inPBCall = YES;
+                        @try {
+                            return ((UIPasteboard *(*)(id, SEL, NSString *))g_origPBNamespace)(
+                                s, pnSel, [@"bdclone.general." stringByAppendingString:cloneTag()]);
+                        } @finally { g_inPBCall = NO; }
+                    });
+                        class_replaceMethod(meta, gpSel, impGP, method_getTypeEncoding(gpM));
+                    }
+
+                    SEL pwnSel = NSSelectorFromString(@"pasteboardWithName:create:");
+                    Method pwnM = class_getInstanceMethod(meta, pwnSel);
+                    if (pwnM) {
+                        g_origPWName = method_getImplementation(pwnM);
+                        IMP impPWN = imp_implementationWithBlock(^UIPasteboard *(id s, NSString *name, BOOL create) {
+                            if (name.length > 0 && ![name hasPrefix:@"bdclone."]) {
+                                name = [[@"bdclone." stringByAppendingString:name]
+                                        stringByAppendingString:[@"." stringByAppendingString:cloneTag()]];
+                            }
+                            return ((UIPasteboard *(*)(id, SEL, NSString *, BOOL))g_origPWName)(
+                                s, pwnSel, name, create);
+                        });
+                        class_replaceMethod(meta, pwnSel, impPWN, method_getTypeEncoding(pwnM));
+                    }
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 3c. v72: DeviceCheck / App Attest 失败化 ★P0★ ----
+        // 审计：百度主二进制 DCDevice/DCAppAttestService/generateToken/attestKey 都有引用。
+        // DeviceCheck 是 Apple 服务器签名的设备证明，绑定物理设备 —— 卸载重装、
+        // 换 bundle id 全部无效，是「刚装能下单、几天后被拉黑」的最强解释。
+        // 做法：所有 token/assert 生成回调直接报错。风控 SDK 对可选信号失败一般静默容忍。
+        //
+        // ★ v74: 仅百度构建启用。美团主二进制同样引用 DCDevice，但美团这次
+        //   的病灶是「登录发码被本地判定拦」——在克隆里额外制造一个
+        //   「设备证明异常」的少数派特征，只会给风控多一个抓手；且原版美团
+        //   在同一台机器上 DeviceCheck 是正常的。美团构建直接透传真实现。
+        //   错误域同时从 "BdCloneV72" 改为中性的 "DCErrorDomain"
+        //   （旧域名字面带 Clone，若 SDK 记录错误域就是自曝）。
+#if !MT_CLONE
+        @try {
+            Class dcd = objc_getClass("DCDevice");
+            if (dcd) {
+                SEL gtSel = NSSelectorFromString(@"generateTokenWithCompletionHandler:");
+                Method gtM = class_getInstanceMethod(dcd, gtSel);
+                if (gtM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSData *, NSError *)) {
+                        if (h) h(nil, [NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
+                    });
+                    class_replaceMethod(dcd, gtSel, imp, method_getTypeEncoding(gtM));
+                }
+            }
+            Class dca = objc_getClass("DCAppAttestService");
+            if (dca) {
+                SEL gkSel = NSSelectorFromString(@"generateKeyWithCompletionHandler:");
+                Method gkM = class_getInstanceMethod(dca, gkSel);
+                if (gkM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, void (^h)(NSString *, NSError *)) {
+                        if (h) h(nil, [NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
+                    });
+                    class_replaceMethod(dca, gkSel, imp, method_getTypeEncoding(gkM));
+                }
+                SEL akSel = NSSelectorFromString(@"attestKey:clientDataHash:completionHandler:");
+                Method akM = class_getInstanceMethod(dca, akSel);
+                if (akM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, NSString *keyId, NSData *hash, void (^h)(NSError *)) {
+                        if (h) h([NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
+                    });
+                    class_replaceMethod(dca, akSel, imp, method_getTypeEncoding(akM));
+                }
+                SEL gaSel = NSSelectorFromString(@"generateAssertion:clientDataHash:completionHandler:");
+                Method gaM = class_getInstanceMethod(dca, gaSel);
+                if (gaM) {
+                    IMP imp = imp_implementationWithBlock(^(id s, NSString *attestObj, NSData *hash, void (^h)(NSData *, NSError *)) {
+                        if (h) h(nil, [NSError errorWithDomain:@"DCErrorDomain" code:1 userInfo:nil]);
+                    });
+                    class_replaceMethod(dca, gaSel, imp, method_getTypeEncoding(gaM));
+                }
+            }
+        } @catch (id e) {}
+#endif // !MT_CLONE
+
+        // ---- 3d. v79: Metal 设备名 —— SoC 世代的第二条硬证据 ----
+        // 实证：主二进制导入 _MTLCreateSystemDefaultDevice，渲染框架 TalosPro
+        //       全程走 Metal。真机 [MTLDevice name] 返回 "Apple A15 GPU"，
+        //       而机型人格是 iPhone13,4（A14）—— 机型说 A14、GPU 说 A15，
+        //       和 v77 那个「磁盘两条通道两个值」是同一类自伤。
+        // 做法：拿到默认设备后，把它所属具体类（AGX*Device）的 -name 改成
+        //       与人格一致的值。用 dlsym 取函数，不引入 Metal 链接依赖。
+        @try {
+            typedef id (*CreateDevFn)(void);
+            CreateDevFn createDev = (CreateDevFn)dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+            if (createDev) {
+                id dev = createDev();
+                if (dev && [dev respondsToSelector:@selector(name)]) {
+                    g_realGPUName = [[dev name] copy];
+                    Class devCls = object_getClass(dev);
+                    Method nm = class_getInstanceMethod(devCls, @selector(name));
+                    if (nm) {
+                        IMP imp = imp_implementationWithBlock(^NSString *(id s) {
+                            return @"Apple A14 GPU";
+                        });
+                        class_replaceMethod(devCls, @selector(name), imp, method_getTypeEncoding(nm));
+                    }
+                }
+            }
+        } @catch (id e) {}
+
+        // ---- 4. NSUserDefaults hooks — 设备 ID 伪造 + v64 按键精准隔离 ----
         @try {
             Class uc = objc_getClass("NSUserDefaults");
             if (uc) {
-                // v59F: 只给 group 域实例打标记，域名不改（功能键仍读共享域）
+                // ★ v64: 隔离粒度从「整个 group 域」收窄到「身份键」 ★
+                //
+                // v62 曾把 suite 名整体加后缀（group.com.baidu.BaiduMobile →
+                // group.com.baidu.BaiduMobile.BdE1）。key 名虽不变，但整份
+                // 共享数据（真机实测 72 键）都看不见了 —— 果园这类跑在
+                // WKWebView 里的 H5 活动页拿不到渠道/活动参数，症状就是
+                // 「能进果园，但选不了水果」。
+                //
+                // v64 做法：initWithSuiteName: **不再改域名**（实例仍指向共享
+                // 域），只给 group 域实例打个标记；随后在 objectForKey: /
+                // stringForKey: / setObject:forKey: 里按 key 分流 ——
+                // 身份键走本克隆私有域，其余键留在共享域。
+                // 于是：身份各克隆独立（防关联），功能数据完整（果园可用）。
                 Method issM = class_getInstanceMethod(uc, @selector(initWithSuiteName:));
                 if (issM) {
                     g_origISS = method_getImplementation(issM);
-                    IMP impISS = imp_implementationWithBlock(^id(id s2, NSString *suite) {
+                    IMP impISS = imp_implementationWithBlock(^id(id s, NSString *suite) {
                         id obj = ((id (*)(id, SEL, NSString *))g_origISS)(
-                            s2, @selector(initWithSuiteName:), suite);
-                        if (obj && suite.length && isGroupDomainStr(suite)) {
+                            s, @selector(initWithSuiteName:), suite);
+                        if (obj && suite.length &&
+                            isGroupDomain((__bridge CFStringRef)suite)) {
                             objc_setAssociatedObject(obj, &kUDGroupSuiteKey, suite,
                                                      OBJC_ASSOCIATION_RETAIN);
                         }
                         return obj;
                     });
-                    class_replaceMethod(uc, @selector(initWithSuiteName:), impISS,
-                                        method_getTypeEncoding(issM));
+                    class_replaceMethod(uc, @selector(initWithSuiteName:), impISS, method_getTypeEncoding(issM));
                 }
                 Method ofkM = class_getInstanceMethod(uc, @selector(objectForKey:));
                 if (ofkM) {
                     IMP orig = method_getImplementation(ofkM);
                     IMP imp = imp_implementationWithBlock(^id(id s, NSString *key) {
-                        // v59F: group 域 + 身份键 → 本克隆私有域
-                        @try {
-                            if (isIdentityKeyStr(key)) {
-                                NSUserDefaults *p = privPeerFor(s);
-                                if (p && p != s) {
-                                    return ((id (*)(id, SEL, NSString *))orig)(
-                                        p, @selector(objectForKey:), key);
-                                }
+                        // v83 ★P0★ cuid 类键 → 直接回本克隆统一假值，不读存储
+                        NSString *fv83 = fakeIdentityValueForKey(key);
+                        if (fv83) return fv83;
+                        // v64: group 域 + 身份键 → 重定向到本克隆私有域
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                return ((id (*)(id, SEL, NSString *))orig)(
+                                    p, @selector(objectForKey:), key);
                             }
-                        } @catch (id e) {}
+                        }
                         if (!g_inUDHook && isDeviceKey(key)) {
                             g_inUDHook = YES;
-                            @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
+                            @try { NSString *f = getFakeID(@"PLATCUID"); g_inUDHook = NO; return f; }   // v67: NSUserDefaults 的 cuid 键 = 平台层格式
                             @catch (id e) { g_inUDHook = NO; }
                         }
                         return ((id (*)(id, SEL, NSString *))orig)(s, @selector(objectForKey:), key);
@@ -1964,50 +3943,65 @@ static void initPrivacyHook(void) {
                 if (sfkM) {
                     IMP orig = method_getImplementation(sfkM);
                     IMP imp = imp_implementationWithBlock(^NSString *(id s, NSString *key) {
-                        @try {
-                            if (isIdentityKeyStr(key)) {
-                                NSUserDefaults *p = privPeerFor(s);
-                                if (p && p != s) {
-                                    return ((NSString *(*)(id, SEL, NSString *))orig)(
-                                        p, @selector(stringForKey:), key);
-                                }
+                        // v83 ★P0★ 同上：cuid 类键统一假值
+                        NSString *fv83 = fakeIdentityValueForKey(key);
+                        if (fv83) return fv83;
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                return ((NSString *(*)(id, SEL, NSString *))orig)(
+                                    p, @selector(stringForKey:), key);
                             }
-                        } @catch (id e) {}
+                        }
                         if (!g_inUDHook && isDeviceKey(key)) {
                             g_inUDHook = YES;
-                            @try { NSString *f = getFakeID(@"cuid"); g_inUDHook = NO; return f; }
+                            @try { NSString *f = getFakeID(@"PLATCUID"); g_inUDHook = NO; return f; }   // v67: NSUserDefaults 的 cuid 键 = 平台层格式
                             @catch (id e) { g_inUDHook = NO; }
                         }
                         return ((NSString *(*)(id, SEL, NSString *))orig)(s, @selector(stringForKey:), key);
                     });
                     class_replaceMethod(uc, @selector(stringForKey:), imp, method_getTypeEncoding(sfkM));
                 }
-                // v59F: 写入侧同样分流 —— 否则 SDK 会把假身份写回共享域，
-                // 下一次读取（或别的克隆）又拿回原机真值。
-                Method sofkM = class_getInstanceMethod(uc, @selector(setObject:forKey:));
-                if (sofkM) {
-                    IMP origSet = method_getImplementation(sofkM);
-                    IMP impSet = imp_implementationWithBlock(^void(id s, id obj, NSString *key) {
-                        @try {
-                            if (!g_inPrivPeer && isIdentityKeyStr(key)) {
-                                NSUserDefaults *p = privPeerFor(s);
-                                if (p && p != s) {
-                                    ((void (*)(id, SEL, id, NSString *))origSet)(
-                                        p, @selector(setObject:forKey:), obj, key);
-                                    return;
-                                }
+                // v64: 写入侧对称分流 —— 身份键写私有域，其余键写共享域
+                // （不这么做的话，因为 v64 已不改域名，身份键会被写进共享域 → 污染）
+                Method soM = class_getInstanceMethod(uc, @selector(setObject:forKey:));
+                if (soM) {
+                    IMP orig = method_getImplementation(soM);
+                    IMP imp = imp_implementationWithBlock(^(id s, id value, NSString *key) {
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                ((void (*)(id, SEL, id, NSString *))orig)(
+                                    p, @selector(setObject:forKey:), value, key);
+                                return;
                             }
-                        } @catch (id e) {}
-                        ((void (*)(id, SEL, id, NSString *))origSet)(
-                            s, @selector(setObject:forKey:), obj, key);
+                        }
+                        ((void (*)(id, SEL, id, NSString *))orig)(
+                            s, @selector(setObject:forKey:), value, key);
                     });
-                    class_replaceMethod(uc, @selector(setObject:forKey:), impSet,
-                                        method_getTypeEncoding(sofkM));
+                    class_replaceMethod(uc, @selector(setObject:forKey:), imp, method_getTypeEncoding(soM));
+                }
+                Method rokM = class_getInstanceMethod(uc, @selector(removeObjectForKey:));
+                if (rokM) {
+                    IMP orig = method_getImplementation(rokM);
+                    IMP imp = imp_implementationWithBlock(^(id s, NSString *key) {
+                        if (isStrictIdentityKeyStr(key)) {
+                            NSUserDefaults *p = privPeerFor(s);
+                            if (p && p != s) {
+                                ((void (*)(id, SEL, NSString *))orig)(
+                                    p, @selector(removeObjectForKey:), key);
+                                return;
+                            }
+                        }
+                        ((void (*)(id, SEL, NSString *))orig)(
+                            s, @selector(removeObjectForKey:), key);
+                    });
+                    class_replaceMethod(uc, @selector(removeObjectForKey:), imp, method_getTypeEncoding(rokM));
                 }
             }
         } @catch (id e) {}
 
-        // ---- 6. Cookie hooks ----
+        // ---- 5. Cookie hooks (ObjC 层) ----
         @try {
             Class cs = objc_getClass("NSHTTPCookieStorage");
 
@@ -2043,6 +4037,7 @@ static void initPrivacyHook(void) {
                 IMP newSC = imp_implementationWithBlock(^void(id s, NSHTTPCookie *cookie) {
                     if (cookie && isDeviceCookie(cookie.name)) {
                         @try {
+                            captureRealIdentity(cookie.name, cookie.value);   // v57U: 捕获真实值
                             NSString *fakeValue = getFakeID(cookie.name);
                             NSMutableDictionary *props = [NSMutableDictionary dictionary];
                             props[NSHTTPCookieName] = cookie.name;
@@ -2085,145 +4080,427 @@ static void initPrivacyHook(void) {
             }
         } @catch (id e) {}
 
-        // ---- 7. NSMutableURLRequest hooks (Cookie + User-Agent) ----
+        // ---- 6. NSMutableURLRequest hooks — Cookie + UA 替换 ----
+        // v57N: UA 必须替换（否则泄露真系统版本，与伪造机型矛盾）
         @try {
             Class reqClass = objc_getClass("NSMutableURLRequest");
             if (reqClass) {
+#if !MT_CLONE
                 Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
                 if (svM) {
                     IMP origSV = method_getImplementation(svM);
                     IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
-                        if (value && field) {
-                            if ([field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame) {
-                                NSString *modified = modifyUserAgentVersion(value);
-                                ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), modified, field);
-                                return;
-                            }
-                            if ([field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
-                                NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
-                                                   @"DVIF", @"tcuid", @"__bid_n", @"fuid",
-                                                   @"BAIDUID", @"BAIDUID_BFESS"];
-                                NSString *modified = value;
-                                for (NSString *name in names) {
-                                    NSString *fake = getFakeID(name);
-                                    NSRegularExpression *regex = [NSRegularExpression
-                                        regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
-                                        options:NSRegularExpressionCaseInsensitive error:nil];
-                                    modified = [regex stringByReplacingMatchesInString:modified options:0
-                                        range:NSMakeRange(0, modified.length)
-                                        withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
-                                }
-                                NSRegularExpression *cuidRegex = [NSRegularExpression
-                                    regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
-                                modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
+                        // UA 替换
+                        if (value && field && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame
+                            && isUALike(value)) {
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), ensureBaiduboxAppUA(value), field);
+                            return;
+                        }
+                        if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
+                            NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                                               @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                                               @"BAIDUID", @"BAIDUID_BFESS"];
+                            NSString *modified = value;
+                            for (NSString *name in names) {
+                                NSString *fake = getFakeID(name);
+                                NSRegularExpression *regex = [NSRegularExpression
+                                    regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
+                                    options:NSRegularExpressionCaseInsensitive error:nil];
+                                modified = [regex stringByReplacingMatchesInString:modified options:0
                                     range:NSMakeRange(0, modified.length)
-                                    withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
-                                ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), modified, field);
-                                return;
+                                    withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
                             }
+                            NSRegularExpression *cuidRegex = [NSRegularExpression
+                                regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
+                            modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
+                                range:NSMakeRange(0, modified.length)
+                                withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
+                            ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), modified, field);
+                            return;
                         }
                         ((void (*)(id, SEL, NSString *, NSString *))origSV)(s, @selector(setValue:forHTTPHeaderField:), value, field);
                     });
                     class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
                 }
+
+                Method addValM = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
+                if (addValM) {
+                    IMP origAddVal = method_getImplementation(addValM);
+                    IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        if (value && field && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame
+                            && isUALike(value)) {
+                            ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), ensureBaiduboxAppUA(value), field);
+                            return;
+                        }
+                        if (value && field && [field caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
+                            NSArray *names = @[@"BAIDUCUID", @"BAIDUCUID_BFESS", @"MAWEBCUID",
+                                               @"DVIF", @"tcuid", @"__bid_n", @"fuid",
+                                               @"BAIDUID", @"BAIDUID_BFESS"];
+                            NSString *modified = value;
+                            for (NSString *name in names) {
+                                NSString *fake = getFakeID(name);
+                                NSRegularExpression *regex = [NSRegularExpression
+                                    regularExpressionWithPattern:[NSString stringWithFormat:@"%@=[^;]+", name]
+                                    options:NSRegularExpressionCaseInsensitive error:nil];
+                                modified = [regex stringByReplacingMatchesInString:modified options:0
+                                    range:NSMakeRange(0, modified.length)
+                                    withTemplate:[NSString stringWithFormat:@"%@=%@", name, fake]];
+                            }
+                            NSRegularExpression *cuidRegex = [NSRegularExpression
+                                regularExpressionWithPattern:@"(?<![A-Za-z_])cuid=[^;]+" options:0 error:nil];
+                            modified = [cuidRegex stringByReplacingMatchesInString:modified options:0
+                                range:NSMakeRange(0, modified.length)
+                                withTemplate:[NSString stringWithFormat:@"cuid=%@", getFakeID(@"cuid")]];
+                            ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), modified, field);
+                            return;
+                        }
+                        ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(s, @selector(addValue:forHTTPHeaderField:), value, field);
+                    });
+                    class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
+                }
+#else
+                // ---- v74: 美团构建的请求头消毒 ----
+                // 美团版不做百度 UA 补段 / Cookie 身份改写（原本就 #if !MT_CLONE
+                // 整段跳过），但**必须**处理包名泄漏：
+                //   User-Agent: com.meituan.imeituan.MtM1/349883 (unknown, iOS 16.1, ...)
+                // 该 UA 由 App 自己用 bundle id 拼出来，是明面上的重打包特征。
+                Method svM = class_getInstanceMethod(reqClass, @selector(setValue:forHTTPHeaderField:));
+                if (svM) {
+                    IMP origSV = method_getImplementation(svM);
+                    IMP newSV = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        ((void (*)(id, SEL, NSString *, NSString *))origSV)(
+                            s, @selector(setValue:forHTTPHeaderField:), maskCloneBundleID(value), field);
+                    });
+                    class_replaceMethod(reqClass, @selector(setValue:forHTTPHeaderField:), newSV, method_getTypeEncoding(svM));
+                }
+                Method addValM = class_getInstanceMethod(reqClass, @selector(addValue:forHTTPHeaderField:));
+                if (addValM) {
+                    IMP origAddVal = method_getImplementation(addValM);
+                    IMP newAddVal = imp_implementationWithBlock(^void(id s, NSString *value, NSString *field) {
+                        ((void (*)(id, SEL, NSString *, NSString *))origAddVal)(
+                            s, @selector(addValue:forHTTPHeaderField:), maskCloneBundleID(value), field);
+                    });
+                    class_replaceMethod(reqClass, @selector(addValue:forHTTPHeaderField:), newAddVal, method_getTypeEncoding(addValM));
+                }
+#endif // MT_CLONE 分支
+
+                // v57U: 请求出口消毒 —— URL 参数 / POST body 里的真实 cuid
+                // 原生 SDK 拼请求时 cuid=%@ 直接进 query/body（不走 cookie），
+                // 按值替换为本克隆伪造值，与 cookie 保持单一身份
+                // v74: 同一出口顺带做克隆包名消毒（csecpkgname/packageName/appInfo.app）
+                Method suM = class_getInstanceMethod(reqClass, @selector(setURL:));
+                if (suM) {
+                    IMP origSetURL = method_getImplementation(suM);
+                    IMP newSetURL = imp_implementationWithBlock(^void(id s, NSURL *u) {
+                        NSURL *nu = u;
+                        @try {
+                            if (u.absoluteString.length > 20) {
+                                // ---- v96: mps 溯源（只观测，不改写）----
+                                if (g_v96BtLeft > 0 &&
+                                    [u.absoluteString rangeOfString:@"mps="].location != NSNotFound) {
+                                    g_v96BtLeft--;
+                                    v96DumpBacktrace(@"MPS-URL", u.absoluteString);
+                                }
+                                if (g_v96MpsLogs < 6 &&
+                                    [u.absoluteString rangeOfString:@"mps="].location != NSNotFound) {
+                                    g_v96MpsLogs++;
+                                    NSRange rr = [u.absoluteString rangeOfString:@"mps="];
+                                    NSString *tail = [u.absoluteString substringFromIndex:rr.location];
+                                    if (tail.length > 120) tail = [tail substringToIndex:120];
+                                    diagAppend([NSString stringWithFormat:
+                                                @"\n[MPS-VAL] %@\n", tail]);
+                                }
+                                NSString *r = rewriteIdentityString(u.absoluteString);
+                                if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
+                            }
+                        } @catch (id e) {}
+                        @try { if (nu.absoluteString) g_lastReqURL = nu.absoluteString; } @catch (id e) {}
+                        ((void (*)(id, SEL, NSURL *))origSetURL)(s, @selector(setURL:), nu);
+                    });
+                    class_replaceMethod(reqClass, @selector(setURL:), newSetURL, method_getTypeEncoding(suM));
+                }
+                Method sbM = class_getInstanceMethod(reqClass, @selector(setHTTPBody:));
+                if (sbM) {
+                    IMP origSetBody = method_getImplementation(sbM);
+                    IMP newSetBody = imp_implementationWithBlock(^void(id s, NSData *body) {
+                        NSData *nb = body;
+                        @try {
+                            if (body && g_bodyRewriteOff) {
+                                NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                                // v96: body 内 mps 溯源（只看不改，最多两次）
+                                if (raw && g_v96BodyBtLeft > 0 &&
+                                    [raw rangeOfString:@"mps="].location != NSNotFound) {
+                                    g_v96BodyBtLeft--;
+                                    NSRange rr = [raw rangeOfString:@"mps="];
+                                    NSString *tail = [raw substringFromIndex:rr.location];
+                                    if (tail.length > 150) tail = [tail substringToIndex:150];
+                                    v96DumpBacktrace(@"MPS-BODY", tail);
+                                }
+                                // ★ v95 ★ 下单链路全量取证 —— 不看结论看事实：
+                                //   把 App 真正发出去的 body 原文落盘，再用真机值清单扫一遍。
+                                //   命中项 = 服务端能看到本机的地方；全不命中 = 出口干净。
+                                @try {
+                                    NSString *u = g_lastReqURL ?: @"";
+                                    BOOL orderPath =
+                                        [u containsString:@"orders/create"] ||
+                                        [u containsString:@"orders/confirm"] ||
+                                        [u containsString:@"innerChannelAllInfo"] ||
+                                        [u containsString:@"calculateInit"] ||
+                                        [u containsString:@"trade/v2.0"] ||
+                                        [u containsString:@"cashier/sdk"];
+                                    // 兜底：URL 没抓到（CFNetwork/结构体路径）时按 body 特征判断
+                                    if (!orderPath && raw) {
+                                        orderPath = [raw containsString:@"orders/create"] ||
+                                                    [raw containsString:@"sdkSign"] ||
+                                                    [raw containsString:@"sdkParams"];
+                                    }
+                                    if (raw && raw.length > 30 && orderPath && g_fullDumpCount < 8) {
+                                        g_fullDumpCount++;
+                                        dumpBlob(@"REQ-BODY", raw);
+                                        scanTruthHits(@"REQ-BODY", raw);
+                                        NSMutableString *hdr = [NSMutableString string];
+                                        @try {
+                                            NSDictionary *hd = ((NSURLRequest *)s).allHTTPHeaderFields;
+                                            if (hd) [hdr appendFormat:@"HEADERS %@\n", hd];
+                                            NSString *ck = [((NSURLRequest *)s) valueForHTTPHeaderField:@"Cookie"];
+                                            if (ck) [hdr appendFormat:@"COOKIE %@\n", ck];
+                                        } @catch (id e2) {}
+                                        if (hdr.length) {
+                                            dumpBlob(@"REQ-HDR", hdr);
+                                            scanTruthHits(@"REQ-HDR", hdr);
+                                        }
+                                    }
+                                } @catch (id e3) {}
+                                // ★ v93 ★ v92 把「所有 body 改写」一起关了，副作用是
+                                //   v91 刚换好的度小满 aif 设备号（imei / cu_short）又退回
+                                //   真机旧值 —— 真机日志实证：v92 的
+                                //   aif/sdk/init 里 imei=aac0ffa1… / cu_short=10ea1c17…。
+                                //   这里只把 aif 这一类（带 atbc / cu_short）放行，
+                                //   下单 body 仍然保持原生，签名实验的口径不变。
+                                if (raw && ([raw containsString:@"cu_short="] ||
+                                            [raw containsString:@"atbc="]) &&
+                                    ![raw containsString:@"orders/create"]) {
+                                    nb = rewriteIdentityData(body);
+                                } else if (raw && (raw.length > 40) &&
+                                    ([raw containsString:@"orders/create"] || [raw containsString:@"cuid="] ||
+                                     [raw containsString:@"sdkParams"] || [raw containsString:@"sign="])) {
+                                    NSString *rc = getPersistent(@"BdD1.real.CUID_FAMILY", ^{ return @""; });
+                                    NSString *fc = getFakeID(@"BAIDUCUID");
+                                    NSString *rb = getPersistent(@"BdD1.real.BAIDUID_FAMILY", ^{ return @""; });
+                                    NSString *fb = getFakeID(@"BAIDUID");
+                                    NSUInteger cr = (rc.length > 15) ? [raw componentsSeparatedByString:rc].count - 1 : 0;
+                                    NSUInteger cf = (fc.length > 15) ? [raw componentsSeparatedByString:fc].count - 1 : 0;
+                                    NSUInteger br = (rb.length > 15) ? [raw componentsSeparatedByString:rb].count - 1 : 0;
+                                    NSUInteger bf = (fb.length > 15) ? [raw componentsSeparatedByString:fb].count - 1 : 0;
+                                    diagAppend([NSString stringWithFormat:
+                                        @"\n[BODY-NATIVE] len=%lu realCuid=%lu fakeCuid=%lu realBUID=%lu fakeBUID=%lu\n  HEAD: %@\n",
+                                        (unsigned long)raw.length, (unsigned long)cr, (unsigned long)cf,
+                                        (unsigned long)br, (unsigned long)bf,
+                                        [raw substringToIndex:MIN((NSUInteger)260, raw.length)]]);
+                                }
+                            } else if (body) {
+                                nb = rewriteIdentityData(body);
+                            }
+                        } @catch (id e) {}
+                        ((void (*)(id, SEL, NSData *))origSetBody)(s, @selector(setHTTPBody:), nb);
+                    });
+                    class_replaceMethod(reqClass, @selector(setHTTPBody:), newSetBody, method_getTypeEncoding(sbM));
+                }
+                Method iwM = class_getInstanceMethod(reqClass, @selector(initWithURL:));
+                if (iwM) {
+                    IMP origInitURL = method_getImplementation(iwM);
+                    IMP newInitURL = imp_implementationWithBlock(^id(id s, NSURL *u) {
+                        NSURL *nu = u;
+                        @try {
+                            if (u.absoluteString.length > 20) {
+                                NSString *r = rewriteIdentityString(u.absoluteString);
+                                if (r != u.absoluteString) nu = [NSURL URLWithString:r] ?: u;
+                            }
+                        } @catch (id e) {}
+                        @try { if (nu.absoluteString) g_lastReqURL = nu.absoluteString; } @catch (id e) {}
+                        return ((id (*)(id, SEL, NSURL *))origInitURL)(s, @selector(initWithURL:), nu);
+                    });
+                    class_replaceMethod(reqClass, @selector(initWithURL:), newInitURL, method_getTypeEncoding(iwM));
+                }
             }
         } @catch (id e) {}
 
-        // ---- 8. WKWebView hooks (customUserAgent) ----
+#if !MT_CLONE
+        // ---- 6b. WKWebView hooks — UA 注入（v57Q 新增，农场关键） ----
+        //
+        // ★★ 这是「活动太火爆，请稍后再试」的真正根因 ★★
+        //
+        // 百度农场（se-act.baidu.com）是**跑在 WKWebView 里的 H5 页面**，
+        // 不是原生 API 调用。WKWebView 发出的网络请求**完全绕过**
+        // NSMutableURLRequest.setValue:forHTTPHeaderField: —— 也就是说
+        // 上面第 6 节写的 UA hook 对农场页面**一次都不会触发**。
+        //
+        // 结果：农场页面带着 WKWebView 默认 UA 访问服务端，该 UA 里没有
+        // baiduboxapp/ 段 → 服务端判定"非百度 App 环境" → 返回兜底文案
+        // 「活动太火爆，请稍后再试」。
+        //
+        // 这正是此前 UA 里出现 light/1.0(WKWebView) 的来源：我们看到的
+        // 就是 WKWebView 的原生 UA，我们的替换根本没生效。
+        //
+        // 正确做法：三条路**全部**设成同一个完整 UA（含 baiduboxapp 段）。
+        //
+        //   优先级：customUserAgent > NSUserDefaults > applicationNameForUserAgent
+        //   生效的只有一条，其余被忽略 —— 所以三条都填同一个完整 UA 是安全的，
+        //   不会产生重复段，同时保证「无论 App 走哪条路」结果都正确。
+        //
+        //   为什么必须带 customUserAgent：applicationNameForUserAgent 是
+        //   「追加到默认 UA」语义，而默认 UA 里没有 baiduboxapp；只设它不够。
+        //   customUserAgent 是「整体替换」语义，优先级最高，才是主力手段。
+        //
+        //   v57T: 移除 dlopen(WebKit) —— 已确认 App 主二进制自带
+        //   LC_LOAD_DYLIB WebKit，dyld 在构造函数运行前必然已加载它，
+        //   objc_getClass 不会返回 nil；dlopen 反而是 v57R/v57S 闪退的
+        //   剩余可疑增量之一（二分期间先去掉）。
         @try {
-            Class wkClass = objc_getClass("WKWebView");
-            if (wkClass) {
-                Method initM = class_getInstanceMethod(wkClass, @selector(initWithFrame:configuration:));
+            Class wkCfg = objc_getClass("WKWebViewConfiguration");
+            if (wkCfg) {
+                Method setAppNameM = class_getInstanceMethod(wkCfg, @selector(setApplicationNameForUserAgent:));
+                if (setAppNameM) {
+                    IMP origSAN = method_getImplementation(setAppNameM);
+                    IMP newSAN = imp_implementationWithBlock(^void(id s, NSString *name) {
+                        // v61: 只补缺段，绝不覆盖 App 自己设的值
+                        ((void (*)(id, SEL, NSString *))origSAN)(s, @selector(setApplicationNameForUserAgent:), ensureBaiduboxAppUA(name));
+                    });
+                    class_replaceMethod(wkCfg, @selector(setApplicationNameForUserAgent:), newSAN, method_getTypeEncoding(setAppNameM));
+                }
+            }
+        } @catch (id e) {}
+
+        @try {
+            Class wkView = objc_getClass("WKWebView");
+            if (wkView) {
+                // c1) 读取侧：getter 永远返回完整 App UA
+                Method getUAM = class_getInstanceMethod(wkView, @selector(customUserAgent));
+                if (getUAM) {
+                    IMP origGUA = method_getImplementation(getUAM);
+                    IMP newGUA = imp_implementationWithBlock(^NSString *(id s) {
+                        // v61: 读原始值，缺段才补 —— 不再无条件返回硬编码 UA
+                        NSString *cur = ((NSString *(*)(id, SEL))origGUA)(s, @selector(customUserAgent));
+                        return ensureBaiduboxAppUA(cur);
+                    });
+                    class_replaceMethod(wkView, @selector(customUserAgent), newGUA, method_getTypeEncoding(getUAM));
+                }
+                // c2) 写入侧：透传 App 设的值（缺 baiduboxapp 段才补）
+                Method setUAM = class_getInstanceMethod(wkView, @selector(setCustomUserAgent:));
+                if (setUAM) {
+                    IMP origSUA = method_getImplementation(setUAM);
+                    IMP newSUA = imp_implementationWithBlock(^void(id s, NSString *ua) {
+                        ((void (*)(id, SEL, NSString *))origSUA)(s, @selector(setCustomUserAgent:), ensureBaiduboxAppUA(ua));
+                    });
+                    class_replaceMethod(wkView, @selector(setCustomUserAgent:), newSUA, method_getTypeEncoding(setUAM));
+                }
+                // c3) 构造侧：v61 起不再主动写 UA。只在 config 的
+                //     applicationNameForUserAgent 为空或确实缺 baiduboxapp 段时补一段，
+                //     防止个别页面因没设 UA 退化成「非 App 环境」。
+                Method initM = class_getInstanceMethod(wkView, @selector(initWithFrame:configuration:));
                 if (initM) {
                     IMP origInit = method_getImplementation(initM);
                     IMP newInit = imp_implementationWithBlock(^id(id s, CGRect frame, id config) {
-                        id obj = ((id (*)(id, SEL, CGRect, id))origInit)(s, @selector(initWithFrame:configuration:), frame, config);
-                        if (obj) {
-                            @try {
-                                NSString *cur = [obj valueForKey:@"customUserAgent"];
-                                NSString *want = ensureBaiduboxappSegment(cur);
-                                if (!cur || ![cur isEqualToString:want]) {
-                                    [obj setValue:want forKey:@"customUserAgent"];
+                        @try {
+                            if (config &&
+                                [config respondsToSelector:@selector(applicationNameForUserAgent)] &&
+                                [config respondsToSelector:@selector(setApplicationNameForUserAgent:)]) {
+                                NSString *cur = [config applicationNameForUserAgent];
+                                if (cur.length == 0 || [cur rangeOfString:@"baiduboxapp"].location == NSNotFound) {
+                                    [config setApplicationNameForUserAgent:ensureBaiduboxAppUA(cur)];
                                 }
-                            } @catch (id e) {}
-                        }
-                        return obj;
+                            }
+                        } @catch (id e) {}
+                        return ((id (*)(id, SEL, CGRect, id))origInit)(s, @selector(initWithFrame:configuration:), frame, config);
                     });
-                    class_replaceMethod(wkClass, @selector(initWithFrame:configuration:), newInit, method_getTypeEncoding(initM));
+                    class_replaceMethod(wkView, @selector(initWithFrame:configuration:), newInit, method_getTypeEncoding(initM));
                 }
-                Method coderM = class_getInstanceMethod(wkClass, @selector(initWithCoder:));
-                if (coderM) {
-                    IMP origCoder = method_getImplementation(coderM);
-                    IMP newCoder = imp_implementationWithBlock(^id(id s, id coder) {
-                        id obj = ((id (*)(id, SEL, id))origCoder)(s, @selector(initWithCoder:), coder);
-                        if (obj) {
-                            @try {
-                                NSString *cur = [obj valueForKey:@"customUserAgent"];
-                                NSString *want = ensureBaiduboxappSegment(cur);
-                                if (!cur || ![cur isEqualToString:want]) {
-                                    [obj setValue:want forKey:@"customUserAgent"];
+
+                // v57U: loadRequest: 出口消毒 —— App 打开 H5 活动页（含农场）
+                // 时会把 SDK 计算的 cuid 等身份参数拼进 URL query，
+                // 同样按值替换为本克隆伪造值
+                Method lrM = class_getInstanceMethod(wkView, @selector(loadRequest:));
+                if (lrM) {
+                    IMP origLR = method_getImplementation(lrM);
+                    IMP newLR = imp_implementationWithBlock(^void(id s, NSURLRequest *req) {
+                        NSURLRequest *nr = req;
+                        @try {
+                            if (req.URL.absoluteString.length > 20) {
+                                NSString *r = rewriteIdentityString(req.URL.absoluteString);
+                                if (r != req.URL.absoluteString) {
+                                    NSURL *nu = [NSURL URLWithString:r];
+                                    if (nu) {
+                                        nr = [NSURLRequest requestWithURL:nu];
+                                    }
                                 }
-                            } @catch (id e) {}
-                        }
-                        return obj;
+                            }
+                        } @catch (id e) {}
+                        ((void (*)(id, SEL, NSURLRequest *))origLR)(s, @selector(loadRequest:), nr);
                     });
-                    class_replaceMethod(wkClass, @selector(initWithCoder:), newCoder, method_getTypeEncoding(coderM));
+                    class_replaceMethod(wkView, @selector(loadRequest:), newLR, method_getTypeEncoding(lrM));
                 }
+
+                // 补充：NSUserDefaults["UserAgent"] 是另一种较低优先级的设置方式，
+                // 优先级低于 customUserAgent。由于我们已将 customUserAgent 全路径
+                // 强制为完整 App UA，该方法即使被调用也不会生效，无需额外 hook。
             }
         } @catch (id e) {}
+#endif // !MT_CLONE
+        // （MT_CLONE=1 时跳过 6b：百度 UA 注入对美团是风控现行，美团 H5 用系统默认 UA）
 
-        // ---- 8b. F2: WKWebViewConfiguration.applicationNameForUserAgent ----
-        // App 创建 WKWebView 时常把 App 标识走这条通道；我们若只改
-        // customUserAgent，这条仍是原值或被覆盖成缺段的 UA，H5 依然判非 App。
+        // ---- 7. fishhook — hook 所有非系统镜像 + dyld 回调 ----
+        // v57L rebind 清单：sysctlbyname + MGCopyAnswer + IOKit
+        //                  + 4个 C 层 Cookie API + 3个 CFPreferences API
         @try {
-            Class cfgClass = objc_getClass("WKWebViewConfiguration");
-            if (cfgClass) {
-                Method setAppM = class_getInstanceMethod(cfgClass, @selector(setApplicationNameForUserAgent:));
-                if (setAppM) {
-                    IMP origSetApp = method_getImplementation(setAppM);
-                    IMP newSetApp = imp_implementationWithBlock(^void(id s, NSString *name) {
-                        NSString *v = ensureAppNameSegment(name);
-                        ((void (*)(id, SEL, NSString *))origSetApp)(s, @selector(setApplicationNameForUserAgent:), v);
-                    });
-                    class_replaceMethod(cfgClass, @selector(setApplicationNameForUserAgent:), newSetApp, method_getTypeEncoding(setAppM));
-                }
-                Method getAppM = class_getInstanceMethod(cfgClass, @selector(applicationNameForUserAgent));
-                if (getAppM) {
-                    IMP origGetApp = method_getImplementation(getAppM);
-                    IMP newGetApp = imp_implementationWithBlock(^NSString *(id s) {
-                        NSString *v = ((NSString *(*)(id, SEL))origGetApp)(s, @selector(applicationNameForUserAgent));
-                        return ensureAppNameSegment(v);
-                    });
-                    class_replaceMethod(cfgClass, @selector(applicationNameForUserAgent), newGetApp, method_getTypeEncoding(getAppM));
-                }
-            }
-        } @catch (id e) {}
+            g_rebindings[0] = (struct rebinding){"sysctlbyname",                          (void *)hook_sysctlbyname,                          (void **)&orig_sysctlbyname};
+            g_rebindings[1] = (struct rebinding){"MGCopyAnswer",                          (void *)hook_MGCopyAnswer,                          (void **)&orig_MGCopyAnswer};
+            g_rebindings[2] = (struct rebinding){"IORegistryEntryCreateCFProperty",       (void *)hook_IORegistryEntryCreateCFProperty,       (void **)&orig_IORegistryEntryCreateCFProperty};
+            g_rebindings[3] = (struct rebinding){"CFHTTPCookieStorageSetCookie",          (void *)hook_CFHTTPCookieStorageSetCookie,          (void **)&orig_CFHTTPCookieStorageSetCookie};
+            g_rebindings[4] = (struct rebinding){"CFHTTPCookieStorageSetCookies",         (void *)hook_CFHTTPCookieStorageSetCookies,         (void **)&orig_CFHTTPCookieStorageSetCookies};
+            g_rebindings[5] = (struct rebinding){"CFHTTPCookieStorageCopyCookiesForURL",  (void *)hook_CFHTTPCookieStorageCopyCookiesForURL,  (void **)&orig_CFHTTPCookieStorageCopyCookiesForURL};
+            g_rebindings[6] = (struct rebinding){"CFHTTPCookieStorageCopyAllCookies",     (void *)hook_CFHTTPCookieStorageCopyAllCookies,     (void **)&orig_CFHTTPCookieStorageCopyAllCookies};
+            g_rebindings[7] = (struct rebinding){"CFPreferencesCopyAppValue",             (void *)hook_CFPreferencesCopyAppValue,             (void **)&orig_CFPreferencesCopyAppValue};
+            g_rebindings[8] = (struct rebinding){"CFPreferencesCopyValue",                (void *)hook_CFPreferencesCopyValue,                (void **)&orig_CFPreferencesCopyValue};
+            // v57U: keychain 出口消毒（只按值替换返回内容，查询不过滤）
+            g_rebindings[9]  = (struct rebinding){"SecItemCopyMatching",                  (void *)hook_SecItemCopyMatching,                   (void **)&orig_SecItemCopyMatching};
+            // v57V: 写入侧也拦截，让 keychain 天然存伪造 cuid
+            g_rebindings[10] = (struct rebinding){"SecItemAdd",                           (void *)hook_SecItemAdd,                            (void **)&orig_SecItemAdd};
+            g_rebindings[11] = (struct rebinding){"SecItemUpdate",                        (void *)hook_SecItemUpdate,                         (void **)&orig_SecItemUpdate};
+            // v59: 删除也要隔离（否则清 keychain 会连带删掉共享组里其他克隆的票据）
+            g_rebindings[12] = (struct rebinding){"SecItemDelete",                        (void *)hook_SecItemDelete,                         (void **)&orig_SecItemDelete};
+            // v63: CFBundleGetIdentifier 的 rebind 已移除 —— 它属于 v60 的
+            // 「包标识伪装」，与 NSBundle 那组 hook 同批停用。保留它会造成
+            // 「C 层报官方值、ObjC 层报真实值」的自相矛盾，反而更容易被察觉。
+            g_rebindings[13] = (struct rebinding){"CFPreferencesSetAppValue",             (void *)hook_CFPreferencesSetAppValue,              (void **)&orig_CFPreferencesSetAppValue};
 
-        // ---- 8z. v62F 收银台网络只读观测 ----
-        pnInstall();
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcn"),
-                                 (__bridge CFStringRef)@"1",
-                                 kCFPreferencesCurrentApplication);
+            // v60: 隐藏注入痕迹。这里只「填表」，真正的 rebind 放在 7d ——
+            // 这几个 API 自身的 GOT 会被替换，安装前必须先把镜像列表收全。
+            // 提前填表是为了让 7b 注册的 dyld 回调里也能安全使用。
+            g_hide_rebindings[0] = (struct rebinding){"_dyld_image_count",            (void *)hook_dyld_image_count,           (void **)&orig_dyld_image_count};
+            g_hide_rebindings[1] = (struct rebinding){"_dyld_get_image_name",         (void *)hook_dyld_get_image_name,        (void **)&orig_dyld_get_image_name};
+            g_hide_rebindings[2] = (struct rebinding){"_dyld_get_image_header",       (void *)hook_dyld_get_image_header,      (void **)&orig_dyld_get_image_header};
+            g_hide_rebindings[3] = (struct rebinding){"_dyld_get_image_vmaddr_slide", (void *)hook_dyld_get_image_vmaddr_slide,(void **)&orig_dyld_get_image_vmaddr_slide};
+            // v57T: uname/sysctl/gethostname 三条 rebind 暂时移除（闪退二分定位）
+            // v70: uname/gethostname 绑回（真凶另有其人，见 REBIND_COUNT 注释）；
+            //      老 sysctl() 继续不绑。
+            g_rebindings[14] = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
+            g_rebindings[15] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
+            g_rebindings[16] = (struct rebinding){"SCNetworkReachabilityGetFlags",       (void *)hook_SCNetworkReachabilityGetFlags,          (void **)&orig_SCNetworkReachabilityGetFlags};
+#if !MT_CLONE
+            g_rebindings[17] = (struct rebinding){"CNCopyCurrentNetworkInfo",            (void *)hook_CNCopyCurrentNetworkInfo,               (void **)&orig_CNCopyCurrentNetworkInfo};
+            // v78 ★P0★ 老式 sysctl(MIB) 绑回 —— 这是 hw.machine / hw.model /
+            //   KERN_BOOTTIME 的第二条读取通道。二进制实测 BaiduBoxApp 引用
+            //   sysctl 9 次、kern.boottime 字符串存在，不堵等于机型人格和
+            //   开机偏移都是单通道自说自话。
+            //   风险控制：hook_sysctl 只拦 namelen==2 且 MIB 明确的调用，
+            //   newp != NULL（写）与未知 MIB 全部原样透传。
+            g_rebindings[18] = (struct rebinding){"sysctl",                              (void *)hook_sysctl,                                 (void **)&orig_sysctl};
+#endif // !MT_CLONE
+            // g_rebindings[9]  = (struct rebinding){"uname",                              (void *)hook_uname,                                 (void **)&orig_uname};
+            // g_rebindings[10] = (struct rebinding){"sysctl",                             (void *)hook_sysctl,                                (void **)&orig_sysctl};
+            // g_rebindings[11] = (struct rebinding){"gethostname",                        (void *)hook_gethostname,                           (void **)&orig_gethostname};
 
-        // ---- 9. fishhook — hook 所有非系统镜像 + dyld 回调 ----
-        // v57 只 hook 主程序 → 百度 SDK 框架内部 sysctlbyname 绕过 hook，获取真实设备信息
-        // v57c: hook 所有非系统镜像 + dyld 回调（动态加载的框架也覆盖）
-        // 注意：v57c 没有闪退，闪退是 v57d 新加的 sysctl旧API/URL body/SystemVersion.plist 导致的
-        @try {
-            g_rebindings[0] = (struct rebinding){"sysctlbyname", (void *)hook_sysctlbyname, (void **)&orig_sysctlbyname};
-            g_rebindings[1] = (struct rebinding){"uname",        (void *)hook_uname,        (void **)&orig_uname};
-            // v59F: group 域身份键隔离（SDK 直接调 CFPreferences 时走这条）
-            g_rebindings[2] = (struct rebinding){"CFPreferencesCopyAppValue", (void *)hook_CFPrefCopyAppValue, (void **)&orig_CFPrefCopyAppValue};
-            g_rebindings[3] = (struct rebinding){"CFPreferencesCopyValue",    (void *)hook_CFPrefCopyValue,    (void **)&orig_CFPrefCopyValue};
-            g_rebindings[4] = (struct rebinding){"CFPreferencesSetAppValue",  (void *)hook_CFPrefSetAppValue,  (void **)&orig_CFPrefSetAppValue};
-            g_rebindings[5] = (struct rebinding){"CFPreferencesSetValue",     (void *)hook_CFPrefSetValue,     (void **)&orig_CFPrefSetValue};
-            // v60F: Keychain 命名空间隔离
-            g_rebindings[6] = (struct rebinding){"SecItemAdd",          (void *)hook_SecItemAdd,          (void **)&orig_SecItemAdd};
-            g_rebindings[7] = (struct rebinding){"SecItemCopyMatching", (void *)hook_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching};
-            g_rebindings[8] = (struct rebinding){"SecItemUpdate",       (void *)hook_SecItemUpdate,       (void **)&orig_SecItemUpdate};
-            g_rebindings[9] = (struct rebinding){"SecItemDelete",       (void *)hook_SecItemDelete,       (void **)&orig_SecItemDelete};
-
-            // 9a. hook 所有已加载的非系统镜像
+            // 7a. hook 所有已加载的非系统镜像
             uint32_t count = _dyld_image_count();
             for (uint32_t i = 0; i < count; i++) {
                 const struct mach_header *header = _dyld_get_image_header(i);
@@ -2236,18 +4513,440 @@ static void initPrivacyHook(void) {
                 rebind_symbols_image((void *)header, slide, g_rebindings, REBIND_COUNT);
             }
 
-            // 9b. 注册 dyld 回调 — 动态加载的框架也会被 hook（用 C 函数，不用 block）
+            // 7b. 注册 dyld 回调（动态加载的框架也覆盖，用全局 C 函数）
             _dyld_register_func_for_add_image(hook_new_image);
+
+            // ---- 8. v79: 真机画像落盘（把「哪一条读到本机」变成可核对的数据）----
+            // 目的不是改，而是记：真机在每条通道上的原始值到底是什么。
+            // 有了这张表才能判断「人格 / 特性位 / GPU / 开机时刻」是否真自洽，
+            // 而不是继续靠猜。
+            @try {
+                static const char *pk[] = {
+                    "hw.machine", "hw.model", "hw.cputype", "hw.cpusubtype",
+                    "hw.memsize", "hw.ncpu", "hw.physicalcpu",
+                    "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_I8MM",
+                    "kern.osversion", "kern.osrelease", "kern.boottime", "kern.hostname"
+                };
+                int (*realSysctl)(const char *, void *, size_t *, void *, size_t) =
+                    orig_sysctlbyname ? orig_sysctlbyname
+                                      : (int (*)(const char *, void *, size_t *, void *, size_t))
+                                        dlsym(RTLD_DEFAULT, "sysctlbyname");
+                NSMutableString *m = [NSMutableString stringWithFormat:
+                    @"\n===== v95 PROFILE %@ =====\n", [NSDate date]];
+                for (size_t i = 0; i < sizeof(pk)/sizeof(pk[0]); i++) {
+                    unsigned char buf[256];
+                    memset(buf, 0, sizeof(buf));
+                    size_t sz = sizeof(buf);
+                    int r = realSysctl ? realSysctl(pk[i], buf, &sz, NULL, 0) : -1;
+                    NSMutableString *hex = [NSMutableString string];
+                    for (size_t k = 0; k < sz && k < 24; k++) [hex appendFormat:@"%02x", buf[k]];
+                    [m appendFormat:@"  %-30s r=%d sz=%2zu hex=%@\n", pk[i], r, sz, hex];
+                }
+                [m appendFormat:@"  GPU_REAL     = %@\n", g_realGPUName ?: @"(null)"];
+                [m appendFormat:@"  FAKE_MACHINE = %s (MG ProductType)\n", FAKE_MACHINE];
+                [m appendFormat:@"  FAKE_MACH_LC = %s (sysctl/uname)\n", FAKE_MACHINE_LC];
+                [m appendFormat:@"  FAKE_HWMODEL = %s (board)\n", FAKE_HWMODEL];
+                [m appendFormat:@"  FAKE_HOST    = %s (all C channels)\n", g_fakeHost];
+                [m appendFormat:@"  bootOffset   = %lld s\n", g_bootOffset];
+                // v84: 单一 cuid 核对点 —— 所有通道（cookie/prefs/keychain/
+                //   请求参数）都必须是这同一个 51 位值。
+                [m appendFormat:@"  CUID_FAKE    = %@ (all identity channels)\n",
+                 getFakeID(@"PLATCUID")];
+                [m appendFormat:@"  BAIDUID_FAKE = %@\n", getFakeID(@"BAIDUID")];
+                [m appendFormat:@"  IDFV_FAKE    = %@\n",
+                 getPersistent(@"BdD1.iv", ^{ return genUUIDStr(); })];
+                [m appendFormat:@"  EPOCH        = %@\n",
+                 getPersistent(@"BdD1.epoch", ^{ return @"(none)"; })];
+
+                // v95: 真值清单落盘 —— 这份表就是「服务端可能看到的本机原值」，
+                //   出口取证时逐条比对，命中即漏点。
+                buildTruthList();
+                [m appendString:@"  --- TRUTH LIST (真机原值) ---\n"];
+                for (NSDictionary *p in g_truthPairs) {
+                    [m appendFormat:@"  %-24@ = %@\n", p[@"k"], p[@"v"]];
+                }
+
+                // v80: 真机 MobileGestalt 各字段原始值 —— 用 orig 指针绕过本 hook，
+                //   用来确认 ProductType / HardwareModel 在真机上的真实格式，
+                //   下一版按真机格式对齐（这三个键历史上被混用过）。
+                if (orig_MGCopyAnswer) {
+                    NSArray *mgk = @[@"ProductType", @"HardwareModel",
+                                     @"PhysicalMachineModel", @"ProductVersion",
+                                     @"BuildVersion", @"DeviceName",
+                                     @"UniqueDeviceID", @"SerialNumber"];
+                    for (NSString *k in mgk) {
+                        @try {
+                            CFTypeRef v = orig_MGCopyAnswer((__bridge CFStringRef)k, NULL);
+                            if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+                                [m appendFormat:@"  MG %-20@ = %@\n", k, (__bridge NSString *)v];
+                            } else {
+                                [m appendFormat:@"  MG %-20@ = (non-string/null)\n", k];
+                            }
+                        } @catch (id e2) {}
+                    }
+                }
+                // v80: uname 四字段真值 —— 确认 nodename/machine 的真机格式与大小写
+                if (orig_uname) {
+                    struct utsname uu;
+                    memset(&uu, 0, sizeof(uu));
+                    if (orig_uname(&uu) == 0) {
+                        [m appendFormat:@"  uname sysname  = %s\n", uu.sysname];
+                        [m appendFormat:@"  uname nodename = %s\n", uu.nodename];
+                        [m appendFormat:@"  uname release  = %s\n", uu.release];
+                        [m appendFormat:@"  uname machine  = %s\n", uu.machine];
+                    }
+                }
+
+                // v81: 实效校验 —— 走上过 hook 的通道，看 App 真正读到的值。
+                //   上面那批是真值（orig_*），只能证明「真机是什么」；
+                //   这一段才能证明「我们伪装成了什么」，两者对不上就是 bug。
+                @try {
+                    static const char *vk[] = {"hw.machine", "hw.model",
+                                               "kern.hostname", "kern.osrelease",
+                                               "kern.osversion"};
+                    for (size_t i = 0; i < sizeof(vk)/sizeof(vk[0]); i++) {
+                        char bb[256];
+                        memset(bb, 0, sizeof(bb));
+                        size_t ss = sizeof(bb);
+                        int rr = sysctlbyname(vk[i], bb, &ss, NULL, 0);
+                        [m appendFormat:@"  OUT %-15s = %s (r=%d)\n", vk[i], bb, rr];
+                    }
+                    struct utsname uh;
+                    memset(&uh, 0, sizeof(uh));
+                    if (uname(&uh) == 0) {
+                        [m appendFormat:@"  OUT uname.machine = %s | nodename = %s\n",
+                                          uh.machine, uh.nodename];
+                    }
+                    char hn[160];
+                    memset(hn, 0, sizeof(hn));
+                    if (gethostname(hn, sizeof(hn)) == 0) {
+                        [m appendFormat:@"  OUT gethostname    = %s\n", hn];
+                    }
+                    // v82: SoC 特性位实效 —— 必须与人格（iPhone13,4 / A14）一致
+                    int iv = -1; size_t is = sizeof(iv);
+                    if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &iv, &is, NULL, 0) == 0)
+                        [m appendFormat:@"  OUT FEAT_I8MM      = %d (A14=0)\n", iv];
+                    iv = -1; is = sizeof(iv);
+                    if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &iv, &is, NULL, 0) == 0)
+                        [m appendFormat:@"  OUT FEAT_DotProd   = %d (A14=1)\n", iv];
+                    // v82: GPU 名实效 —— 走 hook 后的 MTLCreateSystemDefaultDevice
+                    @try {
+                        void *hd = dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+                        if (hd) {
+                            id dev = ((id (*)(void))hd)();
+                            if (dev) {
+                                NSString *nm = [dev valueForKey:@"name"];
+                                [m appendFormat:@"  OUT GPU_NAME       = %@\n", nm ?: @"(nil)"];
+                            }
+                        }
+                    } @catch (id e4) {}
+                    [m appendFormat:@"  OUT FAKE_HOST_LEN  = %lu\n", (unsigned long)strlen(g_fakeHost)];
+                } @catch (id e3) {}
+                diagAppend(m);
+            } @catch (id e) {}
+
+            // ---- 7c/7d. v63 停用 → v74 恢复 7c（包标识伪装）----
+            //
+            // ★ 启动闪退根因（v59 好用、v62 崩，中间只有这两段是新增）★
+            //
+            // 7c（installBundleIdentifierHooks）把 NSBundle 的
+            //   -bundleIdentifier / -infoDictionary / -objectForInfoDictionaryKey
+            // 全局替换，而原实现判断「是不是主 bundle」用
+            //   bundle == [NSBundle mainBundle]
+            // 首次调用 [NSBundle mainBundle] 需要读自己的 Info.plist →
+            // 触发 -infoDictionary → 进 hook → 再调 [NSBundle mainBundle]
+            // （此刻尚未缓存）→ 无限递归 → 栈溢出 → 启动即崩。
+            //
+            // ★ v74 正式修复：installBundleIdentifierHooks() 内部在装 hook
+            //   **之前**先把 [NSBundle mainBundle] 指针缓存到
+            //   g_mainBundleCached，isMainBundleObject 只做指针比较，
+            //   hook 路径里再也没有 [NSBundle mainBundle]。递归不可能发生。
+            //
+            // 7d（dyld 枚举隐藏）仍停用：它 hook 的是 _dyld_image_count /
+            //   _dyld_get_image_name 等 dyld 自身 API，系统组件、ObjC 运行时、
+            //   崩溃上报 SDK 在启动早期都会调，每次 O(n) 遍历重映射 ——
+            //   与 7c 同批停用但从未单独二分验证。保持单一变量，先不开。
+            //
+            // ⚠️ v74: 7c 仅美团构建启用。百度 D/E/P/T 系列当前实测正常
+            //    （能下单、能进农场），没有证据需要动它的包标识；
+            //   在跑通的链路上加未经真机验证的 hook 属于自找变量。
+            //    百度侧真要用：先把 isMainBundleObject 的递归修复
+            //    （已在 v74 完成）带过去，再单独测一版。
+#if MT_CLONE
+            installBundleIdentifierHooks();
+#endif
+#if 0
+            @try {
+                static void *hideHdrs[HIDE_MAX_IMG];
+                static intptr_t hideSlides[HIDE_MAX_IMG];
+                int hideN = 0;
+                uint32_t cnt2 = _dyld_image_count();      // 此刻尚未被替换
+                for (uint32_t i = 0; i < cnt2 && hideN < HIDE_MAX_IMG; i++) {
+                    const struct mach_header *h = _dyld_get_image_header(i);
+                    const char *p = _dyld_get_image_name(i);
+                    if (!h || !p) continue;
+                    if (strncmp(p, "/usr/lib/", 9) == 0) continue;
+                    if (strncmp(p, "/System/", 8) == 0) continue;
+                    if (strncmp(p, "/Developer/", 11) == 0) continue;
+                    hideHdrs[hideN] = (void *)h;
+                    hideSlides[hideN] = _dyld_get_image_vmaddr_slide(i);
+                    hideN++;
+                }
+                for (int k = 0; k < hideN; k++) {
+                    rebind_symbols_image(hideHdrs[k], hideSlides[k],
+                                         g_hide_rebindings, HIDE_REBIND_COUNT);
+                }
+            } @catch (id e) {}
+#endif
+
+            // ---- 8. v68/v69: 诊断日志（T7）----
+            @try {
+                Class sc = objc_getClass("NSURLSession");
+                if (sc) {
+                    // 8a. block 型 data task（v68，含响应）
+                    SEL sel = @selector(dataTaskWithRequest:completionHandler:);
+                    Method m = class_getInstanceMethod(sc, sel);
+                    if (m) {
+                        IMP orig = method_getImplementation(m);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSessionDataTask *(id s, NSURLRequest *req,
+                                                     void (^ch)(NSData *, NSURLResponse *, NSError *)) {
+                                diagDumpRequest(req, @"REQ");
+                                if (!ch) {
+                                    return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(
+                                        s, @selector(dataTaskWithRequest:completionHandler:), req, nil);
+                                }
+                                void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
+                                    ^(NSData *d, NSURLResponse *r, NSError *e) {
+                                        @try {
+                                            if (e) diagDumpError(req, e, @"REQ");
+                                            if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                                diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
+                                            }
+                                        } @catch (id ex) {}
+                                        ch(d, r, e);
+                                    };
+                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(
+                                    s, @selector(dataTaskWithRequest:completionHandler:), req, wrapped);
+                            });
+                        class_replaceMethod(sc, sel, imp, method_getTypeEncoding(m));
+                    }
+                    // 8b. v69: delegate 型 data task（请求侧）
+                    SEL sel2 = @selector(dataTaskWithRequest:);
+                    Method m2 = class_getInstanceMethod(sc, sel2);
+                    if (m2) {
+                        IMP orig = method_getImplementation(m2);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSessionDataTask *(id s, NSURLRequest *req) {
+                                diagDumpRequest(req, @"DELEG-REQ");
+                                return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))orig)(
+                                    s, @selector(dataTaskWithRequest:), req);
+                            });
+                        class_replaceMethod(sc, sel2, imp, method_getTypeEncoding(m2));
+                    }
+                    // 8c. v69: block 型 upload task
+                    SEL sel3 = @selector(uploadTaskWithRequest:fromData:completionHandler:);
+                    Method m3 = class_getInstanceMethod(sc, sel3);
+                    if (m3) {
+                        IMP orig = method_getImplementation(m3);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSessionUploadTask *(id s, NSURLRequest *req, NSData *body,
+                                                      void (^ch)(NSData *, NSURLResponse *, NSError *)) {
+                                diagDumpRequest(req, @"UPL-REQ");
+                                if (body) diagAppend([NSString stringWithFormat:
+                                    @"  UPBODY: %@\n", [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding] ?: @"<binary>"]);
+                                if (!ch) {
+                                    return ((NSURLSessionUploadTask *(*)(id, SEL, NSURLRequest *, NSData *, id))orig)(
+                                        s, @selector(uploadTaskWithRequest:fromData:completionHandler:), req, body, nil);
+                                }
+                                void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
+                                    ^(NSData *d, NSURLResponse *r, NSError *e) {
+                                        @try {
+                                            if (e) diagDumpError(req, e, @"UPL");
+                                            if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                                diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
+                                            }
+                                        } @catch (id ex) {}
+                                        ch(d, r, e);
+                                    };
+                                return ((NSURLSessionUploadTask *(*)(id, SEL, NSURLRequest *, NSData *, id))orig)(
+                                    s, @selector(uploadTaskWithRequest:fromData:completionHandler:), req, body, wrapped);
+                            });
+                        class_replaceMethod(sc, sel3, imp, method_getTypeEncoding(m3));
+                    }
+                }
+                // 8d. v69: session 创建时抓 delegate → swizzle 其 didReceiveData/didComplete
+                @try {
+                    SEL csel = @selector(sessionWithConfiguration:delegate:delegateQueue:);
+                    Method cm = class_getClassMethod(objc_getClass("NSURLSession"), csel);
+                    if (cm) {
+                        IMP orig = method_getImplementation(cm);
+                        IMP imp = imp_implementationWithBlock(
+                            ^NSURLSession *(id s, NSURLSessionConfiguration *cfg, id dg, NSOperationQueue *q) {
+                                diagSwizzleNetDelegate(dg);
+                                return ((NSURLSession *(*)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *))orig)(
+                                    s, csel, cfg, dg, q);
+                            });
+                        method_setImplementation(cm, imp);
+                    }
+                    SEL isel = @selector(initWithConfiguration:delegate:delegateQueue:);
+                    Method im = class_getInstanceMethod(objc_getClass("NSURLSession"), isel);
+                    if (im) {
+                        IMP orig = method_getImplementation(im);
+                        IMP imp = imp_implementationWithBlock(
+                            ^id (id s, NSURLSessionConfiguration *cfg, id dg, NSOperationQueue *q) {
+                                diagSwizzleNetDelegate(dg);
+                                return ((id (*)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *))orig)(
+                                    s, isel, cfg, dg, q);
+                            });
+                        class_replaceMethod(objc_getClass("NSURLSession"), isel, imp, method_getTypeEncoding(im));
+                    }
+                } @catch (id e) {}
+                Class wc = objc_getClass("WKWebView");
+                if (wc) {
+                    SEL lsel = @selector(loadRequest:);
+                    Method lm = class_getInstanceMethod(wc, lsel);
+                    if (lm) {
+                        IMP orig = method_getImplementation(lm);
+                        IMP imp = imp_implementationWithBlock(^id (id s, NSURLRequest *req) {
+                            diagDumpRequest(req, @"WEBVIEW");
+                            return ((id (*)(id, SEL, NSURLRequest *))orig)(
+                                s, @selector(loadRequest:), req);
+                        });
+                        class_replaceMethod(wc, lsel, imp, method_getTypeEncoding(lm));
+                    }
+                }
+                // 8e. v69: 记录 H5↔原生 JSBridge 名单
+                @try {
+                    Class ucc = objc_getClass("WKUserContentController");
+                    if (ucc) {
+                        SEL asel = @selector(addScriptMessageHandler:name:);
+                        Method am = class_getInstanceMethod(ucc, asel);
+                        if (am) {
+                            IMP orig = method_getImplementation(am);
+                            IMP imp = imp_implementationWithBlock(
+                                ^void (id s, id handler, NSString *name) {
+                                    diagAppend([NSString stringWithFormat:@"\n[%@] JSBRIDGE register: %@\n", [NSDate date], name]);
+                                    ((void (*)(id, SEL, id, NSString *))orig)(s, asel, handler, name);
+                                });
+                            class_replaceMethod(ucc, asel, imp, method_getTypeEncoding(am));
+                        }
+                    }
+                } @catch (id e) {}
+                diagAppend(@"==== diag hooks v69 installed ====\n");
+
+                // ---- 8f. v74: NSURLConnection / NSURLProtocol 观测层 ----
+                // M1 抓包三次都看不到「获取验证码」的请求，必须先证明
+                // 「请求到底有没有出去」，否则所有修复都是盲猜。
+                // NSURLProtocol 是 URL 加载系统的最后一道公共入口：
+                // NSURLSession / NSURLConnection / WebView 的请求都会经过它。
+                @try {
+                    Class nc = objc_getClass("NSURLConnection");
+                    if (nc) {
+                        // +sendSynchronousRequest:returningResponse:error:
+                        SEL s1 = @selector(sendSynchronousRequest:returningResponse:error:);
+                        Method m1 = class_getClassMethod(nc, s1);
+                        if (m1) {
+                            IMP o1 = method_getImplementation(m1);
+                            IMP n1 = imp_implementationWithBlock(
+                                ^NSData *(id s, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
+                                    diagDumpConnRequest(req, @"CONN-SYNC");
+                                    NSData *d = ((NSData *(*)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **))o1)(
+                                        s, s1, req, resp, err);
+                                    @try {
+                                        if (resp && *resp && [*resp isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                            diagDumpResponse(req, (NSHTTPURLResponse *)*resp, d);
+                                        }
+                                    } @catch (id e) {}
+                                    return d;
+                                });
+                            method_setImplementation(m1, n1);
+                        }
+                        // +connectionWithRequest:delegate: / -initWithRequest:delegate:startImmediately:
+                        SEL s2 = @selector(connectionWithRequest:delegate:);
+                        Method m2 = class_getClassMethod(nc, s2);
+                        if (m2) {
+                            IMP o2 = method_getImplementation(m2);
+                            IMP n2 = imp_implementationWithBlock(^id(id s, NSURLRequest *req, id dg) {
+                                diagDumpConnRequest(req, @"CONN-REQ");
+                                return ((id (*)(id, SEL, NSURLRequest *, id))o2)(s, s2, req, dg);
+                            });
+                            method_setImplementation(m2, n2);
+                        }
+                        SEL s3 = @selector(initWithRequest:delegate:startImmediately:);
+                        Method m3 = class_getInstanceMethod(nc, s3);
+                        if (m3) {
+                            IMP o3 = method_getImplementation(m3);
+                            IMP n3 = imp_implementationWithBlock(^id(id s, NSURLRequest *req, id dg, BOOL start) {
+                                diagDumpConnRequest(req, @"CONN-INIT");
+                                return ((id (*)(id, SEL, NSURLRequest *, id, BOOL))o3)(s, s3, req, dg, start);
+                            });
+                            class_replaceMethod(nc, s3, n3, method_getTypeEncoding(m3));
+                        }
+                        SEL s4 = @selector(sendAsynchronousRequest:queue:completionHandler:);
+                        Method m4 = class_getClassMethod(nc, s4);
+                        if (m4) {
+                            IMP o4 = method_getImplementation(m4);
+                            IMP n4 = imp_implementationWithBlock(
+                                ^void(id s, NSURLRequest *req, NSOperationQueue *q,
+                                      void (^h)(NSURLResponse *, NSData *, NSError *)) {
+                                    diagDumpConnRequest(req, @"CONN-ASYNC");
+                                    if (!h) {
+                                        ((void (*)(id, SEL, NSURLRequest *, NSOperationQueue *, id))o4)(s, s4, req, q, nil);
+                                        return;
+                                    }
+                                    void (^w)(NSURLResponse *, NSData *, NSError *) =
+                                        ^(NSURLResponse *r, NSData *d, NSError *e) {
+                                            @try {
+                                                if (e) diagDumpError(req, e, @"CONN");
+                                                if ([r isKindOfClass:objc_getClass("NSHTTPURLResponse")]) {
+                                                    diagDumpResponse(req, (NSHTTPURLResponse *)r, d);
+                                                }
+                                            } @catch (id ex) {}
+                                            h(r, d, e);
+                                        };
+                                    ((void (*)(id, SEL, NSURLRequest *, NSOperationQueue *, id))o4)(s, s4, req, q, w);
+                                });
+                            method_setImplementation(m4, n4);
+                        }
+                    }
+                    // NSURLProtocol 兜底：记录所有进入 URL 加载系统的请求
+                    Class np = objc_getClass("NSURLProtocol");
+                    if (np) {
+                        SEL psel = @selector(initWithRequest:cachedResponse:client:);
+                        Method pm = class_getInstanceMethod(np, psel);
+                        if (pm) {
+                            IMP op = method_getImplementation(pm);
+                            IMP npi = imp_implementationWithBlock(^id(id s, NSURLRequest *req, NSCachedURLResponse *cr, id client) {
+                                diagDumpConnRequest(req, @"PROTO");
+                                return ((id (*)(id, SEL, NSURLRequest *, NSCachedURLResponse *, id))op)(s, psel, req, cr, client);
+                            });
+                            class_replaceMethod(np, psel, npi, method_getTypeEncoding(pm));
+                        }
+                    }
+                } @catch (id e) {}
+                diagAppend(@"==== diag hooks v74 (conn/proto) installed ====\n");
+            } @catch (id e) {}
         } @catch (id e) {}
 
-        // ---- 10. v70F: 认领共享登录组里的既有票据 ----
-        // 必须在 fishhook 装好之后（要用 orig_SecItemCopyMatching），
-        // 也必须在 App 主程序发起任何 keychain 查询之前（constructor 满足）。
-        // 做完这一步，本 clone 的白名单里就有了当前登录态所需的全部条目，
-        // 打开 App 不会变成未登录。
-        kcMigrate();
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kca"),
-                                 (__bridge CFStringRef)@"1",
-                                 kCFPreferencesCurrentApplication);
+        // ---- 9. v85: WebKit 侧 cookie 对齐 ----
+        // 启动后两次（2s/8s：等 WKWebView 网络进程就绪、等首屏落地），
+        // 之后每次回到前台再刷一次 —— 服务端可能刚下发新的 BAIDUID。
+        @try {
+            for (NSNumber *d in @[@2.0, @8.0]) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                        (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                        dispatch_get_main_queue(), ^{ alignWebKitCookieStore(); });
+            }
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:@"UIApplicationDidBecomeActiveNotification"
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *n) { alignWebKitCookieStore(); }];
+        } @catch (id e) {}
+
+        // ---- 10. v86: WKWebView H5 探针 ----
+        // 必须在 App 创建任何 WKWebView 之前装好，否则首批 webview 挂不上脚本。
+        @try { installWKProbe(); } @catch (id e) {}
     }
 }
