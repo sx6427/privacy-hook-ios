@@ -852,7 +852,9 @@ static BOOL kcBaiduIDStr(NSString *v) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         ks = @[@"shareloginaccount", @"sapi_share_login", @"baiducuid", @"passport.bduss",
-               @"bduss", @"stoken", @"ptoken"];
+               @"bduss", @"stoken", @"ptoken",
+               // v77F: keychain 里的设备 ID 组，全机共享，必须一起私有化
+               @"baidumobile.cuid", @"baidumobile.maincuid"];
     });
     for (NSString *k in ks) {
         if ([l rangeOfString:k].location != NSNotFound) return YES;
@@ -873,6 +875,9 @@ static BOOL kcBaiduIDDict(NSDictionary *d) {
         if ([l rangeOfString:@"shareloginaccount"].location != NSNotFound) return YES;
         if ([l rangeOfString:@"passport.bduss"].location != NSNotFound) return YES;
         if ([l rangeOfString:@"baiducuid"].location != NSNotFound) return YES;
+        // v77F: com.baidu.baidumobile.mainCUID / cuidDeviceInfo / cuidPrevious
+        if ([l rangeOfString:@"baidumobile.cuid"].location != NSNotFound) return YES;
+        if ([l rangeOfString:@"baidumobile.maincuid"].location != NSNotFound) return YES;
     }
     return NO;
 }
@@ -882,6 +887,16 @@ static BOOL kcShareLoginItem(NSDictionary *item) {
     id ag = item[(__bridge id)kSecAttrAccessGroup];
     if (![ag isKindOfClass:[NSString class]]) return NO;
     return [((NSString *)ag).lowercaseString rangeOfString:@"shareloginaccount"].location != NSNotFound;
+}
+
+// v77F: keychain 设备 ID 组（B83JBVZ6M5.com.baidu.baidumobile.cuid）
+// 里面是 mainCUID(50 字符 32hex+18字母)、cuidDeviceInfo(机型)、cuidPrevious。
+// 全机共享一份，所有 clone 上报同一个设备 ID —— 这是多开被识别的根因。
+static BOOL kcCuidItem(NSDictionary *d) {
+    if (![d isKindOfClass:[NSDictionary class]]) return NO;
+    id ag = d[(__bridge id)kSecAttrAccessGroup];
+    if (![ag isKindOfClass:[NSString class]]) return NO;
+    return [((NSString *)ag).lowercaseString rangeOfString:@"baidumobile.cuid"].location != NSNotFound;
 }
 
 // 只剔除「别人写进共享登录组」的条目；本 clone 写过的放行
@@ -950,7 +965,7 @@ static CFTypeRef kcFilterLoginShared(CFTypeRef res) {
     if (!res) return res;
     if (CFGetTypeID(res) == CFDictionaryGetTypeID()) {
         NSDictionary *d = (__bridge NSDictionary *)res;
-        if (kcShareLoginItem(d) && !kcIsPrivLogin(d)) { CFRelease(res); return NULL; }
+        if ((kcShareLoginItem(d) || kcCuidItem(d)) && !kcIsPrivLogin(d)) { CFRelease(res); return NULL; }
         CFTypeRef out = kcStripCopy(d);
         CFRelease(res);
         return out;
@@ -964,7 +979,7 @@ static CFTypeRef kcFilterLoginShared(CFTypeRef res) {
         CFTypeRef o = CFArrayGetValueAtIndex(arr, i);
         if (!o || CFGetTypeID(o) != CFDictionaryGetTypeID()) { CFArrayAppendValue(out, o); continue; }
         NSDictionary *d = (__bridge NSDictionary *)o;
-        if (kcShareLoginItem(d) && !kcIsPrivLogin(d)) continue;
+        if ((kcShareLoginItem(d) || kcCuidItem(d)) && !kcIsPrivLogin(d)) continue;
         CFTypeRef so = kcStripCopy(d);
         CFArrayAppendValue(out, so);
         CFRelease(so);
@@ -1082,10 +1097,10 @@ static void kcMigrate(void) {
     @try {
         // v75F: 一次性抓 cuid 组结构
         CFPropertyListRef vd = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcvd2"), kCFPreferencesCurrentApplication);
+            (__bridge CFStringRef)FKEY(@"kcvd3"), kCFPreferencesCurrentApplication);
         if (!vd) {
             if (orig_SecItemCopyMatching) kcDumpCuidGroup();
-            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcvd2"),
+            CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcvd3"),
                                      kCFBooleanTrue, kCFPreferencesCurrentApplication);
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
         } else { CFRelease(vd); }
