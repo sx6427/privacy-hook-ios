@@ -46,8 +46,8 @@ static NSString *agSeed(void);
 static uint32_t agMix(const char *, uint32_t);
 static int (*orig_gethostuuid)(uuid_t, const struct timespec *) = NULL;
 
-static int hook_gethostuuid(uuid_t id, const struct timespec *wait) {
-    if (!id) return orig_gethostuuid ? orig_gethostuuid(id, wait) : -1;
+static int hook_gethostuuid(uuid_t out, const struct timespec *wait) {
+    if (!out) return orig_gethostuuid ? orig_gethostuuid(out, wait) : -1;
     @try {
         NSString *sd = [NSString stringWithFormat:@"%@|hostuuid", agSeed()];
         const char *pp = sd.UTF8String;
@@ -56,12 +56,12 @@ static int hook_gethostuuid(uuid_t id, const struct timespec *wait) {
         v[1] = agMix(pp, 2203u);
         v[2] = agMix(pp, 3307u);
         v[3] = agMix(pp, 4409u);
-        memcpy(id, v, 16);
-        id[6] = (uuid_t)((id[6] & 0x0F) | 0x40);
-        id[8] = (uuid_t)((id[8] & 0x3F) | 0x80);
+        memcpy(out, v, 16);
+        out[6] = (unsigned char)((out[6] & 0x0F) | 0x40);
+        out[8] = (unsigned char)((out[8] & 0x3F) | 0x80);
         return 0;
     } @catch (id e) {}
-    return orig_gethostuuid ? orig_gethostuuid(id, wait) : -1;
+    return orig_gethostuuid ? orig_gethostuuid(out, wait) : -1;
 }
 static int (*orig_uname)(struct utsname *) = NULL;
 
