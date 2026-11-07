@@ -851,7 +851,7 @@ static BOOL kcBaiduIDStr(NSString *v) {
     static NSArray *ks = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        ks = @[@"shareloginaccount", @"baiducuid", @"passport.bduss",
+        ks = @[@"shareloginaccount", @"sapi_share_login", @"baiducuid", @"passport.bduss",
                @"bduss", @"stoken", @"ptoken"];
     });
     for (NSString *k in ks) {
@@ -885,12 +885,59 @@ static BOOL kcShareLoginItem(NSDictionary *item) {
 }
 
 // 只剔除「别人写进共享登录组」的条目；本 clone 写过的放行
+// ---- v73F: 实例私有 service 命名空间 ----
+// 登录票据统一存到 "原名.BdFn" 下，读取时再还原成原名返回上层。
+// 这样每个 clone 物理上只有自己那一份，不会互相看见，也不影响支付链路。
+static BOOL kcIsPrivSvc(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
+    return [s hasSuffix:kcSuffix()];
+}
+
+static NSString *kcBaseStr(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return s;
+    NSString *t = s;
+    NSString *sfx = kcSuffix();
+    if ([t hasSuffix:sfx] && t.length > sfx.length)
+        t = [t substringToIndex:t.length - sfx.length];
+    NSString *pre = [NSString stringWithFormat:@"bdpriv.%@.", fpx()];
+    if ([t hasPrefix:pre] && t.length > pre.length)
+        t = [t substringFromIndex:pre.length];
+    return t;
+}
+
+static BOOL kcIsPrivLogin(NSDictionary *d) {
+    id svc  = d[(__bridge id)kSecAttrService];
+    id acct = d[(__bridge id)kSecAttrAccount];
+    // 只认 "原名.BdFn" 这一种私有形式。
+    // bdpriv.BdFn.* 是 v67F 的遗留副本，仅作迁移来源，不再对外暴露。
+    return (kcIsPrivSvc(svc) || kcIsPrivSvc(acct));
+}
+
+// 总是返回 +1 的新字典，service/account 去掉后缀
+static CFTypeRef kcStripCopy(NSDictionary *d) {
+    NSMutableDictionary *m = [d mutableCopy];
+    id svc  = d[(__bridge id)kSecAttrService];
+    id acct = d[(__bridge id)kSecAttrAccount];
+    if ([svc isKindOfClass:[NSString class]]) {
+        NSString *b = kcBaseStr((NSString *)svc);
+        if (b) m[(__bridge id)kSecAttrService] = b;
+    }
+    if ([acct isKindOfClass:[NSString class]]) {
+        NSString *b = kcBaseStr((NSString *)acct);
+        if (b) m[(__bridge id)kSecAttrAccount] = b;
+    }
+    return (__bridge_retained CFTypeRef)[m copy];
+}
+
+// 共享登录组：只放行本实例私有条目；其它一律剔除（防串号）
 static CFTypeRef kcFilterLoginShared(CFTypeRef res) {
     if (!res) return res;
     if (CFGetTypeID(res) == CFDictionaryGetTypeID()) {
         NSDictionary *d = (__bridge NSDictionary *)res;
-        if (kcShareLoginItem(d) && !kcIsOwned(d)) { CFRelease(res); return NULL; }
-        return res;
+        if (kcShareLoginItem(d) && !kcIsPrivLogin(d)) { CFRelease(res); return NULL; }
+        CFTypeRef out = kcStripCopy(d);
+        CFRelease(res);
+        return out;
     }
     if (CFGetTypeID(res) != CFArrayGetTypeID()) return res;
     CFArrayRef arr = (CFArrayRef)res;
@@ -899,11 +946,12 @@ static CFTypeRef kcFilterLoginShared(CFTypeRef res) {
     if (!out) return res;
     for (CFIndex i = 0; i < n; i++) {
         CFTypeRef o = CFArrayGetValueAtIndex(arr, i);
-        if (o && CFGetTypeID(o) == CFDictionaryGetTypeID()) {
-            NSDictionary *d = (__bridge NSDictionary *)o;
-            if (kcShareLoginItem(d) && !kcIsOwned(d)) continue;
-        }
-        CFArrayAppendValue(out, o);
+        if (!o || CFGetTypeID(o) != CFDictionaryGetTypeID()) { CFArrayAppendValue(out, o); continue; }
+        NSDictionary *d = (__bridge NSDictionary *)o;
+        if (kcShareLoginItem(d) && !kcIsPrivLogin(d)) continue;
+        CFTypeRef so = kcStripCopy(d);
+        CFArrayAppendValue(out, so);
+        CFRelease(so);
     }
     CFRelease(res);
     return out;
@@ -938,40 +986,26 @@ static void kcDumpLine(NSString *line) {
     } @catch (id e) {}
 }
 
-static void kcAdoptExisting(void) {
+// ============================================================
+// v73F: 把共享登录票据迁移进本实例私有命名空间（只做一次）
+//
+// 源优先级：
+//   3  sapi_xxx.BdFn            （本实例此前已私有化，最可信）
+//   2  bdpriv.BdFn.sapi_xxx.BdFn（v67F 时代留下的私有副本）
+//   1  基名 sapi_xxx             （共享，最后才用）
+// 每个逻辑键只取一个源，已有私有条目的跳过。
+// ============================================================
+static void kcMigrate(void) {
     @try {
-        // v72F: kcv3 不存在时强制重跑一次全量认领（清掉 v71F 精确模式留下的残缺白名单）
-        // 按新规则重跑一次（清空旧的「全量认领」结果再重新挑）。
-        CFPropertyListRef v2 = CFPreferencesCopyAppValue(
-            (__bridge CFStringRef)FKEY(@"kcv3"), kCFPreferencesCurrentApplication);
-        if (v2) { CFRelease(v2); return; }
+        CFPropertyListRef v4 = CFPreferencesCopyAppValue(
+            (__bridge CFStringRef)FKEY(@"kcv4"), kCFPreferencesCurrentApplication);
+        if (v4) { CFRelease(v4); return; }
         if (!orig_SecItemCopyMatching) return;
-
-        kcForgetAll();
-
-        NSDateFormatter *df = [[NSDateFormatter alloc] init];
-        df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-        kcDumpLine([NSString stringWithFormat:@"==== fpx=%@ ====", fpx()]);
-
-        @try {
-            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-            NSDictionary *rep = [ud dictionaryRepresentation];
-            for (NSString *k in rep.allKeys) {
-                NSString *l = k.lowercaseString;
-                if (!([l rangeOfString:@"uid"].location != NSNotFound ||
-                      [l rangeOfString:@"baidu"].location != NSNotFound ||
-                      [l rangeOfString:@"passport"].location != NSNotFound ||
-                      [l rangeOfString:@"account"].location != NSNotFound ||
-                      [l rangeOfString:@"cuid"].location != NSNotFound)) continue;
-                NSString *v = [rep[k] description];
-                if (v.length > 80) v = [v substringToIndex:80];
-                kcDumpLine([NSString stringWithFormat:@"[UD] %@ = %@", k, v]);
-            }
-        } @catch (id e) {}
 
         NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
                             (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-                            (__bridge id)kSecReturnAttributes: @YES};
+                            (__bridge id)kSecReturnAttributes: @YES,
+                            (__bridge id)kSecReturnData: @YES};
         CFTypeRef all = NULL;
         OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)q, &all);
         if (st != errSecSuccess || !all) { if (all) CFRelease(all); return; }
@@ -980,42 +1014,59 @@ static void kcAdoptExisting(void) {
         if (CFGetTypeID(all) == CFArrayGetTypeID()) arr = (__bridge NSArray *)all;
         else if (CFGetTypeID(all) == CFDictionaryGetTypeID()) arr = @[(__bridge id)all];
 
-        NSMutableArray *cands = [NSMutableArray array];
-        NSMutableArray *mine  = [NSMutableArray array];
-        NSString *fx = fpx();
-        if (arr) {
-            for (id o in arr) {
-                if (![o isKindOfClass:[NSDictionary class]]) continue;
-                NSDictionary *d = (NSDictionary *)o;
-                if (!kcShareLoginItem(d)) continue;
-                [cands addObject:d];
+        NSString *pre = [NSString stringWithFormat:@"bdpriv.%@.", fpx()];
+        NSMutableDictionary *best = [NSMutableDictionary dictionary];
+        NSMutableSet *hasPriv = [NSMutableSet set];
 
-                id svc = d[(__bridge id)kSecAttrService];
-                id acct = d[(__bridge id)kSecAttrAccount];
-                id agrp = d[(__bridge id)kSecAttrAccessGroup];
-                id md = d[(__bridge id)kSecAttrModificationDate];
-                NSString *ss = [svc isKindOfClass:[NSString class]] ? (NSString *)svc : @"-";
-                NSString *aa = [acct isKindOfClass:[NSString class]] ? (NSString *)acct : @"-";
-                NSString *gg = [agrp isKindOfClass:[NSString class]] ? (NSString *)agrp : @"-";
-                NSString *tt = [md isKindOfClass:[NSDate class]] ? [df stringFromDate:(NSDate *)md] : @"-";
-                kcDumpLine([NSString stringWithFormat:@"[KC] agrp=%@ svc=%@ acct=%@ mdat=%@", gg, ss, aa, tt]);
+        for (id o in arr) {
+            if (![o isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *d = (NSDictionary *)o;
+            if (!kcShareLoginItem(d)) continue;
+            id svc  = d[(__bridge id)kSecAttrService];
+            id acct = d[(__bridge id)kSecAttrAccount];
+            if (![svc isKindOfClass:[NSString class]] || ![acct isKindOfClass:[NSString class]]) continue;
+            NSString *lsvc  = kcBaseStr((NSString *)svc);
+            NSString *lacct = kcBaseStr((NSString *)acct);
+            NSString *key = [NSString stringWithFormat:@"%@\x1f%@", lsvc, lacct];
 
-                NSString *blob = [NSString stringWithFormat:@"%@\x1f%@", ss, aa];
-                if ([blob rangeOfString:fx options:NSCaseInsensitiveSearch].location != NSNotFound)
-                    [mine addObject:d];
-            }
+            int pri = 1;
+            if (kcIsPrivSvc((NSString *)svc) && ![(NSString *)svc hasPrefix:@"bdpriv."]) pri = 3;
+            else if ([(NSString *)svc hasPrefix:pre]) pri = 2;
+            if (pri == 3) [hasPriv addObject:key];
+
+            NSArray *cur = best[key];
+            if (!cur || [(NSNumber *)cur[0] intValue] < pri)
+                best[key] = @[@(pri), d];
+        }
+
+        int added = 0, skipped = 0, failed = 0;
+        for (NSString *key in best) {
+            if ([hasPriv containsObject:key]) { skipped++; continue; }
+            NSDictionary *d = best[key][1];
+            NSString *svc  = d[(__bridge id)kSecAttrService];
+            NSString *acct = d[(__bridge id)kSecAttrAccount];
+            NSMutableDictionary *a = [NSMutableDictionary dictionary];
+            a[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+            a[(__bridge id)kSecAttrService] = [kcBaseStr(svc) stringByAppendingString:kcSuffix()];
+            a[(__bridge id)kSecAttrAccount] = [kcBaseStr(acct) stringByAppendingString:kcSuffix()];
+            id v = d[(__bridge id)kSecValueData];
+            if (v) a[(__bridge id)kSecValueData] = v;
+            id ag = d[(__bridge id)kSecAttrAccessGroup];
+            if (ag) a[(__bridge id)kSecAttrAccessGroup] = ag;
+            id acc = d[(__bridge id)kSecAttrAccessible];
+            if (acc) a[(__bridge id)kSecAttrAccessible] = acc;
+            OSStatus s2 = orig_SecItemAdd((__bridge CFDictionaryRef)a, NULL);
+            if (s2 == errSecSuccess || s2 == errSecDuplicateItem) added++;
+            else failed++;
         }
         CFRelease(all);
 
-        NSArray *take = cands;  // v72F: 回到全量认领（与 F3 验证通过的 v70F 行为一致）
-        kcDumpLine([NSString stringWithFormat:@"[PICK] cands=%lu mine=%lu take=%lu mode=%@",
-                    (unsigned long)cands.count, (unsigned long)mine.count,
-                    (unsigned long)take.count, mine.count > 0 ? @"exact" : @"all"]);
-        for (NSDictionary *d in take) kcRemember(d);
+        kcDumpLine([NSString stringWithFormat:@"[MIGRATE] fpx=%@ keys=%lu added=%d skipped=%d failed=%d",
+                    fpx(), (unsigned long)best.count, added, skipped, failed]);
 
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcadopt"),
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv4"),
                                  kCFBooleanTrue, kCFPreferencesCurrentApplication);
-        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcv3"),
+        CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kcadopt"),
                                  kCFBooleanTrue, kCFPreferencesCurrentApplication);
         CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
     } @catch (id e) {}
@@ -1044,12 +1095,11 @@ static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
 
 static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     if (!orig_SecItemCopyMatching) return errSecParam;
-    // 非登录票据：原样透传（枚举、钱包、推送、证书一律不动）
-    if (!query || !kcBaiduIDDict((__bridge NSDictionary *)query)) {
+    BOOL ident = query && kcBaiduIDDict((__bridge NSDictionary *)query);
+    if (!ident) {
         OSStatus st0 = orig_SecItemCopyMatching(query, result);
-        if (query && kcPayNS((__bridge NSDictionary *)query)) {
+        if (query && kcPayNS((__bridge NSDictionary *)query))
             kcLogPay("GET-PASS", (__bridge NSDictionary *)query, st0);
-        }
         if (st0 == errSecSuccess && result && *result) {
             @try {
                 CFTypeRef f = kcFilterLoginShared(*result);
@@ -1061,34 +1111,12 @@ static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *resul
     }
     @try {
         CFDictionaryRef rq = kcRewrite(query);
-        OSStatus st;
-        if (rq) {
-            st = orig_SecItemCopyMatching(rq, result);
-            CFRelease(rq);
-        } else {
-            // query 只有 accessGroup / class，没有可加后缀的定位键：
-            // 直接查共享域，但返回值照样要过白名单（v70F）
-            st = orig_SecItemCopyMatching(query, result);
-        }
-
-        if (st != errSecSuccess) {
-            // v70F: 私有命名空间里没有（升级前的旧票据、或上面提到的无定位键查询）
-            // → 回退共享域读一次。只读、且仍然按 owned 白名单过滤，
-            //   所以能拿回本 clone 自己的登录态，但不会把别人的票据带进来。
-            CFTypeRef r2 = NULL;
-            OSStatus s2 = orig_SecItemCopyMatching(query, &r2);
-            if (s2 == errSecSuccess && r2) {
-                CFTypeRef f = kcFilterLoginShared(r2);
-                if (f) {
-                    if (result) *result = f; else CFRelease(f);
-                    return errSecSuccess;
-                }
-                return errSecItemNotFound;
-            }
-            if (r2) CFRelease(r2);
-            return st;
-        }
-
+        OSStatus st = rq ? orig_SecItemCopyMatching(rq, result)
+                         : orig_SecItemCopyMatching(query, result);
+        if (rq) CFRelease(rq);
+        // v73F: 不再回退共享域。私有域就是唯一来源，读不到即未登录，
+        // 但迁移做了兜底，正常情况下登录态不会丢。
+        if (st != errSecSuccess) return st;
         if (result && *result) {
             CFTypeRef f = kcFilterLoginShared(*result);
             *result = f;
@@ -1851,7 +1879,7 @@ static void initPrivacyHook(void) {
         // 也必须在 App 主程序发起任何 keychain 查询之前（constructor 满足）。
         // 做完这一步，本 clone 的白名单里就有了当前登录态所需的全部条目，
         // 打开 App 不会变成未登录。
-        kcAdoptExisting();
+        kcMigrate();
         CFPreferencesSetAppValue((__bridge CFStringRef)FKEY(@"kca"),
                                  (__bridge CFStringRef)@"1",
                                  kCFPreferencesCurrentApplication);
