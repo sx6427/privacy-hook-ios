@@ -1577,11 +1577,6 @@ static void devFingerprintDump(void) {
                           sc.nativeBounds.size.width, sc.nativeBounds.size.height]];
             [o addObject:[NSString stringWithFormat:@"[DEVF] UIScreen.scale = %.2f nativeScale = %.2f",
                           sc.scale, sc.nativeScale]];
-            if (@available(iOS 11.0, *)) {
-                UIEdgeInsets si = sc.safeAreaInsets;
-                [o addObject:[NSString stringWithFormat:@"[DEVF] safeArea = %.0f/%.0f/%.0f/%.0f",
-                              si.top, si.left, si.bottom, si.right]];
-            }
         } @catch (id e) {}
 
         // 磁盘（走的是 hook 后的 statfs）
