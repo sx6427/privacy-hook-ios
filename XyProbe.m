@@ -790,6 +790,25 @@ static void pollCmd(void) {
             W(@"openurl n=%lu gap=%.0f fg=%d", (unsigned long)gOpenQueue.count, gap,
               (int)([UIApplication sharedApplication].applicationState == UIApplicationStateActive));
             xyOpenNext(gap);
+        } else if ([mode isEqualToString:@"webopen"]) {
+            NSString *us = obj[@"url"];
+            if ([us isKindOfClass:[NSString class]] && us.length > 10) {
+                NSURL *uu = [NSURL URLWithString:us];
+                W(@"webopen %@", [us substringToIndex:MIN((NSUInteger)120, us.length)]);
+                if (uu) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (gWebView) {
+                            [gWebView loadRequest:[NSURLRequest requestWithURL:uu]];
+                            W(@"webopen ok on %@", NSStringFromClass([gWebView class]));
+                        } else {
+                            W(@"webopen: no webview, fallback openURL");
+                            xyOpenOne(us);
+                        }
+                    });
+                }
+            } else {
+                W(@"webopen: bad url");
+            }
         } else if ([mode isEqualToString:@"webdump"]) {
             gWebDump = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
             if (gWebDump) xySwizzleWeb();
@@ -835,7 +854,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.9 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl + webdump)");
+            W(@"v7.10 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl + webdump + webopen)");
             flushLogs();
         });
     }
