@@ -735,7 +735,7 @@ static void my_wv_loadRequest(id self, SEL _cmd, NSURLRequest *req) {
     orig_wv_loadRequest(self, _cmd, req);
 }
 
-static void (*orig_wv_init)(id, SEL, CGRect, WKWebViewConfiguration *);
+static id (*orig_wv_init)(id, SEL, CGRect, WKWebViewConfiguration *);
 
 static id my_wv_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
     id r = orig_wv_init(self, _cmd, frame, cfg);
