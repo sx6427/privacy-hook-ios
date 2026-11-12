@@ -790,6 +790,24 @@ static void pollCmd(void) {
             W(@"openurl n=%lu gap=%.0f fg=%d", (unsigned long)gOpenQueue.count, gap,
               (int)([UIApplication sharedApplication].applicationState == UIApplicationStateActive));
             xyOpenNext(gap);
+        } else if ([mode isEqualToString:@"eval"]) {
+            NSString *js = obj[@"js"];
+            NSString *tag = obj[@"tag"] ?: @"-";
+            if ([js isKindOfClass:[NSString class]] && js.length > 3) {
+                W(@"eval[%@] n=%lu", tag, (unsigned long)js.length);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (!gWebView) { W(@"eval[%@]: no webview", tag); return; }
+                    [gWebView evaluateJavaScript:js completionHandler:^(id res, NSError *err) {
+                        NSString *s = res ? [res description] : @"(nil)";
+                        if (s.length > 800) s = [s substringToIndex:800];
+                        W(@"EVALRES[%@] %@", tag, s);
+                        if (err) W(@"EVALERR[%@] %@", tag, err.localizedDescription);
+                        flushLogs();
+                    }];
+                });
+            } else {
+                W(@"eval: bad js");
+            }
         } else if ([mode isEqualToString:@"webopen"]) {
             NSString *us = obj[@"url"];
             if ([us isKindOfClass:[NSString class]] && us.length > 10) {
@@ -854,7 +872,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.10 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl + webdump + webopen)");
+            W(@"v7.11 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl + webdump + webopen + eval)");
             flushLogs();
         });
     }
