@@ -746,6 +746,35 @@ static id my_wv_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cf
     return r;
 }
 
+// 从窗口视图树里找能 loadRequest 的视图（兼容淘宝系 WebView 子类）
+static void xyScanTree(UIView *v, int depth, id *best, CGFloat *area, NSMutableArray *log) {
+    if (!v || depth > 24) return;
+    @try {
+        if ([v respondsToSelector:@selector(loadRequest:)]) {
+            CGRect f = v.frame;
+            CGFloat a = f.size.width * f.size.height;
+            if (log && log.count < 14) {
+                [log addObject:[NSString stringWithFormat:@"%@ %.0fx%.0f win=%d hid=%d",
+                                NSStringFromClass([v class]), f.size.width, f.size.height,
+                                (int)(v.window != nil), (int)v.hidden]];
+            }
+            if (v.window && !v.hidden && a > *area) { *area = a; *best = v; }
+        }
+        for (UIView *s in v.subviews) xyScanTree(s, depth + 1, best, area, log);
+    } @catch (id e) {}
+}
+
+static id xyFindTreeWeb(NSMutableArray *log) {
+    id best = nil;
+    CGFloat area = 0;
+    @try {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            xyScanTree(w, 0, &best, &area, log);
+        }
+    } @catch (id e) {}
+    return best;
+}
+
 // 挑一个真的显示在屏幕上的 webview（有 window、尺寸正常、不太小）
 static WKWebView *xyPickVisibleWebView(void) {
     WKWebView *best = nil;
@@ -759,6 +788,10 @@ static WKWebView *xyPickVisibleWebView(void) {
             if (f.size.width < 120 || f.size.height < 120) continue;
             CGFloat a = f.size.width * f.size.height;
             if (a > bestArea) { bestArea = a; best = w; }
+        }
+        if (!best) {
+            id t = xyFindTreeWeb(nil);
+            if ([t isKindOfClass:[WKWebView class]]) best = (WKWebView *)t;
         }
     } @catch (id e) {}
     return best;
@@ -859,15 +892,19 @@ static void pollCmd(void) {
                 W(@"webopen pick=%@ %@", pick, [us substringToIndex:MIN((NSUInteger)110, us.length)]);
                 if (uu) {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        WKWebView *target = nil;
-                        if ([pick isEqualToString:@"visible"]) target = xyPickVisibleWebView();
-                        if (!target) target = xyPickVisibleWebView();
+                        id target = xyPickVisibleWebView();
+                        if (!target) target = xyFindTreeWeb(nil);
                         if (!target) target = gWebView;
                         if (target) {
-                            gWebView = target;
-                            [target loadRequest:[NSURLRequest requestWithURL:uu]];
-                            W(@"webopen ok on %@ frame=%.0fx%.0f win=%d", NSStringFromClass([target class]),
-                              target.frame.size.width, target.frame.size.height, (int)(target.window != nil));
+                            if ([target isKindOfClass:[WKWebView class]]) gWebView = (WKWebView *)target;
+                            NSURLRequest *rq = [NSURLRequest requestWithURL:uu];
+                            if ([target respondsToSelector:@selector(loadRequest:)]) {
+                                [target performSelector:@selector(loadRequest:) withObject:rq];
+                            }
+                            UIView *tv = (UIView *)target;
+                            W(@"webopen ok on %@ frame=%.0fx%.0f win=%d",
+                              NSStringFromClass([target class]),
+                              tv.frame.size.width, tv.frame.size.height, (int)(tv.window != nil));
                         } else {
                             W(@"webopen: no webview at all, fallback openURL");
                             xyOpenOne(us);
@@ -878,16 +915,23 @@ static void pollCmd(void) {
                 W(@"webopen: bad url");
             }
         } else if ([mode isEqualToString:@"webviews"]) {
-            NSArray *all = gWebViews.allObjects;
-            W(@"webviews total=%lu", (unsigned long)all.count);
-            for (id v in all) {
-                if (![v isKindOfClass:[WKWebView class]]) continue;
-                WKWebView *w = (WKWebView *)v;
-                W(@"  wv %.0fx%.0f win=%d hid=%d a=%.2f %@", w.frame.size.width, w.frame.size.height,
-                  (int)(w.window != nil), (int)w.hidden, w.alpha,
-                  [(w.URL.absoluteString ?: @"-") substringToIndex:MIN((NSUInteger)90, (w.URL.absoluteString ?: @"-").length)]);
-            }
-            flushLogs();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSArray *all = gWebViews.allObjects;
+                W(@"webviews reg=%lu", (unsigned long)all.count);
+                for (id v in all) {
+                    if (![v isKindOfClass:[WKWebView class]]) continue;
+                    WKWebView *w = (WKWebView *)v;
+                    W(@"  reg %.0fx%.0f win=%d %@", w.frame.size.width, w.frame.size.height,
+                      (int)(w.window != nil),
+                      [(w.URL.absoluteString ?: @"-") substringToIndex:MIN((NSUInteger)80, (w.URL.absoluteString ?: @"-").length)]);
+                }
+                NSMutableArray *lg = [NSMutableArray array];
+                id best = xyFindTreeWeb(lg);
+                W(@"webviews tree hits=%lu", (unsigned long)lg.count);
+                for (NSString *s in lg) W(@"  tree %@", s);
+                W(@"webviews picked=%@", best ? NSStringFromClass([best class]) : @"nil");
+                flushLogs();
+            });
         } else if ([mode isEqualToString:@"webdump"]) {
             gWebDump = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
             if (gWebDump) xySwizzleWeb();
@@ -933,7 +977,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.12 timers started (… + webopen pick=visible + webviews + eval)");
+            W(@"v7.13 timers started (… + webopen tree-pick + webviews tree)");
             flushLogs();
         });
     }
