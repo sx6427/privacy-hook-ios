@@ -714,6 +714,38 @@ static void xyOpenNext(double gap) {
                    dispatch_get_main_queue(), ^{ xyOpenNext(gap); });
 }
 
+// ★ v7.9：抓 WebView 打开的 URL。兑换/下单页的 token、userid 就拼在 URL 里，
+//   hook loadRequest 比抓 mtop 省事（不经过证书固定，也不用管 WindVane 签名）
+static BOOL gWebDump = NO;
+static void (*orig_wv_loadRequest)(id, SEL, NSURLRequest *);
+
+static void my_wv_loadRequest(id self, SEL _cmd, NSURLRequest *req) {
+    if (gWebDump) {
+        @try {
+            NSString *u = req.URL.absoluteString ?: @"";
+            if ([u containsString:@"token="] || [u containsString:@"linkedmall"] ||
+                [u containsString:@"wh_page=buy"] || [u containsString:@"benefitId"] ||
+                [u containsString:@"xianyu-coin"] || [u containsString:@"exchange"]) {
+                W(@"WVD %@", [u substringToIndex:MIN((NSUInteger)900, u.length)]);
+                flushLogs();
+            }
+        } @catch (id e) {}
+    }
+    orig_wv_loadRequest(self, _cmd, req);
+}
+
+static void xySwizzleWeb(void) {
+    Class c = NSClassFromString(@"WKWebView");
+    Method m = c ? class_getInstanceMethod(c, @selector(loadRequest:)) : NULL;
+    if (m) {
+        orig_wv_loadRequest = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)my_wv_loadRequest);
+        W(@"swizzle WKWebView loadRequest ok");
+    } else {
+        W(@"swizzle WKWebView loadRequest FAILED");
+    }
+}
+
 static void pollCmd(void) {
     @autoreleasepool {
         NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_cmd.json"];
@@ -758,6 +790,10 @@ static void pollCmd(void) {
             W(@"openurl n=%lu gap=%.0f fg=%d", (unsigned long)gOpenQueue.count, gap,
               (int)([UIApplication sharedApplication].applicationState == UIApplicationStateActive));
             xyOpenNext(gap);
+        } else if ([mode isEqualToString:@"webdump"]) {
+            gWebDump = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
+            if (gWebDump) xySwizzleWeb();
+            W(@"webdump=%d", gWebDump);
         } else if ([mode isEqualToString:@"ping"]) {
             W(@"ping ok bg=%d ka=%d eng=%d", (int)([UIApplication sharedApplication].applicationState == UIApplicationStateBackground),
               (int)gKaPlayer.isPlaying, (int)(gKaNode && gKaNode.isPlaying));
@@ -797,7 +833,9 @@ static void xyprobe_init(void) {
                     xyStartKeepAlive(@"watchdog");
                 }
             }];
-            W(@"v7.8 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl)");
+            gWebDump = YES;
+            xySwizzleWeb();
+            W(@"v7.9 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl + webdump)");
             flushLogs();
         });
     }
