@@ -17,6 +17,7 @@
 static NSMutableString *gLog = nil;     // 摘要 → xy_probe.log
 static NSMutableString *gBridge = nil;  // 全量桥流量 → xy_bridge.log
 static WKWebView *gWebView = nil;       // 活跃 webview
+static NSHashTable *gWebViews = nil;    // 全部 WKWebView（弱引用，v7.12）
 static NSLock *gLogLock = nil;
 static NSMutableDictionary *gPending;   // cbId -> tag
 static long long gLastCmdAt = 0;
@@ -734,6 +735,35 @@ static void my_wv_loadRequest(id self, SEL _cmd, NSURLRequest *req) {
     orig_wv_loadRequest(self, _cmd, req);
 }
 
+static void (*orig_wv_init)(id, SEL, CGRect, WKWebViewConfiguration *);
+
+static id my_wv_init(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
+    id r = orig_wv_init(self, _cmd, frame, cfg);
+    @try {
+        if (!gWebViews) gWebViews = [NSHashTable weakObjectsHashTable];
+        if (r) [gWebViews addObject:r];
+    } @catch (id e) {}
+    return r;
+}
+
+// 挑一个真的显示在屏幕上的 webview（有 window、尺寸正常、不太小）
+static WKWebView *xyPickVisibleWebView(void) {
+    WKWebView *best = nil;
+    CGFloat bestArea = 0;
+    @try {
+        for (id v in gWebViews.allObjects) {
+            if (![v isKindOfClass:[WKWebView class]]) continue;
+            WKWebView *w = (WKWebView *)v;
+            if (!w.window || w.hidden || w.alpha < 0.05) continue;
+            CGRect f = w.frame;
+            if (f.size.width < 120 || f.size.height < 120) continue;
+            CGFloat a = f.size.width * f.size.height;
+            if (a > bestArea) { bestArea = a; best = w; }
+        }
+    } @catch (id e) {}
+    return best;
+}
+
 static void xySwizzleWeb(void) {
     Class c = NSClassFromString(@"WKWebView");
     Method m = c ? class_getInstanceMethod(c, @selector(loadRequest:)) : NULL;
@@ -743,6 +773,14 @@ static void xySwizzleWeb(void) {
         W(@"swizzle WKWebView loadRequest ok");
     } else {
         W(@"swizzle WKWebView loadRequest FAILED");
+    }
+    Method mi = c ? class_getInstanceMethod(c, @selector(initWithFrame:configuration:)) : NULL;
+    if (mi) {
+        orig_wv_init = (void *)method_getImplementation(mi);
+        method_setImplementation(mi, (IMP)my_wv_init);
+        W(@"swizzle WKWebView init ok");
+    } else {
+        W(@"swizzle WKWebView init FAILED");
     }
 }
 
@@ -796,8 +834,13 @@ static void pollCmd(void) {
             if ([js isKindOfClass:[NSString class]] && js.length > 3) {
                 W(@"eval[%@] n=%lu", tag, (unsigned long)js.length);
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!gWebView) { W(@"eval[%@]: no webview", tag); return; }
-                    [gWebView evaluateJavaScript:js completionHandler:^(id res, NSError *err) {
+                    WKWebView *wv = gWebView;
+                    if (!wv || !wv.window) {
+                        WKWebView *pv = xyPickVisibleWebView();
+                        if (pv) { wv = pv; gWebView = pv; }
+                    }
+                    if (!wv) { W(@"eval[%@]: no webview", tag); return; }
+                    [wv evaluateJavaScript:js completionHandler:^(id res, NSError *err) {
                         NSString *s = res ? [res description] : @"(nil)";
                         if (s.length > 800) s = [s substringToIndex:800];
                         W(@"EVALRES[%@] %@", tag, s);
@@ -810,16 +853,23 @@ static void pollCmd(void) {
             }
         } else if ([mode isEqualToString:@"webopen"]) {
             NSString *us = obj[@"url"];
+            NSString *pick = obj[@"pick"] ?: @"auto";
             if ([us isKindOfClass:[NSString class]] && us.length > 10) {
                 NSURL *uu = [NSURL URLWithString:us];
-                W(@"webopen %@", [us substringToIndex:MIN((NSUInteger)120, us.length)]);
+                W(@"webopen pick=%@ %@", pick, [us substringToIndex:MIN((NSUInteger)110, us.length)]);
                 if (uu) {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        if (gWebView) {
-                            [gWebView loadRequest:[NSURLRequest requestWithURL:uu]];
-                            W(@"webopen ok on %@", NSStringFromClass([gWebView class]));
+                        WKWebView *target = nil;
+                        if ([pick isEqualToString:@"visible"]) target = xyPickVisibleWebView();
+                        if (!target) target = xyPickVisibleWebView();
+                        if (!target) target = gWebView;
+                        if (target) {
+                            gWebView = target;
+                            [target loadRequest:[NSURLRequest requestWithURL:uu]];
+                            W(@"webopen ok on %@ frame=%.0fx%.0f win=%d", NSStringFromClass([target class]),
+                              target.frame.size.width, target.frame.size.height, (int)(target.window != nil));
                         } else {
-                            W(@"webopen: no webview, fallback openURL");
+                            W(@"webopen: no webview at all, fallback openURL");
                             xyOpenOne(us);
                         }
                     });
@@ -827,6 +877,17 @@ static void pollCmd(void) {
             } else {
                 W(@"webopen: bad url");
             }
+        } else if ([mode isEqualToString:@"webviews"]) {
+            NSArray *all = gWebViews.allObjects;
+            W(@"webviews total=%lu", (unsigned long)all.count);
+            for (id v in all) {
+                if (![v isKindOfClass:[WKWebView class]]) continue;
+                WKWebView *w = (WKWebView *)v;
+                W(@"  wv %.0fx%.0f win=%d hid=%d a=%.2f %@", w.frame.size.width, w.frame.size.height,
+                  (int)(w.window != nil), (int)w.hidden, w.alpha,
+                  [(w.URL.absoluteString ?: @"-") substringToIndex:MIN((NSUInteger)90, (w.URL.absoluteString ?: @"-").length)]);
+            }
+            flushLogs();
         } else if ([mode isEqualToString:@"webdump"]) {
             gWebDump = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
             if (gWebDump) xySwizzleWeb();
@@ -872,7 +933,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.11 timers started (file 0.5s + net 2s + keepalive + log-lock + mlog-batch + openurl + webdump + webopen + eval)");
+            W(@"v7.12 timers started (… + webopen pick=visible + webviews + eval)");
             flushLogs();
         });
     }
