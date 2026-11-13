@@ -894,6 +894,39 @@ static void pollCmd(void) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         id target = xyPickVisibleWebView();
                         if (!target) target = xyFindTreeWeb(nil);
+                        // 别把页面塞进隐形 webview（0 尺寸/无窗口）——宁可自己造一个
+                        if (target) {
+                            UIView *tv0 = (UIView *)target;
+                            if (tv0.window == nil || tv0.frame.size.width < 50 ||
+                                tv0.frame.size.height < 50) {
+                                W(@"webopen: picked webview invisible (%.0fx%.0f win=%d), create new",
+                                  tv0.frame.size.width, tv0.frame.size.height, (int)(tv0.window != nil));
+                                target = nil;
+                            }
+                        }
+                        if (!target) {
+                            UIWindow *kw = nil;
+                            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                                if (w.isKeyWindow) { kw = w; break; }
+                            }
+                            if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+                            if (kw) {
+                                CGRect f = kw.bounds;
+                                WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
+                                WKWebView *nv = [[WKWebView alloc] initWithFrame:f configuration:cfg];
+                                nv.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                                      UIViewAutoresizingFlexibleHeight;
+                                nv.hidden = NO;
+                                nv.alpha = 1;
+                                [kw addSubview:nv];
+                                [kw bringSubviewToFront:nv];
+                                if (!gWebViews) gWebViews = [NSHashTable weakObjectsHashTable];
+                                [gWebViews addObject:nv];
+                                target = nv;
+                                W(@"webopen created fresh webview %.0fx%.0f on %@",
+                                  f.size.width, f.size.height, NSStringFromClass([kw class]));
+                            }
+                        }
                         if (!target) target = gWebView;
                         if (target) {
                             if ([target isKindOfClass:[WKWebView class]]) gWebView = (WKWebView *)target;
@@ -977,7 +1010,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.13 timers started (… + webopen tree-pick + webviews tree)");
+            W(@"v7.14 timers started (… + webopen tree-pick + webviews tree)");
             flushLogs();
         });
     }
