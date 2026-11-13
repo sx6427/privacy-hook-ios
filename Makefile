@@ -4,7 +4,8 @@ SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=12.0 -fobjc-arc -Wall
 
 LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=12.0 \
-          -dynamiclib -framework Foundation -framework Security \
+          -dynamiclib -framework Foundation -framework Security -framework UIKit \
+          -framework WebKit -framework AVFoundation \
           -install_name @executable_path/XyProbe.dylib \
           -Xlinker -no_fixup_chains
 
