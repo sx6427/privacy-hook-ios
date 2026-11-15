@@ -281,7 +281,7 @@ static void rememberCreate(id req) {
         if (![api isKindOfClass:[NSString class]] || [api rangeOfString:@"trade.order"].location == NSNotFound) return;
         id biz = [req valueForKey:@"bizParameters"];
         @try { id dg = [req valueForKey:@"delegate"]; if (dg) gLastDelegate = dg; } @catch (id e) {}
-        @try { id tt = [req valueForKey:@"ttid"]; if ([tt isKindOfClass:[NSString class]] && tt.length) gLastTtid = tt; } @catch (id e) {}
+        @try { id tt = [req valueForKey:@"ttid"]; if ([tt isKindOfClass:[NSString class]] && [(NSString *)tt length]) gLastTtid = tt; } @catch (id e) {}
         if ([biz isKindOfClass:[NSDictionary class]]) {
             gLastCreateBiz = [(NSDictionary *)biz copy];
             gLastCreateAPI = [api copy];
