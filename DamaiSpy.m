@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v2.0";
+static NSString *const kVer = @"v2.1";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -957,6 +957,20 @@ static void hookHeaders(void) {
     if (m3) { o_setBody = (void *)method_getImplementation(m3); method_setImplementation(m3, (IMP)dm_setBody); W(@"hook setHTTPBody:"); }
 }
 
+
+// 强制 TBSDKRequest 走 HTTPS+POST+签名（关掉 unsign 降级）
+static void dmForceSign(id mr) {
+    if (!mr) return;
+    for (NSArray *kv in @[@[@"isUseHttpPost", @YES],
+                          @[@"allowSwithToPOST", @YES],
+                          @[@"isUseHttps", @YES],
+                          @[@"attemptUnsign", @NO],
+                          @[@"isConfiguredUnSign", @NO],
+                          @[@"degradedUnSignPositive", @NO]]) {
+        @try { [mr setValue:kv[1] forKey:kv[0]]; W(@"force %@ ok", kv[0]); } @catch (id e) { W(@"force %@ EXC", kv[0]); }
+    }
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1149,7 +1163,7 @@ static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString 
                 for (NSString *k in @[@"mrequest", @"request"]) {
                     @try { [req setValue:tbr forKey:k]; attached = YES; W(@"attach via %@ ok", k); break; } @catch (id e) {}
                 }
-                if (!attached) W(@"attach mrequest EXC（无 setter）");
+                if (attached) dmForceSign(tbr); else W(@"attach mrequest EXC（无 setter）");
             }
         } else [r_err appendString:@"TBSDKRequest init 失败;"];
     } else [r_err appendString:@"无 TBSDKRequest 类;"];
@@ -1245,9 +1259,13 @@ static void execCmd(NSDictionary *cmd) {
                         Ivar iv = class_getInstanceVariable([mr class], "_bizParameters");
                         if (iv) { object_setIvar(mr, iv, nb); done = YES; }
                     }
+                    dmForceSign(mr);
                     W(@"mutate buyParam=%@ done=%d", bp, (int)done);
                 }
             }
+            id mr0 = nil;
+            @try { mr0 = [gLastReqObj valueForKey:@"mrequest"]; } @catch (id e) {}
+            dmForceSign(mr0);
             id inst2 = mtopInstance(nil);
             id resp = nil;
             @try { resp = ((id (*)(id, SEL, id))objc_msgSend)(inst2, @selector(sync_call:), gLastReqObj); }
