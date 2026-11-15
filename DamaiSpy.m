@@ -19,7 +19,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static NSString *const kVer = @"v0.1";
+static NSString *const kVer = @"v0.2";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -191,14 +191,55 @@ static id dm_sync3(id self, SEL _cmd, id req, id v, id biz) {
     return r;
 }
 
-static void hookMtop(void) {
+// 只 hook 指定类（省事且安全：不遍历全部类，避免启动期 realize 崩溃）
+static int hookClassNamed(NSString *cn) {
+    Class c = NSClassFromString(cn);
+    if (!c) return 0;
     SEL sels[5] = { @selector(async_call:delegate:),
                     @selector(async_call:delegate:startFilter:),
                     @selector(sync_call:),
                     @selector(sync_call:apiVersion:),
                     @selector(sync_call:apiVersion:bizParameters:) };
     IMP news[5] = { (IMP)dm_async2, (IMP)dm_async3, (IMP)dm_sync1, (IMP)dm_sync2, (IMP)dm_sync3 };
+    int hooked = 0;
+    for (int k = 0; k < 5; k++) {
+        @try {
+            Method m = class_getInstanceMethod(c, sels[k]);
+            if (!m) continue;
+            IMP orig = method_getImplementation(m);
+            if (orig == news[k]) continue;
+            method_setImplementation(m, news[k]);
+            if (gHookCount < 30) {
+                gHooks[gHookCount].cls = c;
+                gHooks[gHookCount].sel = sels[k];
+                gHooks[gHookCount].orig = orig;
+                gHookCount++;
+            }
+            hooked++;
+            M(@"HOOK -[%@ %@]", cn, NSStringFromSelector(sels[k]));
+        } @catch (id e) { M(@"HOOK-EXC %@ %@: %@", cn, NSStringFromSelector(sels[k]), e); }
+    }
+    return hooked;
+}
 
+// 快速路径：只试已知类名
+static void hookMtop(void) {
+    NSArray *cands = @[@"MtopService", @"MTOPService", @"MtopServer", @"MtopSDKService", @"MtopClient"];
+    for (NSString *n in cands) {
+        int h = hookClassNamed(n);
+        if (h > 0) { M(@"hook done via fast path: %@ hooks=%d", n, h); return; }
+    }
+    M(@"hook: 已知类名都没命中，可下发 {\"c\":\"hookall\"} 全量扫描");
+}
+
+// 慢速路径：遍历所有类（只在指令触发时用，运行期已稳定）
+static void hookAllClasses(void) {
+    SEL sels[5] = { @selector(async_call:delegate:),
+                    @selector(async_call:delegate:startFilter:),
+                    @selector(sync_call:),
+                    @selector(sync_call:apiVersion:),
+                    @selector(sync_call:apiVersion:bizParameters:) };
+    IMP news[5] = { (IMP)dm_async2, (IMP)dm_async3, (IMP)dm_sync1, (IMP)dm_sync2, (IMP)dm_sync3 };
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     if (!classes) return;
@@ -212,28 +253,24 @@ static void hookMtop(void) {
             @try {
                 Method m = class_getInstanceMethod(c, sels[k]);
                 if (!m) continue;
-                // 只处理"自己实现"的，继承来的跳过，避免重复 hook
                 Class sup = class_getSuperclass(c);
                 if (sup) {
                     Method sm = class_getInstanceMethod(sup, sels[k]);
                     if (sm && method_getImplementation(sm) == method_getImplementation(m)) continue;
                 }
                 IMP orig = method_getImplementation(m);
-                // 已经是我们自己的实现就跳过（幂等）
                 if (orig == news[k]) continue;
                 method_setImplementation(m, news[k]);
                 gHooks[gHookCount].cls = c;
                 gHooks[gHookCount].sel = sels[k];
                 gHooks[gHookCount].orig = orig;
                 gHookCount++; hooked++;
-                M(@"HOOK -[%@ %@]", cn, NSStringFromSelector(sels[k]));
-            } @catch (id e) {
-                M(@"HOOK-EXC %@ %@: %@", cn, NSStringFromSelector(sels[k]), e);
-            }
+                M(@"HOOK(all) -[%@ %@]", cn, NSStringFromSelector(sels[k]));
+            } @catch (id e) {}
         }
     }
     free(classes);
-    M(@"hook done: %d hooks on mtop selectors", hooked);
+    M(@"hookall done: +%d hooks (total %d)", hooked, gHookCount);
 }
 
 // ---------------- NSURLSession 明文 hook ----------------
@@ -381,6 +418,8 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
 }
 
 // ---------------- 指令通道 ----------------
+static void hookAllClasses(void);   // 前向声明
+
 static NSString *gLastCmd = nil;
 
 static void writeOut(NSString *s) {
@@ -413,6 +452,9 @@ static void execCmd(NSDictionary *cmd) {
     } else if ([c isEqualToString:@"clear"]) {
         if ([cmd[@"what"] isEqualToString:@"mtop"]) { [gLock lock]; [gMtopLog setString:@""]; gMtopDirty = YES; [gLock unlock]; }
         writeOut(@"cleared");
+    } else if ([c isEqualToString:@"hookall"]) {
+        hookAllClasses();
+        writeOut([NSString stringWithFormat:@"hookall done total=%d\n", gHookCount]);
     } else if ([c isEqualToString:@"mtopinfo"]) {
         NSMutableString *o = [NSMutableString string];
         Class c2 = mtopServiceClass();
@@ -462,6 +504,54 @@ static void pollNet(void) {
 }
 
 // ---------------- 启动 ----------------
+// ★ v0.2 关键修正：绝不能在 dylib 构造函数里调 objc_copyClassList / class_getInstanceMethod。
+//   那一刻 dyld 还在跑 initializer，libobjc 的 realizeAllClasses() 会 SIGSEGV（v0.1 就是这么崩的）。
+//   正确做法：延后到主队列、且 App 已 finishLaunching 之后再做 hook。
+static BOOL gSetup = NO;
+
+static void bootMtopInfo(void) {
+    @try {
+        Class ms = NSClassFromString(@"MtopService");
+        M(@"boot: MtopService=%@", ms ? @"found" : @"nil");
+        if (ms) {
+            unsigned int mc = 0;
+            Method *mm = class_copyMethodList(ms, &mc);
+            NSMutableArray *names = [NSMutableArray array];
+            for (unsigned int i = 0; i < mc; i++) [names addObject:NSStringFromSelector(method_getName(mm[i]))];
+            if (mm) free(mm);
+            M(@"MtopService instance methods(%u): %@", mc, clip([names componentsJoinedByString:@", "], 3000));
+        }
+    } @catch (id e) { M(@"boot mtopinfo EXC %@", e); }
+}
+
+static void setupOnce(void) {
+    if (gSetup) return;
+    gSetup = YES;
+    W(@"setupOnce begin (app state=%ld)", (long)[UIApplication sharedApplication].applicationState);
+    @try { hookNet(); } @catch (id e) { W(@"hookNet EXC %@", e); }
+    @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
+    @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
+    flushAll();
+    W(@"setupOnce done hooks=%d", gHookCount);
+    flushAll();
+}
+
+static void startTimers(void) {
+    static BOOL started = NO;
+    if (started) return;
+    started = YES;
+    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        pollCmd();
+        flushAll();
+    }];
+    [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+        pollNet();
+        flushAll();
+    }];
+    W(@"timers started (cmd-file 0.5s, net %d)", gNetOn);
+    flushAll();
+}
+
 __attribute__((constructor))
 static void dspy_init(void) {
     @autoreleasepool {
@@ -472,36 +562,25 @@ static void dspy_init(void) {
         W(@"bundle=%@ off=%d docs=%@", [[NSBundle mainBundle] bundleIdentifier], off, docs());
         if (off) { flushAll(); return; }
         gNetOn = exists(@"dm_net_on");
-
-        @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
-        @try { hookNet(); } @catch (id e) { W(@"hookNet EXC %@", e); }
-
-        // 启动即把 MTOP 类家族关系落一份，方便判断是不是 MtopService
-        @try {
-            Class ms = NSClassFromString(@"MtopService");
-            M(@"boot: MtopService=%@", ms ? @"found" : @"nil");
-            if (ms) {
-                unsigned int mc = 0;
-                Method *mm = class_copyMethodList(ms, &mc);
-                NSMutableArray *names = [NSMutableArray array];
-                for (unsigned int i = 0; i < mc; i++) [names addObject:NSStringFromSelector(method_getName(mm[i]))];
-                if (mm) free(mm);
-                M(@"MtopService instance methods(%u): %@", mc, clip([names componentsJoinedByString:@", "], 3000));
-            }
-        } @catch (id e) { M(@"boot mtopinfo EXC %@", e); }
-
-        flushAll();
+        // 只写日志，不碰 ObjC 运行时
         dispatch_async(dispatch_get_main_queue(), ^{
-            [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-                pollCmd();
-                flushAll();
-            }];
-            [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
-                pollNet();
-                flushAll();
-            }];
-            W(@"timers started (cmd-file 0.5s, net %d)", gNetOn);
-            flushAll();
+            @autoreleasepool {
+                [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                                  object:nil queue:[NSOperationQueue mainQueue]
+                                                              usingBlock:^(NSNotification *n) {
+                    W(@"got didFinishLaunching");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        setupOnce();
+                        startTimers();
+                    });
+                }];
+                // 兜底：万一通知错过了（dylib 注入到已运行的进程），1.8s 后直接干
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (!gSetup) { W(@"fallback timer -> setupOnce"); setupOnce(); }
+                    startTimers();
+                });
+            }
         });
+        flushAll();
     }
 }
