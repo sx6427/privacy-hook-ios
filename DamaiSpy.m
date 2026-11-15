@@ -20,7 +20,7 @@
 #import <objc/message.h>
 #import <zlib.h>
 
-static NSString *const kVer = @"v0.7";
+static NSString *const kVer = @"v0.8";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -507,6 +507,106 @@ static void hookNet(void) {
     if (m3) { o_dt = (void *)method_getImplementation(m3); method_setImplementation(m3, (IMP)dm_dt); W(@"hook dataTaskWithRequest:"); }
 }
 
+// ---------------- UI 自动化（进程内驱动 App 自己的流程）----------------
+static void dmRunOnMain(dispatch_block_t blk) {
+    if ([NSThread isMainThread]) blk();
+    else dispatch_sync(dispatch_get_main_queue(), blk);
+}
+
+static NSString *viewText(UIView *v) {
+    NSString *t = nil;
+    @try {
+        if ([v isKindOfClass:[UILabel class]]) t = [(UILabel *)v text];
+        else if ([v isKindOfClass:[UIButton class]]) t = [[(UIButton *)v titleLabel] text];
+        else if ([v isKindOfClass:[UITextField class]]) t = [(UITextField *)v text] ?: [(UITextField *)v placeholder];
+        if (!t.length && [v respondsToSelector:NSSelectorFromString(@"text")]) {
+            id x = nil;
+            @try { x = [v performSelector:NSSelectorFromString(@"text")]; } @catch (id e) {}
+            if ([x isKindOfClass:[NSString class]]) t = x;
+        }
+    } @catch (id e) {}
+    return t;
+}
+
+static void dmWalkViews(UIView *v, int depth, NSMutableString *out, int *budget, NSString *needle) {
+    if (!v || *budget <= 0) return;
+    NSString *txt = viewText(v);
+    BOOL hit = needle.length ? (txt.length && [txt rangeOfString:needle].location != NSNotFound) : YES;
+    BOOL interesting = txt.length > 0 || [v isKindOfClass:[UIControl class]];
+    if (interesting && hit) {
+        [out appendFormat:@"%*s%@ frame=(%.0f,%.0f,%.0f,%.0f) tappable=%d txt=%@\n",
+         depth * 2, "", NSStringFromClass([v class]), v.frame.origin.x, v.frame.origin.y,
+         v.frame.size.width, v.frame.size.height, (int)[v isKindOfClass:[UIControl class]],
+         clip(txt, 60)];
+        (*budget)--;
+    }
+    for (UIView *s in v.subviews) dmWalkViews(s, depth + 1, out, budget, needle);
+}
+
+static UIViewController *dmTopVC(void) {
+    UIWindow *w = nil;
+    for (UIWindow *x in [UIApplication sharedApplication].windows) if (x.isKeyWindow) { w = x; break; }
+    if (!w) w = [UIApplication sharedApplication].keyWindow;
+    UIViewController *vc = w.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+// 找到文字包含 needle 的控件并触发点击
+static NSString *dmTapByText(NSString *needle) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        UIViewController *vc = dmTopVC();
+        NSMutableArray *cands = [NSMutableArray array];
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
+        while (stack.count) {
+            UIView *v = [stack lastObject];
+            [stack removeLastObject];
+            NSString *t = viewText(v);
+            if (t.length && [t rangeOfString:needle].location != NSNotFound) [cands addObject:v];
+            for (UIView *s in v.subviews) [stack addObject:s];
+        }
+        NSMutableString *r = [NSMutableString string];
+        [r appendFormat:@"candidates=%lu\n", (unsigned long)cands.count];
+        for (UIView *v in cands) {
+            [r appendFormat:@"  %@ frame=%@ txt=%@\n", NSStringFromClass([v class]),
+             NSStringFromCGRect(v.frame), clip(viewText(v), 40)];
+        }
+        // 优先挑 UIControl，且层级最深（最内层）的
+        UIView *target = nil;
+        for (UIView *v in cands) if ([v isKindOfClass:[UIControl class]]) target = v;
+        if (!target && cands.count) target = [cands lastObject];
+        if (target) {
+            [r appendFormat:@"TAP -> %@\n", NSStringFromClass([target class])];
+            if ([target isKindOfClass:[UIControl class]]) {
+                [(UIControl *)target sendActionsForControlEvents:UIControlEventTouchUpInside];
+                [r appendString:@"sent TouchUpInside\n"];
+            } else {
+                // 非控件：尝试触发其单指手势的 target-action
+                BOOL fired = NO;
+                for (UIGestureRecognizer *g in target.gestureRecognizers) {
+                    if (![g isKindOfClass:[UITapGestureRecognizer class]]) continue;
+                    NSArray *targets = [g valueForKey:@"_targets"];
+                    for (id t in targets) {
+                        id tgt = [t valueForKey:@"_target"];
+                        NSString *act = [t valueForKey:@"_action"];
+                        SEL sel = NSSelectorFromString(act);
+                        if (tgt && sel && [tgt respondsToSelector:sel]) {
+                            ((void (*)(id, SEL, id))objc_msgSend)(tgt, sel, g);
+                            fired = YES;
+                        }
+                    }
+                }
+                [r appendFormat:@"gesture fired=%d\n", (int)fired];
+            }
+        } else {
+            [r appendString:@"未找到可点击目标\n"];
+        }
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -715,6 +815,21 @@ static void execCmd(NSDictionary *cmd) {
         NSString *payload = runMtop(@"mtop.damai.trade.order.create", @"1.0", biz, nil, tag);
         writeOut([NSString stringWithFormat:@"[create %@ paramsRaw=%lu b64=%lu]\n%@\n", buyParam, (unsigned long)pj.length, (unsigned long)b64.length, payload]);
         [payload writeToFile:dpath([NSString stringWithFormat:@"dm_res_%@.json", tag]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else if ([c isEqualToString:@"ui"]) {
+        __block NSString *out = nil;
+        dmRunOnMain(^{
+            NSMutableString *o = [NSMutableString string];
+            UIViewController *vc = dmTopVC();
+            [o appendFormat:@"topVC=%@\n", vc ? NSStringFromClass([vc class]) : @"nil"];
+            int budget = 300;
+            dmWalkViews(vc.view, 0, o, &budget, cmd[@"kw"]);
+            out = [o copy];
+        });
+        writeOut(out ?: @"(nil)");
+    } else if ([c isEqualToString:@"uitap"]) {
+        NSString *needle = cmd[@"txt"];
+        if (!needle.length) { writeOut(@"需要 txt 参数"); return; }
+        writeOut(dmTapByText(needle));
     } else if ([c isEqualToString:@"instinfo"]) {
         NSMutableString *o = [NSMutableString string];
         id inst = mtopInstance(cmd[@"site"]);
