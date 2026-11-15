@@ -20,7 +20,7 @@
 #import <objc/message.h>
 #import <zlib.h>
 
-static NSString *const kVer = @"v0.6";
+static NSString *const kVer = @"v0.7";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -265,6 +265,24 @@ static NSString *decodeParamsField(id biz) {
 }
 
 // ---------------- MTOP hook ----------------
+static NSDictionary *gLastCreateBiz = nil;   // 最近一次 trade.order.create 的 bizParameters
+static NSString *gLastCreateAPI = nil;
+
+static void rememberCreate(id req) {
+    @try {
+        NSString *api = [req valueForKey:@"apiName"];
+        if (![api isKindOfClass:[NSString class]] || [api rangeOfString:@"trade.order"].location == NSNotFound) return;
+        id biz = [req valueForKey:@"bizParameters"];
+        if ([biz isKindOfClass:[NSDictionary class]]) {
+            gLastCreateBiz = [(NSDictionary *)biz copy];
+            gLastCreateAPI = [api copy];
+            NSMutableArray *ks = [NSMutableArray array];
+            for (NSString *k in [(NSDictionary *)biz allKeys]) [ks addObject:[NSString stringWithFormat:@"%@(%lu)", k, (unsigned long)[[NSString stringWithFormat:@"%@", [(NSDictionary *)biz objectForKey:k]] length]]];
+            W(@"saved last %@ biz: %@", api, [ks componentsJoinedByString:@", "]);
+        }
+    } @catch (id e) { W(@"rememberCreate EXC %@", e); }
+}
+
 typedef struct { Class cls; SEL sel; IMP orig; } HookRec;
 static HookRec gHooks[32];
 static int gHookCount = 0;
@@ -279,6 +297,7 @@ static IMP origFor(SEL cmd) {
 
 static id dm_async2(id self, SEL _cmd, id req, id dlg) {
     gMtopSeq++;
+    rememberCreate(req);
     M(@"==== REQ #%ld -[%@ async_call:delegate:] ====", gMtopSeq, NSStringFromClass([self class]));
     M(@"%@", dumpObj(req));
     IMP o = origFor(_cmd);
@@ -286,6 +305,7 @@ static id dm_async2(id self, SEL _cmd, id req, id dlg) {
 }
 static id dm_async3(id self, SEL _cmd, id req, id dlg, id sf) {
     gMtopSeq++;
+    rememberCreate(req);
     M(@"==== REQ #%ld -[%@ async_call:delegate:startFilter:] sf=%@ ====", gMtopSeq, NSStringFromClass([self class]), sf);
     M(@"%@", dumpObj(req));
     IMP o = origFor(_cmd);
@@ -311,6 +331,7 @@ static id dm_sync2(id self, SEL _cmd, id req, id v) {
 }
 static id dm_sync3(id self, SEL _cmd, id req, id v, id biz) {
     gMtopSeq++;
+    rememberCreate(req);
     M(@"==== REQ #%ld -[%@ sync_call:apiVersion:bizParameters:] v=%@ biz=%@ ====", gMtopSeq, NSStringFromClass([self class]), v, clip([NSString stringWithFormat:@"%@", biz], 400));
     M(@"%@", dumpObj(req));
     IMP o = origFor(_cmd);
@@ -648,6 +669,27 @@ static void execCmd(NSDictionary *cmd) {
     } else if ([c isEqualToString:@"clear"]) {
         if ([cmd[@"what"] isEqualToString:@"mtop"]) { [gLock lock]; [gMtopLog setString:@""]; gMtopDirty = YES; [gLock unlock]; }
         writeOut(@"cleared");
+    } else if ([c isEqualToString:@"replay_create"] || [c isEqualToString:@"dumpparams"]) {
+        if (!gLastCreateBiz) { writeOut(@"尚未捕获到 trade.order.* 请求（先在 App 里点一次提交）"); return; }
+        if ([c isEqualToString:@"dumpparams"]) {
+            NSMutableString *o = [NSMutableString string];
+            [o appendFormat:@"api=%@\nbuyParam=%@\nexParams=%lu B\nfeature=%@\n",
+             gLastCreateAPI, gLastCreateBiz[@"buyParam"],
+             (unsigned long)[[NSString stringWithFormat:@"%@", gLastCreateBiz[@"exParams"]] length],
+             gLastCreateBiz[@"feature"]];
+            id pv = gLastCreateBiz[@"params"];
+            [o appendFormat:@"paramsLen=%lu\n---- params(base64) ----\n%@\n---- decoded ----\n%@\n",
+             (unsigned long)[pv length], pv, decodeParamsField(gLastCreateBiz)];
+            writeOut(o);
+            return;
+        }
+        if (!exists(@"dm_allow_create")) { writeOut(@"拒绝：没有 dm_allow_create"); return; }
+        NSMutableDictionary *biz = [gLastCreateBiz mutableCopy];
+        NSString *bp = cmd[@"buyParam"];
+        if ([bp isKindOfClass:[NSString class]] && bp.length) biz[@"buyParam"] = bp;
+        NSString *payload = runMtop(gLastCreateAPI ?: @"mtop.damai.trade.order.create", @"1.0", biz, nil, tag);
+        writeOut([NSString stringWithFormat:@"[replay %@ buyParam=%@]\n%@\n", gLastCreateAPI, biz[@"buyParam"], payload]);
+        [payload writeToFile:dpath([NSString stringWithFormat:@"dm_res_%@.json", tag]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } else if ([c isEqualToString:@"create"]) {
         if (!exists(@"dm_allow_create")) { writeOut(@"拒绝执行：沙盒里没有 dm_allow_create"); return; }
         NSString *buyParam = cmd[@"buyParam"];
