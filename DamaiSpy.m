@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.6";
+static NSString *const kVer = @"v1.7";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -904,6 +904,52 @@ static void hookSending(void) {
     W(@"hook sendingRequest:delegate:startFilter:");
 }
 
+
+// HTTP 头捕获（定位 431：Request Header Fields Too Large）
+static void (*o_setH)(id, SEL, NSString *, NSString *);
+static void dm_setH(id self, SEL _cmd, NSString *v, NSString *f) {
+    @try {
+        NSString *fl = f.lowercaseString ?: @"";
+        if ([fl containsString:@"sign"] || [fl containsString:@"wua"] || [fl containsString:@"sgext"]
+            || [fl containsString:@"umt"] || [fl isEqualToString:@"cookie"] || [fl containsString:@"x-"]) {
+            M(@"HDR[%p] %@ = %@", self, f ?: @"-", clip(v, 260));
+        }
+    } @catch (id e) {}
+    if (o_setH) o_setH(self, _cmd, v, f);
+}
+static void (*o_setAllH)(id, SEL, NSDictionary *);
+static void dm_setAllH(id self, SEL _cmd, NSDictionary *hs) {
+    @try {
+        for (NSString *k in hs) {
+            NSString *kl = k.lowercaseString;
+            if ([kl containsString:@"sign"] || [kl containsString:@"wua"] || [kl containsString:@"sgext"] || [kl isEqualToString:@"cookie"]) {
+                M(@"HDRALL[%p] %@ = %@", self, k, clip([NSString stringWithFormat:@"%@", hs[k]], 260));
+            }
+        }
+    } @catch (id e) {}
+    if (o_setAllH) o_setAllH(self, _cmd, hs);
+}
+static void (*o_setBody)(id, SEL, NSData *);
+static void dm_setBody(id self, SEL _cmd, NSData *b) {
+    @try {
+        NSString *s = bytesPreview(b, 200) ?: @"";
+        if ([s containsString:@"order.create"] || [s containsString:@"H4sIA"]) {
+            M(@"BODY[%p] len=%lu head=%@", self, (unsigned long)b.length, clip(s, 200));
+        }
+    } @catch (id e) {}
+    if (o_setBody) o_setBody(self, _cmd, b);
+}
+
+static void hookHeaders(void) {
+    Class c = [NSMutableURLRequest class];
+    Method m1 = class_getInstanceMethod(c, @selector(setValue:forHTTPHeaderField:));
+    if (m1) { o_setH = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)dm_setH); W(@"hook setValue:forHTTPHeaderField:"); }
+    Method m2 = class_getInstanceMethod(c, @selector(setAllHTTPHeaderFields:));
+    if (m2) { o_setAllH = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)dm_setAllH); W(@"hook setAllHTTPHeaderFields:"); }
+    Method m3 = class_getInstanceMethod(c, @selector(setHTTPBody:));
+    if (m3) { o_setBody = (void *)method_getImplementation(m3); method_setImplementation(m3, (IMP)dm_setBody); W(@"hook setHTTPBody:"); }
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1327,6 +1373,7 @@ static void setupOnce(void) {
     @try { hookSecurityGuard(); } @catch (id e) { W(@"hookSG EXC %@", e); }
     @try { hookDX(); } @catch (id e) { W(@"hookDX EXC %@", e); }
     @try { hookSending(); } @catch (id e) { W(@"hookSending EXC %@", e); }
+    @try { hookHeaders(); } @catch (id e) { W(@"hookHeaders EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
