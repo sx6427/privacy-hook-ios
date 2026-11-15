@@ -19,7 +19,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static NSString *const kVer = @"v0.2";
+static NSString *const kVer = @"v0.3";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -100,25 +100,77 @@ static NSString *clip(NSString *s, NSUInteger n) {
     return s.length > n ? [[s substringToIndex:n] stringByAppendingString:@"…"] : s;
 }
 
+// 递归父类的 ivar dump（MtopExtRequest 的真参数在 MtopRequest/TBSDKRequest 里）
+static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
+    if (!c || c == [NSObject class] || *budget <= 0) return;
+    dumpIvarsOf(o, class_getSuperclass(c), s, budget);
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(c, &n);
+    for (unsigned int i = 0; i < n && *budget > 0; i++) {
+        const char *tn = ivar_getTypeEncoding(ivars[i]);
+        NSString *nm = [NSString stringWithUTF8String:ivar_getName(ivars[i])];
+        if (tn && tn[0] == '@' && tn[1] != '?') {
+            id v = nil;
+            @try { v = object_getIvar(o, ivars[i]); } @catch (id e) {}
+            if (!v) continue;
+            NSString *vs = [NSString stringWithFormat:@"%@", v];
+            [s appendFormat:@"\n  .%@ = %@", nm, clip(vs, 700)];
+            *budget -= 1;
+        } else if (tn && (tn[0] == 'i' || tn[0] == 'q' || tn[0] == 'Q' || tn[0] == 'd' || tn[0] == 'c' || tn[0] == 'B')) {
+            // 数值型只留少数关键字段，避免刷屏
+            if ([nm rangeOfString:@"api"].location != NSNotFound || [nm rangeOfString:@"version"].location != NSNotFound) {
+                [s appendFormat:@"\n  .%@ = (%s)", nm, tn];
+                *budget -= 1;
+            }
+        }
+    }
+    if (ivars) free(ivars);
+}
+
+static NSString *kvcProbe(id o, NSArray *keys) {
+    if (!o) return @"";
+    NSMutableString *s = [NSMutableString string];
+    for (NSString *k in keys) {
+        @try {
+            id v = [o valueForKey:k];
+            if (!v) continue;
+            NSString *vs = [NSString stringWithFormat:@"%@", v];
+            if (!vs.length || [vs isEqualToString:@"(null)"]) continue;
+            [s appendFormat:@"\n  %@ = %@", k, clip(vs, 900)];
+        } @catch (id e) {}
+    }
+    return s;
+}
+
+static NSArray *reqKeys(void) {
+    return @[@"api", @"apiName", @"v", @"apiVersion", @"version", @"data", @"dataParams",
+             @"params", @"bizParameters", @"appKey", @"ttid", @"mid", @"sid", @"t", @"sign",
+             @"needLogin", @"needEcode", @"url", @"host", @"method", @"fullTraceID", @"pageName"];
+}
+
 static NSString *dumpObj(id o) {
     if (!o) return @"(nil)";
     NSMutableString *s = [NSMutableString string];
     @try {
-        [s appendFormat:@"<%@> %@", NSStringFromClass([o class]), clip([NSString stringWithFormat:@"%@", o], 400)];
-        unsigned int n = 0;
-        Ivar *ivars = class_copyIvarList([o class], &n);
-        for (unsigned int i = 0; i < n; i++) {
-            const char *tn = ivar_getTypeEncoding(ivars[i]);
-            NSString *nm = [NSString stringWithUTF8String:ivar_getName(ivars[i])];
-            if (tn && tn[0] == '@' && tn[1] != '?') {
-                id v = nil;
-                @try { v = object_getIvar(o, ivars[i]); } @catch (id e) {}
-                [s appendFormat:@" | %@=%@", nm, clip([NSString stringWithFormat:@"%@", v ?: @"nil"], 260)];
-            } else if (tn) {
-                [s appendFormat:@" | %@=(%s)", nm, tn];
-            }
+        [s appendFormat:@"<%@>", NSStringFromClass([o class])];
+        [s appendString:kvcProbe(o, reqKeys())];
+        // 嵌套的 mrequest（TBSDKRequest）才是真正拼包对象
+        id mr = nil;
+        @try { mr = [o valueForKey:@"mrequest"]; } @catch (id e) {}
+        if (mr && mr != o) {
+            [s appendFormat:@"\n [mrequest %@]", NSStringFromClass([mr class])];
+            [s appendString:kvcProbe(mr, reqKeys())];
+            int b1 = 12;
+            [s appendString:@"\n  -- ivars --"];
+            dumpIvarsOf(mr, [mr class], s, &b1);
         }
-        if (ivars) free(ivars);
+        id d = nil;
+        @try { d = [o valueForKey:@"data"]; } @catch (id e) {}
+        if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
+            NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingWithoutEscapingSlashes error:nil];
+            if (jd) [s appendFormat:@"\n DATA %@", clip([[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding], 2000)];
+        }
+        if (s.length > 4000) s = [[s substringToIndex:4000] mutableCopy];
     } @catch (id e) {
         [s appendFormat:@" <dump-exc %@>", e];
     }
@@ -143,6 +195,9 @@ static NSString *bytesPreview(NSData *d, NSUInteger max) {
 typedef struct { Class cls; SEL sel; IMP orig; } HookRec;
 static HookRec gHooks[32];
 static int gHookCount = 0;
+
+static id dm_succeed(id self, SEL _cmd, id req, id resp);
+static id dm_failed(id self, SEL _cmd, id req, id resp);
 
 static IMP origFor(SEL cmd) {
     for (int i = 0; i < gHookCount; i++) if (sel_isEqual(gHooks[i].sel, cmd)) return gHooks[i].orig;
@@ -202,6 +257,24 @@ static int hookClassNamed(NSString *cn) {
                     @selector(sync_call:apiVersion:bizParameters:) };
     IMP news[5] = { (IMP)dm_async2, (IMP)dm_async3, (IMP)dm_sync1, (IMP)dm_sync2, (IMP)dm_sync3 };
     int hooked = 0;
+    // 响应回调
+    @try {
+        Method ms = class_getInstanceMethod(c, @selector(succeed:response:));
+        if (ms && method_getImplementation(ms) != (IMP)dm_succeed) {
+            IMP orig = method_getImplementation(ms);
+            method_setImplementation(ms, (IMP)dm_succeed);
+            if (gHookCount < 30) { gHooks[gHookCount].cls = c; gHooks[gHookCount].sel = @selector(succeed:response:); gHooks[gHookCount].orig = orig; gHookCount++; }
+            hooked++; M(@"HOOK -[%@ succeed:response:]", cn);
+        }
+        Method mf = class_getInstanceMethod(c, @selector(failed:response:));
+        if (mf && method_getImplementation(mf) != (IMP)dm_failed) {
+            IMP orig = method_getImplementation(mf);
+            method_setImplementation(mf, (IMP)dm_failed);
+            if (gHookCount < 30) { gHooks[gHookCount].cls = c; gHooks[gHookCount].sel = @selector(failed:response:); gHooks[gHookCount].orig = orig; gHookCount++; }
+            hooked++; M(@"HOOK -[%@ failed:response:]", cn);
+        }
+    } @catch (id e) { M(@"resp-hook EXC %@", e); }
+
     for (int k = 0; k < 5; k++) {
         @try {
             Method m = class_getInstanceMethod(c, sels[k]);
@@ -223,6 +296,20 @@ static int hookClassNamed(NSString *cn) {
 }
 
 // 快速路径：只试已知类名
+static id dm_succeed(id self, SEL _cmd, id req, id resp) {
+    M(@"==== RESP(ok) %@ ====", NSStringFromClass([self class]));
+    M(@" req  api=%@", clip([[NSString stringWithFormat:@"%@", [[req valueForKey:@"api"] description] ?: @"?"]], 120));
+    M(@"%@", dumpObj(resp));
+    IMP o = origFor(_cmd);
+    return o ? ((id (*)(id, SEL, id, id))o)(self, _cmd, req, resp) : nil;
+}
+static id dm_failed(id self, SEL _cmd, id req, id resp) {
+    M(@"==== RESP(fail) %@ ====", NSStringFromClass([self class]));
+    M(@"%@", dumpObj(resp));
+    IMP o = origFor(_cmd);
+    return o ? ((id (*)(id, SEL, id, id))o)(self, _cmd, req, resp) : nil;
+}
+
 static void hookMtop(void) {
     NSArray *cands = @[@"MtopService", @"MTOPService", @"MtopServer", @"MtopSDKService", @"MtopClient"];
     for (NSString *n in cands) {
@@ -452,6 +539,23 @@ static void execCmd(NSDictionary *cmd) {
     } else if ([c isEqualToString:@"clear"]) {
         if ([cmd[@"what"] isEqualToString:@"mtop"]) { [gLock lock]; [gMtopLog setString:@""]; gMtopDirty = YES; [gLock unlock]; }
         writeOut(@"cleared");
+    } else if ([c isEqualToString:@"classinfo"]) {
+        NSString *cn = cmd[@"cls"] ?: @"";
+        Class cc = NSClassFromString(cn);
+        NSMutableString *o = [NSMutableString string];
+        if (!cc) { [o appendFormat:@"no class %@\n", cn]; }
+        else {
+            for (Class k = cc; k && k != [NSObject class]; k = class_getSuperclass(k)) {
+                [o appendFormat:@"=== %@ (super=%@) ===\n", NSStringFromClass(k), NSStringFromClass(class_getSuperclass(k))];
+                unsigned int ic = 0; Ivar *iv = class_copyIvarList(k, &ic);
+                for (unsigned int i = 0; i < ic; i++) [o appendFormat:@"  .%s (%s)\n", ivar_getName(iv[i]), ivar_getTypeEncoding(iv[i])];
+                if (iv) free(iv);
+                unsigned int mc = 0; Method *mm = class_copyMethodList(k, &mc);
+                for (unsigned int i = 0; i < mc; i++) [o appendFormat:@"  -%@\n", NSStringFromSelector(method_getName(mm[i]))];
+                if (mm) free(mm);
+            }
+        }
+        writeOut(o);
     } else if ([c isEqualToString:@"hookall"]) {
         hookAllClasses();
         writeOut([NSString stringWithFormat:@"hookall done total=%d\n", gHookCount]);
