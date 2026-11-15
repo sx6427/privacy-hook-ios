@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v2.1";
+static NSString *const kVer = @"v2.2";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -971,6 +971,110 @@ static void dmForceSign(id mr) {
     }
 }
 
+
+// ---------------- H5 购买链路（buy.damai.cn，cookie 鉴权，无加固签名）----------------
+static NSData *dmSyncGet(NSURL *url, NSDictionary *headers) {
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:url];
+    rq.HTTPMethod = @"GET";
+    rq.timeoutInterval = 15;
+    for (NSString *k in headers) [rq setValue:headers[k] forHTTPHeaderField:k];
+    __block NSData *out = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        out = d; dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+    return out;
+}
+
+static NSData *dmSyncPost(NSURL *url, NSDictionary *headers, NSData *body) {
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:url];
+    rq.HTTPMethod = @"POST";
+    rq.HTTPBody = body;
+    rq.timeoutInterval = 15;
+    for (NSString *k in headers) [rq setValue:headers[k] forHTTPHeaderField:k];
+    __block NSData *out = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        out = d; dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time_NOW_OR_LATER(0, 20 * NSEC_PER_SEC));
+    return out;
+}
+
+static NSString *dmEnc(NSString *s) {
+    return [s stringByAddingPercentEncodingWithAllowedCharacters:[[NSCharacterSet alphanumericCharacterSet] invertedSet]];
+}
+
+// 完整 H5 下单：orderConfirm -> 改表单 -> createOrder
+static NSString *dmH5Buy(NSString *buyParam, NSString *viewerName, BOOL doSubmit) {
+    NSMutableString *log = [NSMutableString string];
+    NSString *ex = @"{\"channel\":\"damai_app\",\"umpChannel\":\"10001\",\"coVersion\":\"2.0\",\"coupon\":\"true\",\"pioneer\":\"1\",\"atomSplit\":\"1\",\"damai\":\"1\"}";
+    NSDictionary *gh = @{@"User-Agent": @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+                         @"Accept": @"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"};
+    NSString *u1 = [NSString stringWithFormat:@"https://buy.damai.cn/orderConfirm?exParams=%@&buyParam=%@&buyNow=true&spm=a2oeg.project.projectinfo.dbuy",
+                    dmEnc(ex), dmEnc(buyParam)];
+    [log appendFormat:@"[1] GET orderConfirm\n"];
+    NSData *d1 = dmSyncGet([NSURL URLWithString:u1], gh);
+    NSString *html = [[NSString alloc] initWithData:d1 encoding:NSUTF8StringEncoding] ?: @"";
+    [log appendFormat:@"    status=%@ htmlLen=%lu\n", @(html.length ? @"ok" : @"empty"), (unsigned long)html.length];
+    // 抠 window.INIT_DATA
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"window\\.INIT_DATA[\\s\\S]*?};"
+                                                                       options:0 error:nil];
+    NSTextCheckingResult *hit = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
+    if (!hit) { [log appendFormat:@"    未找到 INIT_DATA（可能未登录/风控/页面结构变化）\n    head=%@\n", clip(html, 400)]; return log; }
+    NSString *jsonStr = [[html substringWithRange:hit.range] stringByReplacingOccurrencesOfString:@"window.INIT_DATA = " withString:@""];
+    jsonStr = [jsonStr substringToIndex:jsonStr.length - 1];   // 去掉结尾的 };
+    NSDictionary *form = [NSJSONSerialization JSONObjectWithData:[jsonStr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    if (!form) { [log appendString:@"    INIT_DATA 解析失败\n"]; return log; }
+    NSMutableDictionary *info = [form mutableCopy];
+    @try { info[@"output"] = [NSJSONSerialization JSONObjectWithData:[[(NSString *)form[@"output"] ?: @"{}" dataUsingEncoding:NSUTF8StringEncoding]] options:0 error:nil]; } @catch (id e) {}
+    [log appendFormat:@"[2] 表单解析成功 dataKeys=%@\n", [[info[@"data"] allKeys] componentsJoinedByString:@","]];
+    // 标观演人
+    NSString *viewerKey = nil;
+    for (NSString *k in info[@"data"]) if ([k rangeOfString:@"dmViewer"].location != NSNotFound) viewerKey = k;
+    if (viewerKey) {
+        NSDictionary *vk = info[@"data"][viewerKey];
+        NSMutableArray *ul = [((NSArray *)vk[@"fields"][@"dmViewerList"] ?: @[]) mutableCopy];
+        BOOL matched = NO;
+        for (NSMutableDictionary *u in ul) {
+            NSString *nm = u[@"viewerName"] ?: @"";
+            BOOL use = viewerName.length ? [nm rangeOfString:viewerName].location != NSNotFound : YES;
+            u[@"isUsed"] = use ? @YES : @NO;
+            if (use) matched = YES;
+        }
+        NSMutableDictionary *vk2 = [vk mutableCopy];
+        NSMutableDictionary *f2 = [vk[@"fields"] mutableCopy];
+        f2[@"dmViewerList"] = ul;
+        vk2[@"fields"] = f2;
+        NSMutableDictionary *data2 = [info[@"data"] mutableCopy];
+        data2[viewerKey] = vk2;
+        info[@"data"] = data2;
+        [log appendFormat:@"    观演人匹配=%d (viewer=%@)\n", (int)matched, viewerName ?: @"(第一个)"];
+        if (viewerName.length && !matched) [log appendString:@"    ★ 观演人没匹配上，仍会提交（isUsed 全 false）\n"];
+    } else [log appendString:@"    该表单无 dmViewer 节点\n"];
+    if (!doSubmit) { [log appendString:@"[3] 未提交（观察模式）\n    表单已保存到 dm_res_h5form.json\n"];
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingWithoutEscapingSlashes error:nil];
+        if (jd) [jd writeToFile:dpath(@"dm_res_h5form.json") options:NSDataWritingAtomic error:nil];
+        return log;
+    }
+    // step3: createOrder
+    [log appendString:@"[3] POST createOrder\n"];
+    NSData *body = [NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingWithoutEscapingSlashes error:nil];
+    NSDictionary *ph = @{@"User-Agent": gh[@"User-Agent"],
+                         @"Content-Type": @"application/json;charset=UTF-8",
+                         @"X-Requested-With": @"XMLHttpRequest",
+                         @"Origin": @"https://buy.damai.cn",
+                         @"Referer": @"https://buy.damai.cn/orderConfirm?",
+                         @"Accept": @"application/json, text/plain, */*"};
+    NSString *u3 = @"https://buy.damai.cn/multi/trans/createOrder?feature=%7B%22returnUrl%22%3A%22https%3A%2F%2Forders.damai.cn%2ForderDetail%22%2C%22serviceVersion%22%3A%221.8.5%22%7D&submitref=undefined";
+    NSData *d3 = dmSyncPost([NSURL URLWithString:u3], ph, body);
+    NSString *resp = [[NSString alloc] initWithData:d3 encoding:NSUTF8StringEncoding] ?: @"";
+    [log appendFormat:@"    resp=%@\n", clip(resp, 1200)];
+    [resp writeToFile:dpath(@"dm_res_h5create.json") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    return log;
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1341,6 +1445,12 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
     } else if ([c isEqualToString:@"viewinfo"]) {
         writeOut(dmViewIvars(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"h5confirm"] || [c isEqualToString:@"h5buy"]) {
+        NSString *bp = cmd[@"buyParam"] ?: @"1091503581127_1_6311209779027";
+        NSString *viewer = [cmd[@"viewer"] isKindOfClass:[NSString class]] ? cmd[@"viewer"] : @"";
+        BOOL submit = [c isEqualToString:@"h5buy"] && exists(@"dm_allow_create");
+        if ([c isEqualToString:@"h5buy"] && !exists(@"dm_allow_create")) { writeOut(@"拒绝：没有 dm_allow_create"); return; }
+        writeOut(dmH5Buy(bp, viewer, submit));
     } else if ([c isEqualToString:@"dxev"]) {
         writeOut(dmDXEv(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"instinfo"]) {
