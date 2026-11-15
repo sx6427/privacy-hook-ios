@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.9";
+static NSString *const kVer = @"v2.0";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -272,6 +272,7 @@ static NSString *decodeParamsField(id biz) {
 // ---------------- MTOP hook ----------------
 static NSDictionary *gLastCreateBiz = nil;   // 最近一次 trade.order.create 的 bizParameters
 static id gLastDelegate = nil;
+static id gLastReqObj = nil;   // App 原生的 MtopExtRequest 对象本身
 static NSString *gLastTtid = nil;
 static NSString *gLastCreateAPI = nil;
 
@@ -281,6 +282,7 @@ static void rememberCreate(id req) {
         if (![api isKindOfClass:[NSString class]] || [api rangeOfString:@"trade.order"].location == NSNotFound) return;
         id biz = [req valueForKey:@"bizParameters"];
         @try { id dg = [req valueForKey:@"delegate"]; if (dg) gLastDelegate = dg; } @catch (id e) {}
+        gLastReqObj = req;   // ★ 保留对象本体
         @try { id tt = [req valueForKey:@"ttid"]; if ([tt isKindOfClass:[NSString class]] && [(NSString *)tt length]) gLastTtid = tt; } @catch (id e) {}
         if ([biz isKindOfClass:[NSDictionary class]]) {
             gLastCreateBiz = [(NSDictionary *)biz copy];
@@ -1226,10 +1228,49 @@ static void execCmd(NSDictionary *cmd) {
             return;
         }
         if (!exists(@"dm_allow_create")) { writeOut(@"拒绝：没有 dm_allow_create"); return; }
-        NSMutableDictionary *biz = [gLastCreateBiz mutableCopy];
         NSString *bp = cmd[@"buyParam"];
-        if ([bp isKindOfClass:[NSString class]] && bp.length) biz[@"buyParam"] = bp;
-        NSString *payload = runCreateViaRequest(biz, gLastCreateAPI, @"1.0", tag);
+        NSString *payload = nil;
+        if (gLastReqObj) {
+            // ★ 对象复用：原样（或改 buyParam 后）重发 App 自己的请求对象
+            if ([bp isKindOfClass:[NSString class]] && bp.length) {
+                @try { [gLastReqObj setValue:bp forKey:@"buyParam"]; } @catch (id e) {}
+                id mr = nil;
+                @try { mr = [gLastReqObj valueForKey:@"mrequest"]; } @catch (id e) {}
+                if (mr) {
+                    NSMutableDictionary *nb = [gLastCreateBiz mutableCopy];
+                    nb[@"buyParam"] = bp;
+                    BOOL done = NO;
+                    @try { [mr setValue:nb forKey:@"bizParameters"]; done = YES; } @catch (id e) {}
+                    if (!done) {
+                        Ivar iv = class_getInstanceVariable([mr class], "_bizParameters");
+                        if (iv) { object_setIvar(mr, iv, nb); done = YES; }
+                    }
+                    W(@"mutate buyParam=%@ done=%d", bp, (int)done);
+                }
+            }
+            id inst2 = mtopInstance(nil);
+            id resp = nil;
+            @try { resp = ((id (*)(id, SEL, id))objc_msgSend)(inst2, @selector(sync_call:), gLastReqObj); }
+            @catch (NSException *e) { payload = [NSString stringWithFormat:@"{\"err\":\"%@\"}", e.name]; }
+            NSMutableString *pl = [NSMutableString string];
+            id d2 = nil;
+            @try { d2 = [resp valueForKey:@"data"]; } @catch (id e) {}
+            if ([d2 isKindOfClass:[NSDictionary class]] || [d2 isKindOfClass:[NSArray class]]) {
+                NSData *jd = [NSJSONSerialization dataWithJSONObject:d2 options:NSJSONWritingWithoutEscapingSlashes error:nil];
+                if (jd) [pl appendString:[[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]];
+            }
+            if (!pl.length) {
+                NSString *errLine = nil;
+                @try { errLine = [[resp valueForKey:@"error"] description]; } @catch (id e) {}
+                [pl appendFormat:@"{\"raw\":\"%@\"}", clip(errLine ?: @"(nil)", 600)];
+            }
+            payload = pl;
+            W(@"REPLAY-OBJ buyParam=%@ len=%lu", bp ?: @"(原样)", (unsigned long)pl.length);
+        } else {
+            NSMutableDictionary *biz = [gLastCreateBiz mutableCopy];
+            if ([bp isKindOfClass:[NSString class]] && bp.length) biz[@"buyParam"] = bp;
+            payload = runCreateViaRequest(biz, gLastCreateAPI, @"1.0", tag);
+        }
         writeOut([NSString stringWithFormat:@"[replay %@ buyParam=%@]\n%@\n", gLastCreateAPI, biz[@"buyParam"], payload]);
         [payload writeToFile:dpath([NSString stringWithFormat:@"dm_res_%@.json", tag]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } else if ([c isEqualToString:@"create"]) {
