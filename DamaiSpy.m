@@ -22,7 +22,7 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
-static NSString *const kVer = @"v1.0";
+static NSString *const kVer = @"v1.1";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -729,6 +729,59 @@ static NSString *dmViewIvars(NSString *needle) {
     return report ?: @"(nil)";
 }
 
+
+// 沿祖先链找手势（DinamicX 的点击挂在容器上）
+static UIView *dmFindByText(NSString *needle) {
+    UIViewController *vc = dmTopVC();
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
+    while (stack.count) {
+        UIView *v = [stack lastObject]; [stack removeLastObject];
+        NSString *t = viewText(v);
+        if (t.length && [t rangeOfString:needle].location != NSNotFound) return v;
+        for (UIView *s in v.subviews) [stack addObject:s];
+    }
+    return nil;
+}
+
+static NSString *dmChain(NSString *needle, BOOL fire) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIView *v = dmFindByText(needle);
+        if (!v) { report = @"未找到"; return; }
+        int depth = 0;
+        BOOL fired = NO;
+        for (UIView *cur = v; cur && depth < 12; cur = cur.superview, depth++) {
+            NSMutableArray *gs = [NSMutableArray array];
+            for (UIGestureRecognizer *g in cur.gestureRecognizers) {
+                NSString *tn = NSStringFromClass([g class]);
+                NSArray *targets = nil;
+                @try { targets = [g valueForKey:@"_targets"]; } @catch (id e) {}
+                [gs addObject:[NSString stringWithFormat:@"%@(%lu)", tn, (unsigned long)targets.count]];
+                if (fire && !fired && [g isKindOfClass:[UITapGestureRecognizer class]]) {
+                    for (id t in targets) {
+                        id tgt = nil; NSString *act = nil;
+                        @try { tgt = [t valueForKey:@"_target"]; act = [t valueForKey:@"_action"]; } @catch (id e) {}
+                        SEL sel = act ? NSSelectorFromString(act) : NULL;
+                        if (tgt && sel && [tgt respondsToSelector:sel]) {
+                            @try {
+                                ((void (*)(id, SEL, id))objc_msgSend)(tgt, sel, g);
+                                [r appendFormat:@"FIRE %@ -%@ (ancestor %d)\n", NSStringFromClass([tgt class]), act, depth];
+                                fired = YES;
+                            } @catch (id e) { [r appendFormat:@"FIRE EXC %@\n", e]; }
+                        }
+                    }
+                }
+            }
+            [r appendFormat:@"%*s%@ frame=%@ gestures=[%@]\n", depth * 2, "", NSStringFromClass([cur class]),
+             NSStringFromCGRect(cur.frame), [gs componentsJoinedByString:@","]];
+        }
+        [r appendFormat:@"fired=%d\n", (int)fired];
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -956,6 +1009,8 @@ static void execCmd(NSDictionary *cmd) {
         NSString *needle = cmd[@"txt"];
         if (!needle.length) { writeOut(@"需要 txt 参数"); return; }
         writeOut(dmHIDTapByText(needle, [c isEqualToString:@"hidtap"]));
+    } else if ([c isEqualToString:@"chain"] || [c isEqualToString:@"gestap"]) {
+        writeOut(dmChain(cmd[@"txt"] ?: @"立即提交", [c isEqualToString:@"gestap"]));
     } else if ([c isEqualToString:@"axact"]) {
         writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
     } else if ([c isEqualToString:@"viewinfo"]) {
