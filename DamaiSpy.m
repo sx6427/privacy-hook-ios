@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.4";
+static NSString *const kVer = @"v1.5";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -284,6 +284,13 @@ static void rememberCreate(id req) {
             NSMutableArray *ks = [NSMutableArray array];
             for (NSString *k in [(NSDictionary *)biz allKeys]) [ks addObject:[NSString stringWithFormat:@"%@(%lu)", k, (unsigned long)[[NSString stringWithFormat:@"%@", [(NSDictionary *)biz objectForKey:k]] length]]];
             W(@"saved last %@ biz: %@", api, [ks componentsJoinedByString:@", "]);
+            if ([api rangeOfString:@"order.create"].location != NSNotFound) {
+                @try {
+                    NSDictionary *snap = @{@"api": api, @"v": @"1.0", @"biz": gLastCreateBiz};
+                    NSData *jd = [NSJSONSerialization dataWithJSONObject:snap options:NSJSONWritingWithoutEscapingSlashes error:nil];
+                    if (jd) [jd writeToFile:dpath(@"dm_biz.json") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                } @catch (id e) {}
+            }
             if ([api rangeOfString:@"order.create"].location != NSNotFound)
                 M(@"==== CREATE 调用栈 ====\n%@", dmBacktrace(22));
         }
@@ -871,6 +878,32 @@ static NSString *dmDXEv(NSString *needle) {
     return report ?: @"(nil)";
 }
 
+
+// 发送前转换观察（MtopExtRequest -> TBSDKRequest 在哪里失败）
+static id (*o_sending)(id, SEL, id, id, id);
+static id dm_sending(id self, SEL _cmd, id req, id dlg, id sf) {
+    NSString *api = nil;
+    @try { api = [req valueForKey:@"apiName"]; } @catch (id e) {}
+    if ([api rangeOfString:@"order.create"].location != NSNotFound) {
+        M(@"==== sendingRequest for create ====");
+        M(@"%@", dumpObj(req));
+        id out = o_sending ? o_sending(self, _cmd, req, dlg, sf) : nil;
+        M(@"---- sendingRequest out ----\n%@", dumpObj(out));
+        return out;
+    }
+    return o_sending ? o_sending(self, _cmd, req, dlg, sf) : nil;
+}
+
+static void hookSending(void) {
+    Class c = NSClassFromString(@"MtopService");
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, @selector(sendingRequest:delegate:startFilter:));
+    if (!m) { W(@"no sendingRequest:"); return; }
+    o_sending = (void *)method_getImplementation(m);
+    method_setImplementation(m, (IMP)dm_sending);
+    W(@"hook sendingRequest:delegate:startFilter:");
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1253,9 +1286,22 @@ static void setupOnce(void) {
     if (gSetup) return;
     gSetup = YES;
     W(@"setupOnce begin (app state=%ld)", (long)[UIApplication sharedApplication].applicationState);
+    // 从落盘文件恢复最近一次 create 参数（重启后不用再点提交）
+    @try {
+        NSData *jd = [NSData dataWithContentsOfFile:dpath(@"dm_biz.json")];
+        if (jd) {
+            NSDictionary *snap = [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil];
+            if ([snap isKindOfClass:[NSDictionary class]] && [snap[@"biz"] isKindOfClass:[NSDictionary class]]) {
+                gLastCreateBiz = snap[@"biz"];
+                gLastCreateAPI = snap[@"api"];
+                W(@"restored biz from dm_biz.json (params len=%lu)", (unsigned long)[[NSString stringWithFormat:@"%@", gLastCreateBiz[@"params"]] length]);
+            }
+        }
+    } @catch (id e) { W(@"restore biz EXC %@", e); }
     @try { hookNet(); } @catch (id e) { W(@"hookNet EXC %@", e); }
     @try { hookSecurityGuard(); } @catch (id e) { W(@"hookSG EXC %@", e); }
     @try { hookDX(); } @catch (id e) { W(@"hookDX EXC %@", e); }
+    @try { hookSending(); } @catch (id e) { W(@"hookSending EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
