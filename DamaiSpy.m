@@ -22,7 +22,7 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
-static NSString *const kVer = @"v0.9";
+static NSString *const kVer = @"v1.0";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -675,6 +675,60 @@ static NSString *dmHIDTapByText(NSString *needle, BOOL doTap) {
     return report ?: @"(nil)";
 }
 
+
+// 无障碍激活（DinamicX 节点一般实现了 accessibilityActivate，能触发内部事件）
+static NSString *dmAXActivate(NSString *needle) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIViewController *vc = dmTopVC();
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
+        NSMutableArray *cands = [NSMutableArray array];
+        while (stack.count) {
+            UIView *v = [stack lastObject]; [stack removeLastObject];
+            NSString *t = viewText(v);
+            if (t.length && [t rangeOfString:needle].location != NSNotFound) [cands addObject:v];
+            for (UIView *s in v.subviews) [stack addObject:s];
+        }
+        [r appendFormat:@"candidates=%lu\n", (unsigned long)cands.count];
+        for (UIView *v in cands) {
+            BOOL act = [v respondsToSelector:@selector(accessibilityActivate)];
+            BOOL hadAct = NO;
+            if (act) {
+                @try { hadAct = (BOOL)[v performSelector:@selector(accessibilityActivate)]; }
+                @catch (id e) { [r appendFormat:@"  EXC %@\n", e]; }
+            }
+            [r appendFormat:@"  %@ activate=%d returned=%d label=%@\n", NSStringFromClass([v class]),
+             (int)act, (int)hadAct, clip([v accessibilityLabel], 30)];
+        }
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
+// 打印匹配视图的 ivar，找内部 handler / event 对象
+static NSString *dmViewIvars(NSString *needle) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIViewController *vc = dmTopVC();
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
+        UIView *target = nil;
+        while (stack.count) {
+            UIView *v = [stack lastObject]; [stack removeLastObject];
+            NSString *t = viewText(v);
+            if (!target && t.length && [t rangeOfString:needle].location != NSNotFound) target = v;
+            for (UIView *s in v.subviews) [stack addObject:s];
+        }
+        if (!target) { report = @"未找到"; return; }
+        [r appendFormat:@"target=%@\n", NSStringFromClass([target class])];
+        int budget = 40;
+        dumpIvarsOf(target, [target class], r, &budget);
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -902,6 +956,10 @@ static void execCmd(NSDictionary *cmd) {
         NSString *needle = cmd[@"txt"];
         if (!needle.length) { writeOut(@"需要 txt 参数"); return; }
         writeOut(dmHIDTapByText(needle, [c isEqualToString:@"hidtap"]));
+    } else if ([c isEqualToString:@"axact"]) {
+        writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
+    } else if ([c isEqualToString:@"viewinfo"]) {
+        writeOut(dmViewIvars(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"instinfo"]) {
         NSMutableString *o = [NSMutableString string];
         id inst = mtopInstance(cmd[@"site"]);
