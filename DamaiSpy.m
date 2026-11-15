@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.8";
+static NSString *const kVer = @"v1.9";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -889,6 +889,7 @@ static id dm_sending(id self, SEL _cmd, id req, id dlg, id sf) {
     NSString *api = nil;
     @try { api = [req valueForKey:@"apiName"]; } @catch (id e) {}
     if ([api rangeOfString:@"order.create"].location != NSNotFound) {
+        if (dlg) gLastDelegate = dlg;   // ★ delegate 在这里才就位
         M(@"==== sendingRequest for create ====");
         M(@"%@", dumpObj(req));
         id out = o_sending ? o_sending(self, _cmd, req, dlg, sf) : nil;
