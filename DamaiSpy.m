@@ -634,7 +634,7 @@ static NSString *dmHIDTap(CGPoint pt, NSString *why) {
         if (!ev) { [r appendString:@"event=nil\n"]; continue; }
         @try {
             if ([app respondsToSelector:enq]) ((void (*)(id, SEL, void *))objc_msgSend)(app, enq, ev);
-            else [app sendEvent:(UIEvent *)ev];
+            else [app sendEvent:(__bridge UIEvent *)ev];
             [r appendFormat:@"sent phase=%d\n", phase];
         } @catch (id e) { [r appendFormat:@"send EXC %@\n", e]; }
         CFRelease(ev);
