@@ -18,8 +18,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <zlib.h>
 
-static NSString *const kVer = @"v0.5";
+static NSString *const kVer = @"v0.6";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -182,6 +183,11 @@ static NSString *dumpObj(id o) {
             [s appendString:@"\n  -- ivars --"];
             dumpIvarsOf(mr, [mr class], s, &b1);
         }
+        id bizp = nil;
+        @try { bizp = [o valueForKey:@"bizParameters"]; } @catch (id e) {}
+        NSString *dec = decodeParamsField(bizp);
+        if (dec.length) [s appendFormat:@"\n PARAMS_DECODED = %@", dec];
+
         id d = nil;
         @try { d = [o valueForKey:@"data"]; } @catch (id e) {}
         if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
@@ -207,6 +213,54 @@ static NSString *bytesPreview(NSData *d, NSUInteger max) {
         return h;
     }
     return d.length > max ? [s stringByAppendingString:@"…"] : s;
+}
+
+// ---------------- gzip / base64 工具（params 字段是 gzip+base64 的表单体）----------------
+static NSData *dmGunzip(NSData *in) {
+    if (in.length < 18) return nil;
+    z_stream s; memset(&s, 0, sizeof(s));
+    if (inflateInit2(&s, 16 + MAX_WBITS) != Z_OK) return nil;
+    NSMutableData *out = [NSMutableData dataWithLength:256 * 1024];
+    s.next_in = (Bytef *)in.bytes;
+    s.avail_in = (uInt)in.length;
+    s.next_out = (Bytef *)out.mutableBytes;
+    s.avail_out = (uInt)out.length;
+    int ret = inflate(&s, Z_FINISH);
+    NSData *res = nil;
+    if (ret == Z_STREAM_END && s.total_out > 0)
+        res = [out subdataWithRange:NSMakeRange(0, s.total_out)];
+    inflateEnd(&s);
+    return res;
+}
+
+static NSData *dmGzip(NSData *in) {
+    if (!in.length) return nil;
+    z_stream s; memset(&s, 0, sizeof(s));
+    if (deflateInit2(&s, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) return nil;
+    NSUInteger cap = in.length + 1024;
+    NSMutableData *out = [NSMutableData dataWithLength:cap];
+    s.next_in = (Bytef *)in.bytes;
+    s.avail_in = (uInt)in.length;
+    s.next_out = (Bytef *)out.mutableBytes;
+    s.avail_out = (uInt)out.length;
+    int ret = deflate(&s, Z_FINISH);
+    NSData *res = nil;
+    if (ret == Z_STREAM_END) res = [out subdataWithRange:NSMakeRange(0, s.total_out)];
+    deflateEnd(&s);
+    return res;
+}
+
+// 从 bizParameters 里把 params(gzip+base64) 解成明文
+static NSString *decodeParamsField(id biz) {
+    if (![biz isKindOfClass:[NSDictionary class]]) return nil;
+    id v = [(NSDictionary *)biz objectForKey:@"params"];
+    if (![v isKindOfClass:[NSString class]] || ![(NSString *)v hasPrefix:@"H4sI"]) return nil;
+    NSData *raw = [[NSData alloc] initWithBase64EncodedString:(NSString *)v options:0];
+    if (!raw) return nil;
+    NSData *plain = dmGunzip(raw);
+    if (!plain) return [NSString stringWithFormat:@"(params %luB, gunzip 失败)", (unsigned long)((NSString *)v).length];
+    NSString *txt = [[NSString alloc] initWithData:plain encoding:NSUTF8StringEncoding];
+    return txt.length ? clip(txt, 4000) : [NSString stringWithFormat:@"(params %luB 解出非文本)", (unsigned long)plain.length];
 }
 
 // ---------------- MTOP hook ----------------
@@ -593,6 +647,31 @@ static void execCmd(NSDictionary *cmd) {
     } else if ([c isEqualToString:@"clear"]) {
         if ([cmd[@"what"] isEqualToString:@"mtop"]) { [gLock lock]; [gMtopLog setString:@""]; gMtopDirty = YES; [gLock unlock]; }
         writeOut(@"cleared");
+    } else if ([c isEqualToString:@"create"]) {
+        if (!exists(@"dm_allow_create")) { writeOut(@"拒绝执行：沙盒里没有 dm_allow_create"); return; }
+        NSString *buyParam = cmd[@"buyParam"];
+        NSString *signKey = cmd[@"signKey"] ?: @"";
+        id params = cmd[@"params"] ?: @{};
+        if (!buyParam.length || ![params isKindOfClass:[NSDictionary class]]) { writeOut(@"参数不足：需要 buyParam + params"); return; }
+        NSData *pj = [NSJSONSerialization dataWithJSONObject:params options:0 error:nil];
+        NSData *gz = dmGzip(pj);
+        NSString *b64 = gz ? [gz base64EncodedStringWithOptions:0] : @"";
+        NSDictionary *ex = @{@"signKey": signKey, @"novad": @"mtop.damai.cn", @"novacv": @"1.0",
+                             @"novab": @"mtop.damai.trade.order.build", @"channel": @"damai_app",
+                             @"novaav": @"1.0", @"novac": @"mtop.damai.trade.order.create", @"coupon": @"true",
+                             @"umpChannel": @"10001", @"novaa": @"mtop.damai.trade.order.adjust", @"coVersion": @"2.0",
+                             @"novabv": @"1.0", @"pioneer": @"1", @"atomSplit": @"1"};
+        NSData *exj = [NSJSONSerialization dataWithJSONObject:ex options:0 error:nil];
+        NSString *exs = exj ? [[NSString alloc] initWithData:exj encoding:NSUTF8StringEncoding] : @"{}";
+        NSMutableDictionary *biz = [NSMutableDictionary dictionary];
+        biz[@"buyNow"] = @YES;
+        biz[@"buyParam"] = buyParam;
+        biz[@"exParams"] = exs;
+        biz[@"params"] = b64;
+        biz[@"feature"] = @"{\"gzip\":\"true\"}";
+        NSString *payload = runMtop(@"mtop.damai.trade.order.create", @"1.0", biz, nil, tag);
+        writeOut([NSString stringWithFormat:@"[create %@ paramsRaw=%lu b64=%lu]\n%@\n", buyParam, (unsigned long)pj.length, (unsigned long)b64.length, payload]);
+        [payload writeToFile:dpath([NSString stringWithFormat:@"dm_res_%@.json", tag]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } else if ([c isEqualToString:@"instinfo"]) {
         NSMutableString *o = [NSMutableString string];
         id inst = mtopInstance(cmd[@"site"]);
