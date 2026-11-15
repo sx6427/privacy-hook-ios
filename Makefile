@@ -1,25 +1,16 @@
-# iOS 12 构建：XyProbe.dylib（输出名 PrivacyHook.dylib 匹配 workflow 产物）
+# 大麦探针构建（damai 分支专用）：源 DamaiSpy.m，产物沿用 PrivacyHook.dylib 以匹配 workflow
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
-
-CFLAGS  = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=12.0 -fobjc-arc -Wall
-
-LDFLAGS = -arch arm64 -isysroot $(SDKROOT) -miphoneos-version-min=12.0 \
-          -dynamiclib -framework Foundation -framework Security -framework UIKit \
-          -framework WebKit -framework AVFoundation \
-          -install_name @executable_path/XyProbe.dylib \
+ARCH    = -arch arm64
+CFLAGS  = $(ARCH) -isysroot $(SDKROOT) -miphoneos-version-min=15.0 -fobjc-arc -Wall -O2
+LDFLAGS = $(ARCH) -isysroot $(SDKROOT) -miphoneos-version-min=15.0 \
+          -dynamiclib -framework Foundation -framework UIKit \
+          -install_name @executable_path/DamaiSpy.dylib \
           -Xlinker -no_fixup_chains
-
 DYLIB = PrivacyHook.dylib
-SRC   = XyProbe.m
-
+SRC   = DamaiSpy.m
 .PHONY: all clean
 all: $(DYLIB)
-
 $(DYLIB): $(SRC)
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
 	@file $@
-	@otool -l $@ | grep -A4 LC_BUILD_VERSION || true
-	@otool -l $@ | grep minos || true
-
-clean:
-	rm -f $(DYLIB)
+clean:/n	rm -f $(DYLIB)
