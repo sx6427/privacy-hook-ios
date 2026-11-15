@@ -298,7 +298,9 @@ static int hookClassNamed(NSString *cn) {
 // 快速路径：只试已知类名
 static id dm_succeed(id self, SEL _cmd, id req, id resp) {
     M(@"==== RESP(ok) %@ ====", NSStringFromClass([self class]));
-    M(@" req  api=%@", clip([[NSString stringWithFormat:@"%@", [[req valueForKey:@"api"] description] ?: @"?"]], 120));
+    id apiv = nil;
+    @try { apiv = [req valueForKey:@"api"]; } @catch (id e) {}
+    M(@" req api=%@", clip([NSString stringWithFormat:@"%@", apiv ?: @"?"], 120));
     M(@"%@", dumpObj(resp));
     IMP o = origFor(_cmd);
     return o ? ((id (*)(id, SEL, id, id))o)(self, _cmd, req, resp) : nil;
