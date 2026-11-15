@@ -19,7 +19,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static NSString *const kVer = @"v0.3";
+static NSString *const kVer = @"v0.4";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -101,6 +101,8 @@ static NSString *clip(NSString *s, NSUInteger n) {
 }
 
 // 递归父类的 ivar dump（MtopExtRequest 的真参数在 MtopRequest/TBSDKRequest 里）
+static NSString *bytesPreview(NSData *d, NSUInteger max);
+
 static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
     if (!c || c == [NSObject class] || *budget <= 0) return;
     dumpIvarsOf(o, class_getSuperclass(c), s, budget);
@@ -113,8 +115,14 @@ static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
             id v = nil;
             @try { v = object_getIvar(o, ivars[i]); } @catch (id e) {}
             if (!v) continue;
-            NSString *vs = [NSString stringWithFormat:@"%@", v];
-            [s appendFormat:@"\n  .%@ = %@", nm, clip(vs, 700)];
+            NSString *vs;
+            if ([v isKindOfClass:[NSData class]]) {
+                NSData *dd = (NSData *)v;
+                vs = [NSString stringWithFormat:@"(NSData %luB) %@", (unsigned long)dd.length, bytesPreview(dd, 900)];
+            } else {
+                vs = [NSString stringWithFormat:@"%@", v];
+            }
+            [s appendFormat:@"\n  .%@ = %@", nm, clip(vs, 900)];
             *budget -= 1;
         } else if (tn && (tn[0] == 'i' || tn[0] == 'q' || tn[0] == 'Q' || tn[0] == 'd' || tn[0] == 'c' || tn[0] == 'B')) {
             // 数值型只留少数关键字段，避免刷屏
@@ -148,12 +156,22 @@ static NSArray *reqKeys(void) {
              @"needLogin", @"needEcode", @"url", @"host", @"method", @"fullTraceID", @"pageName"];
 }
 
+static NSArray *respKeys(void) {
+    return @[@"api", @"apiName", @"apiVersion", @"v", @"ret", @"code", @"msg", @"message",
+             @"subCode", @"data", @"headers", @"fullTraceID", @"mappingCode", @"success"];
+}
+
 static NSString *dumpObj(id o) {
     if (!o) return @"(nil)";
     NSMutableString *s = [NSMutableString string];
     @try {
         [s appendFormat:@"<%@>", NSStringFromClass([o class])];
         [s appendString:kvcProbe(o, reqKeys())];
+        [s appendString:kvcProbe(o, respKeys())];
+        // ★ 对象自己的 ivar（响应体常藏在 _data / _response 里）
+        int b0 = 18;
+        [s appendString:@"\n  -- self ivars --"];
+        dumpIvarsOf(o, [o class], s, &b0);
         // 嵌套的 mrequest（TBSDKRequest）才是真正拼包对象
         id mr = nil;
         @try { mr = [o valueForKey:@"mrequest"]; } @catch (id e) {}
