@@ -21,8 +21,9 @@
 #import <zlib.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
+#import <execinfo.h>
 
-static NSString *const kVer = @"v1.1";
+static NSString *const kVer = @"v1.2";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -281,6 +282,8 @@ static void rememberCreate(id req) {
             NSMutableArray *ks = [NSMutableArray array];
             for (NSString *k in [(NSDictionary *)biz allKeys]) [ks addObject:[NSString stringWithFormat:@"%@(%lu)", k, (unsigned long)[[NSString stringWithFormat:@"%@", [(NSDictionary *)biz objectForKey:k]] length]]];
             W(@"saved last %@ biz: %@", api, [ks componentsJoinedByString:@", "]);
+            if ([api rangeOfString:@"order.create"].location != NSNotFound)
+                M(@"==== CREATE 调用栈 ====\n%@", dmBacktrace(22));
         }
     } @catch (id e) { W(@"rememberCreate EXC %@", e); }
 }
@@ -782,6 +785,44 @@ static NSString *dmChain(NSString *needle, BOOL fire) {
     return report ?: @"(nil)";
 }
 
+
+// 打印调用栈（用于定位"谁构造了 create 包"）
+static NSString *dmBacktrace(int max) {
+    void *buf[80];
+    int n = backtrace(buf, 80);
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < n && i < max; i++) {
+        Dl_info info;
+        if (dladdr(buf[i], &info) && info.dli_sname) {
+            const char *img = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
+            [s appendFormat:@"  #%-2d %s  [%s]\n", i, info.dli_sname, img ? img + 1 : "?"];
+        } else {
+            [s appendFormat:@"  #%-2d %p\n", i, buf[i]];
+        }
+    }
+    return s;
+}
+
+// 安全签名类 hook（看它是不是交易签名的实施者）
+static id (*o_sg_sign)(id, SEL, id, id);
+static id dm_sg_sign(id self, SEL _cmd, id req, id code) {
+    NSString *in = clip([NSString stringWithFormat:@"%@", req], 1200);
+    M(@"==== SG signRequest in ====\n%@\n-- bt --\n%@", in, dmBacktrace(14));
+    id out = o_sg_sign ? o_sg_sign(self, _cmd, req, code) : nil;
+    M(@"---- SG signRequest out = %@", clip([NSString stringWithFormat:@"%@", out], 1200));
+    return out;
+}
+
+static void hookSecurityGuard(void) {
+    Class c = NSClassFromString(@"SecurityGuardOpenSecureSignature");
+    if (!c) { W(@"no SecurityGuardOpenSecureSignature"); return; }
+    Method m = class_getInstanceMethod(c, @selector(signRequest:authCode:));
+    if (!m) { W(@"no signRequest:authCode:"); return; }
+    o_sg_sign = (void *)method_getImplementation(m);
+    method_setImplementation(m, (IMP)dm_sg_sign);
+    W(@"hook SecurityGuardOpenSecureSignature signRequest:authCode:");
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1118,6 +1159,7 @@ static void setupOnce(void) {
     gSetup = YES;
     W(@"setupOnce begin (app state=%ld)", (long)[UIApplication sharedApplication].applicationState);
     @try { hookNet(); } @catch (id e) { W(@"hookNet EXC %@", e); }
+    @try { hookSecurityGuard(); } @catch (id e) { W(@"hookSG EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
