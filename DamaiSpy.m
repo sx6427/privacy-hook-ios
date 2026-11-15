@@ -19,8 +19,10 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <zlib.h>
+#import <dlfcn.h>
+#import <mach/mach_time.h>
 
-static NSString *const kVer = @"v0.8";
+static NSString *const kVer = @"v0.9";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -607,6 +609,72 @@ static NSString *dmTapByText(NSString *needle) {
     return report ?: @"(nil)";
 }
 
+
+// ---------------- HID 级触摸注入（真实触摸事件，DinamicX 节点也能点）----------------
+typedef void *(*DMCreateFingerEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
+                                       double, double, double, double, double, Boolean, Boolean, uint32_t);
+
+static NSString *dmHIDTap(CGPoint pt, NSString *why) {
+    NSMutableString *r = [NSMutableString string];
+    [r appendFormat:@"hidtap at (%.0f,%.0f) %@\n", pt.x, pt.y, why ?: @""];
+    void *sym = dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerFingerEvent");
+    [r appendFormat:@"symbol=%s\n", sym ? "ok" : "MISSING"];
+    if (!sym) return r;
+    DMCreateFingerEventFn mk = (DMCreateFingerEventFn)sym;
+    UIApplication *app = [UIApplication sharedApplication];
+    SEL enq = NSSelectorFromString(@"_enqueueHIDEvent:");
+    [r appendFormat:@"enqueue=%d\n", (int)[app respondsToSelector:enq]];
+
+    uint32_t mask = 0x3;   // Range|Touch
+    for (int phase = 0; phase < 2; phase++) {
+        Boolean touch = (phase == 0);
+        uint64_t ts = mach_absolute_time();
+        void *ev = mk(kCFAllocatorDefault, ts, 0, 0x1, mask,
+                      pt.x, pt.y, 0.0, phase == 0 ? 1.0 : 0.0, 0.0, touch, touch, 0);
+        if (!ev) { [r appendString:@"event=nil\n"]; continue; }
+        @try {
+            if ([app respondsToSelector:enq]) ((void (*)(id, SEL, void *))objc_msgSend)(app, enq, ev);
+            else [app sendEvent:(UIEvent *)ev];
+            [r appendFormat:@"sent phase=%d\n", phase];
+        } @catch (id e) { [r appendFormat:@"send EXC %@\n", e]; }
+        CFRelease(ev);
+        usleep(60000);
+    }
+    return r;
+}
+
+// 找到文字匹配的视图，换算成窗口坐标后 HID 点击
+static NSString *dmHIDTapByText(NSString *needle, BOOL doTap) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIViewController *vc = dmTopVC();
+        UIWindow *win = vc.view.window;
+        NSMutableArray *cands = [NSMutableArray array];
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
+        while (stack.count) {
+            UIView *v = [stack lastObject];
+            [stack removeLastObject];
+            NSString *t = viewText(v);
+            if (t.length && [t rangeOfString:needle].location != NSNotFound) [cands addObject:v];
+            for (UIView *s in v.subviews) [stack addObject:s];
+        }
+        [r appendFormat:@"candidates=%lu\n", (unsigned long)cands.count];
+        UIView *target = nil;
+        for (UIView *v in cands) {
+            CGPoint c = [v convertPoint:CGPointMake(CGRectGetMidX(v.bounds), CGRectGetMidY(v.bounds)) toView:win];
+            [r appendFormat:@"  %@ bounds=%@ winCenter=(%.0f,%.0f) txt=%@\n",
+             NSStringFromClass([v class]), NSStringFromCGRect(v.bounds), c.x, c.y, clip(viewText(v), 30)];
+            if (!target) target = v;
+        }
+        if (!target) { [r appendString:@"未找到目标\n"]; report = [r copy]; return; }
+        CGPoint p = [target convertPoint:CGPointMake(CGRectGetMidX(target.bounds), CGRectGetMidY(target.bounds)) toView:win];
+        if (doTap) [r appendString:dmHIDTap(p, needle)];
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -830,6 +898,10 @@ static void execCmd(NSDictionary *cmd) {
         NSString *needle = cmd[@"txt"];
         if (!needle.length) { writeOut(@"需要 txt 参数"); return; }
         writeOut(dmTapByText(needle));
+    } else if ([c isEqualToString:@"hidfind"] || [c isEqualToString:@"hidtap"]) {
+        NSString *needle = cmd[@"txt"];
+        if (!needle.length) { writeOut(@"需要 txt 参数"); return; }
+        writeOut(dmHIDTapByText(needle, [c isEqualToString:@"hidtap"]));
     } else if ([c isEqualToString:@"instinfo"]) {
         NSMutableString *o = [NSMutableString string];
         id inst = mtopInstance(cmd[@"site"]);
