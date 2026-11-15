@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.3";
+static NSString *const kVer = @"v1.4";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -108,6 +108,7 @@ static NSString *clip(NSString *s, NSUInteger n) {
 static NSString *bytesPreview(NSData *d, NSUInteger max);
 static NSString *decodeParamsField(id biz);
 static NSString *dmBacktrace(int max);
+static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag);
 
 static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
     if (!c || c == [NSObject class] || *budget <= 0) return;
@@ -997,6 +998,51 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
     return payload;
 }
 
+
+// 自建 MtopExtRequest 发 create（对齐 App 原生请求形态）
+static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag) {
+    Class reqCls = NSClassFromString(@"MtopExtRequest");
+    if (!reqCls) return @"{\"err\":\"no MtopExtRequest\"}";
+    id inst = mtopInstance(nil);
+    if (!inst) return @"{\"err\":\"no mtop instance\"}";
+
+    id req = ((id (*)(id, SEL))objc_msgSend)(reqCls, @selector(alloc));
+    @try { req = ((id (*)(id, SEL))objc_msgSend)(req, @selector(init)); } @catch (id e) {}
+
+    NSArray *sets = @[
+        @[@"apiName", api ?: @"mtop.damai.trade.order.create"],
+        @[@"apiVersion", v ?: @"1.0"],
+        @[@"bizParameters", biz ?: @{}],
+        @[@"customHost", @"mtop.damai.cn"],
+    ];
+    for (NSArray *kv in sets) {
+        @try { [req setValue:kv[1] forKey:kv[0]]; } @catch (id e) { W(@"set %@ EXC %@", kv[0], e); }
+    }
+    for (NSString *k in @[@"needEcode", @"isNeedEcode"]) {
+        @try { [req setValue:@YES forKey:k]; W(@"set %@ ok", k); break; } @catch (id e) {}
+    }
+
+    W(@"REQ-OBJ api=%@ v=%@ biz=%lu", api, v, (unsigned long)biz.count);
+    SEL call = @selector(sync_call:);
+    id resp = nil;
+    @try {
+        resp = ((id (*)(id, SEL, id))objc_msgSend)(inst, call, req);
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"{\"err\":\"exception\",\"name\":\"%@\",\"reason\":\"%@\"}", e.name, clip(e.reason, 200)];
+    }
+    NSMutableString *payload = [NSMutableString string];
+    id d = nil;
+    @try { d = [resp valueForKey:@"data"]; } @catch (id e) {}
+    if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingWithoutEscapingSlashes error:nil];
+        if (jd) [payload appendString:[[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]];
+    }
+    if (!payload.length) [payload appendFormat:@"{}", @""]; // placeholder
+    if (!payload.length) [payload appendString:[NSString stringWithFormat:@"%@", resp ?: @"(nil)"]];
+    M(@"CREATE-VIA-REQ tag=%@ len=%lu", tag ?: @"-", (unsigned long)payload.length);
+    return payload;
+}
+
 // ---------------- 指令通道 ----------------
 static void hookAllClasses(void);   // 前向声明
 
@@ -1050,7 +1096,7 @@ static void execCmd(NSDictionary *cmd) {
         NSMutableDictionary *biz = [gLastCreateBiz mutableCopy];
         NSString *bp = cmd[@"buyParam"];
         if ([bp isKindOfClass:[NSString class]] && bp.length) biz[@"buyParam"] = bp;
-        NSString *payload = runMtop(gLastCreateAPI ?: @"mtop.damai.trade.order.create", @"1.0", biz, nil, tag);
+        NSString *payload = runCreateViaRequest(biz, gLastCreateAPI, @"1.0", tag);
         writeOut([NSString stringWithFormat:@"[replay %@ buyParam=%@]\n%@\n", gLastCreateAPI, biz[@"buyParam"], payload]);
         [payload writeToFile:dpath([NSString stringWithFormat:@"dm_res_%@.json", tag]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } else if ([c isEqualToString:@"create"]) {
