@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.7";
+static NSString *const kVer = @"v1.8";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -271,6 +271,8 @@ static NSString *decodeParamsField(id biz) {
 
 // ---------------- MTOP hook ----------------
 static NSDictionary *gLastCreateBiz = nil;   // 最近一次 trade.order.create 的 bizParameters
+static id gLastDelegate = nil;
+static NSString *gLastTtid = nil;
 static NSString *gLastCreateAPI = nil;
 
 static void rememberCreate(id req) {
@@ -278,6 +280,8 @@ static void rememberCreate(id req) {
         NSString *api = [req valueForKey:@"apiName"];
         if (![api isKindOfClass:[NSString class]] || [api rangeOfString:@"trade.order"].location == NSNotFound) return;
         id biz = [req valueForKey:@"bizParameters"];
+        @try { id dg = [req valueForKey:@"delegate"]; if (dg) gLastDelegate = dg; } @catch (id e) {}
+        @try { id tt = [req valueForKey:@"ttid"]; if ([tt isKindOfClass:[NSString class]] && tt.length) gLastTtid = tt; } @catch (id e) {}
         if ([biz isKindOfClass:[NSDictionary class]]) {
             gLastCreateBiz = [(NSDictionary *)biz copy];
             gLastCreateAPI = [api copy];
@@ -1099,6 +1103,30 @@ static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString 
     }
     for (NSString *k in @[@"needEcode", @"isNeedEcode"]) {
         @try { [req setValue:@YES forKey:k]; W(@"outer set %@ ok", k); break; } @catch (id e) {}
+    }
+    // 反降级：补 delegate / ttid，关 slim
+    id dg = gLastDelegate;
+    if (!dg) {
+        Class ds = NSClassFromString(@"TBSDKMTOPServer");
+        if (ds) {
+            for (NSString *mk in @[@"getInstance", @"sharedInstance", @"getInstanceWithID:"]) {
+                SEL s = NSSelectorFromString(mk);
+                if ([ds respondsToSelector:s] || [ds instancesRespondToSelector:s]) {
+                    @try {
+                        if ([ds respondsToSelector:s]) dg = ((id (*)(id, SEL))objc_msgSend)(ds, s);
+                        else if (inst && [(id)inst respondsToSelector:s]) dg = ((id (*)(id, SEL))objc_msgSend)(inst, s);
+                    } @catch (id e) {}
+                    if (dg) { W(@"delegate via %@ ok", mk); break; }
+                }
+            }
+        }
+    }
+    if (dg) { @try { [req setValue:dg forKey:@"delegate"]; W(@"set delegate ok (%@)", NSStringFromClass([dg class])); } @catch (id e) { W(@"set delegate EXC"); } }
+    else W(@"delegate 未取得");
+    NSString *ttid = gLastTtid ?: @"cn.damai.iphone@damai_iphone_9.0.37";
+    @try { [req setValue:ttid forKey:@"ttid"]; W(@"set ttid ok"); } @catch (id e) { W(@"set ttid EXC"); }
+    for (NSString *k in @[@"isSlimConfRetry", @"_isSlimConfRetry"]) {
+        @try { [req setValue:@NO forKey:k]; W(@"set %@ NO ok", k); break; } @catch (id e) {}
     }
     // 内层：bizParameters 挂在 TBSDKRequest(mrequest) 上
     Class tbCls = NSClassFromString(@"TBSDKRequest");
