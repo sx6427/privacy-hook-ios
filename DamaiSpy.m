@@ -1271,7 +1271,7 @@ static void execCmd(NSDictionary *cmd) {
             if ([bp isKindOfClass:[NSString class]] && bp.length) biz[@"buyParam"] = bp;
             payload = runCreateViaRequest(biz, gLastCreateAPI, @"1.0", tag);
         }
-        writeOut([NSString stringWithFormat:@"[replay %@ buyParam=%@]\n%@\n", gLastCreateAPI, biz[@"buyParam"], payload]);
+        writeOut([NSString stringWithFormat:@"[replay %@ buyParam=%@]\n%@\n", gLastCreateAPI, bp ?: @"(原样)", payload]);
         [payload writeToFile:dpath([NSString stringWithFormat:@"dm_res_%@.json", tag]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } else if ([c isEqualToString:@"create"]) {
         if (!exists(@"dm_allow_create")) { writeOut(@"拒绝执行：沙盒里没有 dm_allow_create"); return; }
