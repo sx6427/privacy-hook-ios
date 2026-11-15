@@ -22,8 +22,10 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 #import <execinfo.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <WebKit/WebKit.h>
 
-static NSString *const kVer = @"v2.2";
+static NSString *const kVer = @"v2.3";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1080,6 +1082,76 @@ static NSString *dmH5Buy(NSString *buyParam, NSString *viewerName, BOOL doSubmit
     return log;
 }
 
+
+// ---------------- H5 网关（公开 MD5 签名协议，绕开加固壳）----------------
+static NSString *dmMd5(NSString *in) {
+    unsigned char dg[CC_MD5_DIGEST_LENGTH];
+    const char *c = in.UTF8String;
+    CC_MD5(c, (CC_LONG)strlen(c), dg);
+    NSMutableString *h = [NSMutableString string];
+    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [h appendFormat:@"%02x", dg[i]];
+    return h;
+}
+
+static NSString *dmH5Token(void) {
+    for (NSHTTPCookie *c in [NSHTTPCookieStorage sharedHTTPCookieStorage].cookies) {
+        if ([c.name isEqualToString:@"_m_h5_tk"]) {
+            NSArray *p = [c.value componentsSeparatedByString:@"_"];
+            return p.firstObject ?: @"";
+        }
+    }
+    return @"";
+}
+
+static NSString *dmEnc2(NSString *s) {
+    return [s stringByAddingPercentEncodingWithAllowedCharacters:[[NSCharacterSet alphanumericCharacterSet] invertedSet]];
+}
+
+static NSData *dmH5Sync(NSURL *url, NSString *method, NSData *body) {
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:url];
+    rq.HTTPMethod = method;
+    rq.timeoutInterval = 15;
+    if (body) rq.HTTPBody = body;
+    __block NSData *out = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        out = d; dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+    return out;
+}
+
+// 通用 H5 mtop 调用（自动处理 token 过期重试）
+static NSString *dmH5Call(NSString *api, NSString *ver, NSString *dataJson) {
+    NSMutableString *log = [NSMutableString string];
+    for (int attempt = 0; attempt < 2; attempt++) {
+        NSString *token = dmH5Token();
+        long long t = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
+        NSString *sign = dmMd5([NSString stringWithFormat:@"%@&%lld&12574478&%@", token, t, dataJson]);
+        NSString *u = [NSString stringWithFormat:
+            @"https://mtop.damai.cn/h5/%@/%@/?appKey=12574478&t=%lld&sign=%@&api=%@&v=%@&type=originaljson&dataType=json&timeout=20000&data=%@",
+            api, ver, t, sign, dmEnc2(api), dmEnc2(ver), dmEnc2(dataJson)];
+        [log appendFormat:@"[attempt %d] token=%@... sign=%@...\n", attempt, clip(token, 8), clip(sign, 12)];
+        NSData *d = dmH5Sync([NSURL URLWithString:u], @"GET", nil);
+        NSString *body = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+        [log appendFormat:@"    resp=%@\n", clip(body, 900)];
+        NSData *jd = [body dataUsingEncoding:NSUTF8StringEncoding];
+        id obj = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+        NSString *ret = @"";
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            id r = obj[@"ret"];
+            if ([r isKindOfClass:[NSArray class]] && [r count]) ret = [r firstObject];
+            else if ([r isKindOfClass:[NSString class]]) ret = r;
+        }
+        if ([ret rangeOfString:@"SUCCESS"].location != NSNotFound ||
+            [ret rangeOfString:@"TOKEN"].location == NSNotFound) {
+            return [log stringByAppendingFormat:@"\nRESULT %@", body];
+        }
+        [log appendString:@"    token 失效，刷新重试\n"];
+    }
+    return log;
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1456,6 +1528,15 @@ static void execCmd(NSDictionary *cmd) {
         BOOL submit = [c isEqualToString:@"h5buy"] && exists(@"dm_allow_create");
         if ([c isEqualToString:@"h5buy"] && !exists(@"dm_allow_create")) { writeOut(@"拒绝：没有 dm_allow_create"); return; }
         writeOut(dmH5Buy(bp, viewer, submit));
+    } else if ([c isEqualToString:@"h5call"]) {
+        NSString *api = cmd[@"api"] ?: @"mtop.damai.item.detail.getdetail";
+        NSString *ver = [cmd[@"v"] isKindOfClass:[NSString class]] ? cmd[@"v"] : @"1.0";
+        NSString *dataJson = nil;
+        if ([cmd[@"data"] isKindOfClass:[NSDictionary class]]) {
+            NSData *jd = [NSJSONSerialization dataWithJSONObject:cmd[@"data"] options:NSJSONWritingWithoutEscapingSlashes error:nil];
+            dataJson = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}";
+        } else dataJson = cmd[@"data"] ?: @"{}";
+        writeOut(dmH5Call(api, ver, dataJson));
     } else if ([c isEqualToString:@"dxev"]) {
         writeOut(dmDXEv(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"instinfo"]) {
