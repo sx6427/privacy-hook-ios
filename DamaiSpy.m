@@ -103,6 +103,7 @@ static NSString *clip(NSString *s, NSUInteger n) {
 
 // 递归父类的 ivar dump（MtopExtRequest 的真参数在 MtopRequest/TBSDKRequest 里）
 static NSString *bytesPreview(NSData *d, NSUInteger max);
+static NSString *decodeParamsField(id biz);
 
 static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
     if (!c || c == [NSObject class] || *budget <= 0) return;
