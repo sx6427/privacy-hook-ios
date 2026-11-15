@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.5";
+static NSString *const kVer = @"v1.6";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1033,7 +1033,10 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
 
 
 // 自建 MtopExtRequest 发 create（对齐 App 原生请求形态）
+static NSMutableString *r_err = nil;
+
 static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag) {
+    r_err = [NSMutableString new];
     Class reqCls = NSClassFromString(@"MtopExtRequest");
     if (!reqCls) return @"{\"err\":\"no MtopExtRequest\"}";
     id inst = mtopInstance(nil);
@@ -1042,18 +1045,37 @@ static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString 
     id req = ((id (*)(id, SEL))objc_msgSend)(reqCls, @selector(alloc));
     @try { req = ((id (*)(id, SEL))objc_msgSend)(req, @selector(init)); } @catch (id e) {}
 
-    NSArray *sets = @[
-        @[@"apiName", api ?: @"mtop.damai.trade.order.create"],
-        @[@"apiVersion", v ?: @"1.0"],
-        @[@"bizParameters", biz ?: @{}],
-        @[@"customHost", @"mtop.damai.cn"],
-    ];
-    for (NSArray *kv in sets) {
-        @try { [req setValue:kv[1] forKey:kv[0]]; } @catch (id e) { W(@"set %@ EXC %@", kv[0], e); }
+    // 外层：MtopExtRequest 自己的属性
+    for (NSArray *kv in @[@[@"apiName", api ?: @"mtop.damai.trade.order.create"],
+                          @[@"apiVersion", v ?: @"1.0"],
+                          @[@"customHost", @"mtop.damai.cn"]]) {
+        @try { [req setValue:kv[1] forKey:kv[0]]; W(@"outer set %@ ok", kv[0]); } @catch (id e) { W(@"outer set %@ EXC", kv[0]); }
     }
     for (NSString *k in @[@"needEcode", @"isNeedEcode"]) {
-        @try { [req setValue:@YES forKey:k]; W(@"set %@ ok", k); break; } @catch (id e) {}
+        @try { [req setValue:@YES forKey:k]; W(@"outer set %@ ok", k); break; } @catch (id e) {}
     }
+    // 内层：bizParameters 挂在 TBSDKRequest(mrequest) 上
+    Class tbCls = NSClassFromString(@"TBSDKRequest");
+    if (tbCls) {
+        id tbr = ((id (*)(id, SEL))objc_msgSend)(tbCls, @selector(alloc));
+        @try { tbr = ((id (*)(id, SEL))objc_msgSend)(tbr, @selector(init)); } @catch (id e) {}
+        if (tbr) {
+            BOOL ok = NO;
+            for (NSArray *kv in @[@[@"apiName", api ?: @"mtop.damai.trade.order.create"],
+                                  @[@"apiVersion", v ?: @"1.0"],
+                                  @[@"bizParameters", biz ?: @{}],
+                                  @[@"customHost", @"mtop.damai.cn"]]) {
+                @try { [tbr setValue:kv[1] forKey:kv[0]]; ok = YES; W(@"inner set %@ ok", kv[0]); } @catch (id e) { W(@"inner set %@ EXC", kv[0]); }
+            }
+            if (ok) {
+                BOOL attached = NO;
+                for (NSString *k in @[@"mrequest", @"request"]) {
+                    @try { [req setValue:tbr forKey:k]; attached = YES; W(@"attach via %@ ok", k); break; } @catch (id e) {}
+                }
+                if (!attached) W(@"attach mrequest EXC（无 setter）");
+            }
+        } else [r_err appendString:@"TBSDKRequest init 失败;"];
+    } else [r_err appendString:@"无 TBSDKRequest 类;"];
 
     W(@"REQ-OBJ api=%@ v=%@ biz=%lu", api, v, (unsigned long)biz.count);
     SEL call = @selector(sync_call:);
@@ -1070,9 +1092,12 @@ static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString 
         NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingWithoutEscapingSlashes error:nil];
         if (jd) [payload appendString:[[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]];
     }
-    if (!payload.length) [payload appendFormat:@"{}", @""]; // placeholder
-    if (!payload.length) [payload appendString:[NSString stringWithFormat:@"%@", resp ?: @"(nil)"]];
-    M(@"CREATE-VIA-REQ tag=%@ len=%lu", tag ?: @"-", (unsigned long)payload.length);
+    if (!payload.length) {
+        NSString *errLine = nil;
+        @try { errLine = [[resp valueForKey:@"error"] description]; } @catch (id e) {}
+        [payload appendFormat:@"{\"raw\":\"%@\"}", clip(errLine ?: [NSString stringWithFormat:@"%@", resp ?: @"(nil)"], 600)];
+    }
+    M(@"CREATE-VIA-REQ tag=%@ len=%lu err=%@", tag ?: @"-", (unsigned long)payload.length, r_err);
     return payload;
 }
 
