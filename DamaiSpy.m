@@ -998,7 +998,7 @@ static NSData *dmSyncPost(NSURL *url, NSDictionary *headers, NSData *body) {
     [[[NSURLSession sharedSession] dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
         out = d; dispatch_semaphore_signal(sem);
     }] resume];
-    dispatch_semaphore_wait(sem, dispatch_time_NOW_OR_LATER(0, 20 * NSEC_PER_SEC));
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
     return out;
 }
 
@@ -1017,7 +1017,7 @@ static NSString *dmH5Buy(NSString *buyParam, NSString *viewerName, BOOL doSubmit
     [log appendFormat:@"[1] GET orderConfirm\n"];
     NSData *d1 = dmSyncGet([NSURL URLWithString:u1], gh);
     NSString *html = [[NSString alloc] initWithData:d1 encoding:NSUTF8StringEncoding] ?: @"";
-    [log appendFormat:@"    status=%@ htmlLen=%lu\n", @(html.length ? @"ok" : @"empty"), (unsigned long)html.length];
+    [log appendFormat:@"    htmlLen=%lu\n", (unsigned long)html.length];
     // 抠 window.INIT_DATA
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"window\\.INIT_DATA[\\s\\S]*?};"
                                                                        options:0 error:nil];
@@ -1028,7 +1028,12 @@ static NSString *dmH5Buy(NSString *buyParam, NSString *viewerName, BOOL doSubmit
     NSDictionary *form = [NSJSONSerialization JSONObjectWithData:[jsonStr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
     if (!form) { [log appendString:@"    INIT_DATA 解析失败\n"]; return log; }
     NSMutableDictionary *info = [form mutableCopy];
-    @try { info[@"output"] = [NSJSONSerialization JSONObjectWithData:[[(NSString *)form[@"output"] ?: @"{}" dataUsingEncoding:NSUTF8StringEncoding]] options:0 error:nil]; } @catch (id e) {}
+    @try {
+        NSString *ostr = [NSString stringWithFormat:@"%@", form[@"output"] ?: @"{}"];
+        NSData *od = [ostr dataUsingEncoding:NSUTF8StringEncoding];
+        id oj = od ? [NSJSONSerialization JSONObjectWithData:od options:0 error:nil] : nil;
+        if (oj) info[@"output"] = oj;
+    } @catch (id e) {}
     [log appendFormat:@"[2] 表单解析成功 dataKeys=%@\n", [[info[@"data"] allKeys] componentsJoinedByString:@","]];
     // 标观演人
     NSString *viewerKey = nil;
