@@ -41,15 +41,18 @@ static NSString *docs(void) {
 static NSString *dpath(NSString *n) { return [docs() stringByAppendingPathComponent:n]; }
 static BOOL exists(NSString *n) { return [[NSFileManager defaultManager] fileExistsAtPath:dpath(n)]; }
 
-static void appendTo(NSMutableString **buf, NSString *s, BOOL *dirty, NSUInteger cap, NSUInteger keep) {
+static void appendLog(int kind, NSString *s, NSUInteger cap, NSUInteger keep) {
     if (!s.length) return;
     if (!gLock) gLock = [NSLock new];
     [gLock lock];
-    if (!*buf) *buf = [NSMutableString new];
-    [*buf appendString:s];
-    [*buf appendString:@"\n"];
-    if ((*buf).length > cap) [(*buf) deleteCharactersInRange:NSMakeRange(0, keep)];
-    *dirty = YES;
+    NSMutableString *buf = (kind == 0) ? gLog : (kind == 1 ? gMtopLog : gNetLog);
+    if (!buf) buf = [NSMutableString new];
+    [buf appendString:s];
+    [buf appendString:@"\n"];
+    if (buf.length > cap) [buf deleteCharactersInRange:NSMakeRange(0, keep)];
+    if (kind == 0) { gLog = buf; gLogDirty = YES; }
+    else if (kind == 1) { gMtopLog = buf; gMtopDirty = YES; }
+    else { gNetLog = buf; gNetDirty = YES; }
     [gLock unlock];
 }
 
@@ -57,19 +60,19 @@ static void W(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    appendTo(&gLog, s, &gLogDirty, 160000, 80000);
+    appendLog(0, s, 160000, 80000);
 }
 static void M(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    appendTo(&gMtopLog, s, &gMtopDirty, 900000, 400000);
+    appendLog(1, s, 900000, 400000);
 }
 static void N(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    appendTo(&gNetLog, s, &gNetDirty, 900000, 400000);
+    appendLog(2, s, 900000, 400000);
 }
 
 static void flushAll(void) {
@@ -234,8 +237,8 @@ static void hookMtop(void) {
 }
 
 // ---------------- NSURLSession 明文 hook ----------------
-static void (*o_dt_ch)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
-static void (*o_up_ch)(id, SEL, NSURLRequest *, NSData *, void (^)(NSData *, NSURLResponse *, NSError *));
+static id (*o_dt_ch)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
+static id (*o_up_ch)(id, SEL, NSURLRequest *, NSData *, void (^)(NSData *, NSURLResponse *, NSError *));
 static id (*o_dt)(id, SEL, NSURLRequest *);
 
 static void logReq(NSString *tag, NSURLRequest *rq) {
