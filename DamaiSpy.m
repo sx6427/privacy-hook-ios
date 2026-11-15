@@ -19,7 +19,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static NSString *const kVer = @"v0.4";
+static NSString *const kVer = @"v0.5";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -483,34 +483,68 @@ static Class mtopServiceClass(void) {
     return Nil;
 }
 
-static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NSString *tag) {
+static id mtopInstance(NSString *site) {
     Class c = mtopServiceClass();
-    if (!c) return @"{\"err\":\"no mtop service class\"}";
-    id inst = nil;
+    if (!c) return nil;
+    // 1) 标准单例 +getInstance
+    if ([c respondsToSelector:@selector(getInstance)]) {
+        @try {
+            id i = ((id (*)(id, SEL))objc_msgSend)(c, @selector(getInstance));
+            if (i) { W(@"mtop inst via +getInstance"); return i; }
+        } @catch (id e) { W(@"getInstance EXC %@", e); }
+    }
+    // 2) 指定 site + 常见候选
     if ([c respondsToSelector:@selector(getInstanceWithAccountSite:)]) {
-        NSArray *sites = site.length ? @[site] : @[@"damai", @"DM", @"damai_app", @"mtop", @"taobao"];
+        NSMutableArray *sites = [NSMutableArray array];
+        if (site.length) [sites addObject:site];
+        [sites addObjectsFromArray:@[@"damai", @"damai_app", @"damai_iphone", @"DM", @"damaiApp", @"mtop", @"taobao"]];
         for (NSString *s in sites) {
-            @try { inst = ((id (*)(id, SEL, id))objc_msgSend)(c, @selector(getInstanceWithAccountSite:), s); } @catch (id e) { inst = nil; }
-            if (inst) { W(@"mtop inst via site=%@", s); break; }
+            @try {
+                id i = ((id (*)(id, SEL, id))objc_msgSend)(c, @selector(getInstanceWithAccountSite:), s);
+                if (i) { W(@"mtop inst via site=%@", s); return i; }
+            } @catch (id e) {}
         }
     }
-    if (!inst && [c respondsToSelector:@selector(sharedInstance)]) inst = ((id (*)(id, SEL))objc_msgSend)(c, @selector(sharedInstance));
-    if (!inst) return @"{\"err\":\"no mtop instance\"}";
+    return nil;
+}
 
+static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NSString *tag) {
+    id inst = mtopInstance(site);
+    if (!inst) {
+        Class c = mtopServiceClass();
+        return [NSString stringWithFormat:@"{\"err\":\"no mtop instance\",\"class\":\"%@\"}", c ? NSStringFromClass(c) : @"nil"];
+    }
     SEL call = @selector(sync_call:apiVersion:bizParameters:);
-    if (![inst respondsToSelector:call]) return @"{\"err\":\"no sync_call:apiVersion:bizParameters:\"}";
+    if (![inst respondsToSelector:call])
+        call = @selector(sync_call:apiVersion:);
+    if (![inst respondsToSelector:call])
+        return @"{\"err\":\"no sync_call selector\"}";
+
     id resp = nil;
     @try {
-        resp = ((id (*)(id, SEL, id, id, id))objc_msgSend)(inst, call, api, v ?: @"1.0", data ?: @{});
+        if (sel_isEqual(call, @selector(sync_call:apiVersion:bizParameters:)))
+            resp = ((id (*)(id, SEL, id, id, id))objc_msgSend)(inst, call, api, v ?: @"1.0", data ?: @{});
+        else
+            resp = ((id (*)(id, SEL, id, id))objc_msgSend)(inst, call, api, v ?: @"1.0");
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"{\"err\":\"exception\",\"name\":\"%@\",\"reason\":\"%@\"}", e.name, clip(e.reason, 300)];
     }
+
+    // 取响应：优先 data / 整体 JSON / description
     NSMutableString *payload = [NSMutableString string];
-    id d = nil;
-    @try { d = [resp valueForKey:@"data"]; } @catch (id e) {}
-    if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
-        NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingWithoutEscapingSlashes error:nil];
-        if (jd) [payload appendString:[[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]];
+    NSArray *tryKeys = @[@"data", @"responseData", @"json"];
+    for (NSString *k in tryKeys) {
+        id d = nil;
+        @try { d = [resp valueForKey:k]; } @catch (id e) {}
+        if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
+            NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingWithoutEscapingSlashes error:nil];
+            if (jd) { [payload appendString:[[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]]; break; }
+        } else if ([d isKindOfClass:[NSData class]] && ((NSData *)d).length) {
+            NSString *s = [[NSString alloc] initWithData:(NSData *)d encoding:NSUTF8StringEncoding];
+            if (s.length) { [payload appendString:s]; break; }
+        } else if ([d isKindOfClass:[NSString class]] && ((NSString *)d).length) {
+            [payload appendString:(NSString *)d]; break;
+        }
     }
     if (!payload.length) {
         NSData *jd = nil;
@@ -520,7 +554,7 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
     }
     if (!payload.length) [payload appendString:[NSString stringWithFormat:@"%@", resp ?: @"(nil)"]];
     if (payload.length > 260000) [payload deleteCharactersInRange:NSMakeRange(260000, payload.length - 260000)];
-    M(@"CALL tag=%@ api=%@ len=%lu", tag ?: @"-", api, (unsigned long)payload.length);
+    M(@"CALL tag=%@ api=%@ v=%@ len=%lu", tag ?: @"-", api, v, (unsigned long)payload.length);
     return payload;
 }
 
@@ -559,6 +593,15 @@ static void execCmd(NSDictionary *cmd) {
     } else if ([c isEqualToString:@"clear"]) {
         if ([cmd[@"what"] isEqualToString:@"mtop"]) { [gLock lock]; [gMtopLog setString:@""]; gMtopDirty = YES; [gLock unlock]; }
         writeOut(@"cleared");
+    } else if ([c isEqualToString:@"instinfo"]) {
+        NSMutableString *o = [NSMutableString string];
+        id inst = mtopInstance(cmd[@"site"]);
+        [o appendFormat:@"inst=%@\n", inst ? NSStringFromClass([inst class]) : @"nil"];
+        if (inst) {
+            int b = 40;
+            dumpIvarsOf(inst, [inst class], o, &b);
+        }
+        writeOut(o);
     } else if ([c isEqualToString:@"classinfo"]) {
         NSString *cn = cmd[@"cls"] ?: @"";
         Class cc = NSClassFromString(cn);
