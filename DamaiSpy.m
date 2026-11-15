@@ -288,7 +288,7 @@ static void rememberCreate(id req) {
                 @try {
                     NSDictionary *snap = @{@"api": api, @"v": @"1.0", @"biz": gLastCreateBiz};
                     NSData *jd = [NSJSONSerialization dataWithJSONObject:snap options:NSJSONWritingWithoutEscapingSlashes error:nil];
-                    if (jd) [jd writeToFile:dpath(@"dm_biz.json") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                    if (jd) [jd writeToFile:dpath(@"dm_biz.json") options:NSDataWritingAtomic error:nil];
                 } @catch (id e) {}
             }
             if ([api rangeOfString:@"order.create"].location != NSNotFound)
