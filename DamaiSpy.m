@@ -23,7 +23,7 @@
 #import <mach/mach_time.h>
 #import <execinfo.h>
 
-static NSString *const kVer = @"v1.2";
+static NSString *const kVer = @"v1.3";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -824,6 +824,52 @@ static void hookSecurityGuard(void) {
     W(@"hook SecurityGuardOpenSecureSignature signRequest:authCode:");
 }
 
+
+// DXRootView 点击事件追踪
+static void (*o_dxpost)(id, SEL, id);
+static void dm_dxpost(id self, SEL _cmd, id msg) {
+    M(@"==== DXRootView postMessage ====");
+    M(@"%@", dumpObj(msg));
+    M(@"-- bt --\n%@", dmBacktrace(20));
+    if (o_dxpost) o_dxpost(self, _cmd, msg);
+}
+
+static void hookDX(void) {
+    Class c = NSClassFromString(@"DXRootView");
+    if (!c) { W(@"no DXRootView"); return; }
+    Method m = class_getInstanceMethod(c, @selector(postMessage:));
+    if (!m) { W(@"DXRootView 无 postMessage:"); return; }
+    o_dxpost = (void *)method_getImplementation(m);
+    method_setImplementation(m, (IMP)dm_dxpost);
+    W(@"hook DXRootView postMessage:");
+}
+
+static NSString *dmDXEv(NSString *needle) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIView *tv = dmFindByText(needle);
+        UIView *root = tv ? tv.superview : nil;
+        Class dxc = NSClassFromString(@"DXRootView");
+        while (root && dxc && ![root isKindOfClass:dxc]) root = root.superview;
+        if (!root) { report = @"未找到 DXRootView"; return; }
+        id disp = nil;
+        @try { disp = [root performSelector:@selector(eventDispatcher)]; } @catch (id e) {}
+        [r appendFormat:@"DXRootView ok, dispatcher=%@\n", disp ? NSStringFromClass([disp class]) : @"nil"];
+        if (disp) {
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList([disp class], &mc);
+            for (unsigned int i = 0; i < mc && i < 100; i++)
+                [r appendFormat:@"  -%@\n", NSStringFromSelector(method_getName(ms[i]))];
+            if (ms) free(ms);
+            int b = 24;
+            dumpIvarsOf(disp, [disp class], r, &b);
+        }
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1057,6 +1103,8 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
     } else if ([c isEqualToString:@"viewinfo"]) {
         writeOut(dmViewIvars(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"dxev"]) {
+        writeOut(dmDXEv(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"instinfo"]) {
         NSMutableString *o = [NSMutableString string];
         id inst = mtopInstance(cmd[@"site"]);
@@ -1161,6 +1209,7 @@ static void setupOnce(void) {
     W(@"setupOnce begin (app state=%ld)", (long)[UIApplication sharedApplication].applicationState);
     @try { hookNet(); } @catch (id e) { W(@"hookNet EXC %@", e); }
     @try { hookSecurityGuard(); } @catch (id e) { W(@"hookSG EXC %@", e); }
+    @try { hookDX(); } @catch (id e) { W(@"hookDX EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
