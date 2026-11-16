@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v4.2";
+static NSString *const kVer = @"v4.3";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1804,7 +1804,73 @@ static void hookSignMethods(void) {
 }
 
 
-// ---------------- CC_MD5/CC_SHA/CCHmac 底层 hook（dyld interposing）----------------
+
+// ---------------- 自带 MD5 实现（避免 interpose 递归）----------------
+typedef struct { uint32_t state[4]; uint32_t count[2]; unsigned char buffer[64]; } dm_md5_ctx;
+
+static const uint32_t dm_md5_k[64] = {
+0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
+static const int dm_md5_s[64] = {
+7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+
+static void dm_md5_init(dm_md5_ctx *c) {
+    c->state[0]=0x67452301; c->state[1]=0xefcdab89; c->state[2]=0x98badcfe; c->state[3]=0x10325476;
+    c->count[0]=c->count[1]=0;
+}
+static void dm_md5_transform(uint32_t st[4], const unsigned char block[64]) {
+    uint32_t a=st[0], b=st[1], c=st[2], d=st[3], m[16], x, t;
+    for (int i=0;i<16;i++) m[i]= (uint32_t)block[i*4] | ((uint32_t)block[i*4+1]<<8) | ((uint32_t)block[i*4+2]<<16) | ((uint32_t)block[i*4+3]<<24);
+    for (int i=0;i<64;i++) {
+        int r;
+        if (i<16) { x = (b & c) | (~b & d); r = i; }
+        else if (i<32) { x = (d & b) | (~d & c); r = (5*i+1) % 16; }
+        else if (i<48) { x = b ^ c ^ d; r = (3*i+5) % 16; }
+        else { x = c ^ (b | ~d); r = (7*i) % 16; }
+        t = d; d = c; c = b;
+        uint32_t v = a + x + dm_md5_k[i] + m[r];
+        b = b + ((v << dm_md5_s[i]) | (v >> (32 - dm_md5_s[i])));
+        a = t;
+    }
+    st[0]+=a; st[1]+=b; st[2]+=c; st[3]+=d;
+}
+static void dm_md5_update(dm_md5_ctx *c, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    size_t idx = (c->count[0] >> 3) & 0x3F;
+    if ((c->count[0] += (uint32_t)(len << 3)) < (len << 3)) c->count[1]++;
+    c->count[1] += (uint32_t)(len >> 29);
+    size_t part = 64 - idx;
+    size_t i = 0;
+    if (len >= part) {
+        memcpy(&c->buffer[idx], p, part);
+        dm_md5_transform(c->state, c->buffer);
+        for (i = part; i + 63 < len; i += 64) dm_md5_transform(c->state, &p[i]);
+        idx = 0;
+    }
+    memcpy(&c->buffer[idx], &p[i], len - i);
+}
+static void dm_md5_final(unsigned char digest[16], dm_md5_ctx *c) {
+    unsigned char bits[8];
+    for (int i=0;i<4;i++) { bits[i]=(unsigned char)(c->count[0]>>(8*i)); bits[i+4]=(unsigned char)(c->count[1]>>(8*i)); }
+    size_t idx = (c->count[0] >> 3) & 0x3F;
+    unsigned char pad[64] = {0x80};
+    size_t padlen = (idx < 56) ? (56 - idx) : (120 - idx);
+    dm_md5_update(c, pad, padlen);
+    dm_md5_update(c, bits, 8);
+    for (int i=0;i<4;i++) { digest[i*4]=(unsigned char)(c->state[i]); digest[i*4+1]=(unsigned char)(c->state[i]>>8);
+                            digest[i*4+2]=(unsigned char)(c->state[i]>>16); digest[i*4+3]=(unsigned char)(c->state[i]>>24); }
+}
+
+// ---------------- CC_MD5 hook（自带实现，不调原函数）----------------
 static NSString *dmHexStr(const unsigned char *b, int n) {
     NSMutableString *s = [NSMutableString string];
     for (int i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
@@ -1837,49 +1903,41 @@ static void dmRecordMd5(const void *data, CC_LONG len, const unsigned char *dige
 // 流式上下文 → 累积数据
 static NSMutableDictionary *gCtxMap = nil;
 
-static unsigned char *(*g_orig_CC_MD5)(const void *, CC_LONG, unsigned char *);
 static unsigned char *dm_CC_MD5(const void *data, CC_LONG len, unsigned char *md) {
-    if (!g_orig_CC_MD5) return md;
-    unsigned char *r = g_orig_CC_MD5(data, len, md);
-    if (r && len >= 24 && gCryptoReady) {
-        @try { dmRecordMd5(data, len, r, @"oneshot"); } @catch (id e) {}
-    }
-    return r;
+    if (!md) return md;
+    dm_md5_ctx c; dm_md5_init(&c);
+    if (data && len) dm_md5_update(&c, data, (size_t)len);
+    dm_md5_final(md, &c);
+    if (len >= 24 && gCryptoReady) { @try { dmRecordMd5(data, len, md, @"oneshot"); } @catch (id e) {} }
+    return md;
 }
-
-static int (*g_orig_CC_MD5_Init)(CC_MD5_CTX *);
 static int dm_CC_MD5_Init(CC_MD5_CTX *c) {
-    if (!g_orig_CC_MD5_Init) return 0;
-    if (!gCryptoReady) return g_orig_CC_MD5_Init(c);
-    @try {
-        if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
-        gCtxMap[@((uintptr_t)c)] = [NSMutableData new];
-    } @catch (id e) {}
-    return g_orig_CC_MD5_Init(c);
+    if (!c) return 0;
+    dm_md5_ctx *x = (dm_md5_ctx *)c;
+    dm_md5_init(x);
+    if (gCryptoReady) { @try { if (!gCtxMap) gCtxMap = [NSMutableDictionary new]; gCtxMap[@((uintptr_t)c)] = [NSMutableData new]; } @catch (id e) {} }
+    return 1;
 }
-static int (*g_orig_CC_MD5_Update)(CC_MD5_CTX *, const void *, CC_LONG);
 static int dm_CC_MD5_Update(CC_MD5_CTX *c, const void *data, CC_LONG len) {
-    if (!g_orig_CC_MD5_Update) return 0;
-    if (!gCryptoReady) return g_orig_CC_MD5_Update(c, data, len);
-    @try {
-        if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
-        NSMutableData *acc = gCtxMap[@((uintptr_t)c)];
-        if (!acc) { acc = [NSMutableData new]; gCtxMap[@((uintptr_t)c)] = acc; }
-        if (data && len) [acc appendBytes:data length:len];
-    } @catch (id e) {}
-    return g_orig_CC_MD5_Update(c, data, len);
+    if (!c) return 0;
+    dm_md5_ctx *x = (dm_md5_ctx *)c;
+    if (data && len) dm_md5_update(x, data, (size_t)len);
+    if (gCryptoReady && data && len) {
+        @try { NSMutableData *acc = gCtxMap[@((uintptr_t)c)];
+               if (acc) [acc appendBytes:data length:len]; } @catch (id e) {}
+    }
+    return 1;
 }
-static int (*g_orig_CC_MD5_Final)(unsigned char *, CC_MD5_CTX *);
 static int dm_CC_MD5_Final(unsigned char *md, CC_MD5_CTX *c) {
-    if (!g_orig_CC_MD5_Final) return 0;
-    int r = g_orig_CC_MD5_Final(md, c);
-    if (!gCryptoReady) return r;
-    @try {
-        NSData *acc = gCtxMap[@((uintptr_t)c)];
-        if (r && acc.length >= 24) dmRecordMd5(acc.bytes, (CC_LONG)acc.length, md, @"stream");
-        if (acc) [gCtxMap removeObjectForKey:@((uintptr_t)c)];
-    } @catch (id e) {}
-    return r;
+    if (!md || !c) return 0;
+    dm_md5_ctx *x = (dm_md5_ctx *)c;
+    dm_md5_final(md, x);
+    if (gCryptoReady) {
+        @try { NSData *acc = gCtxMap[@((uintptr_t)c)];
+               if (acc.length >= 24) dmRecordMd5(acc.bytes, (CC_LONG)acc.length, md, @"stream");
+               if (acc) [gCtxMap removeObjectForKey:@((uintptr_t)c)]; } @catch (id e) {}
+    }
+    return 1;
 }
 
 // 装载 interpose 表
@@ -2436,7 +2494,12 @@ static void setupOnce(void) {
     flushAll();
     W(@"setupOnce done hooks=%d", gHookCount);
     gCryptoReady = 1;
-    W(@"crypto ready");
+    gCryptoReady = 1;
+    {
+        unsigned char t[16]; dm_md5_ctx c; dm_md5_init(&c);
+        dm_md5_update(&c, "abc", 3); dm_md5_final(t, &c);
+        W(@"crypto ready selftest md5(abc)=%@ (应为 900150983cd24fb0d6963f7d28e17f72)", dmHexStr(t, 16));
+    }
     flushAll();
 }
 
