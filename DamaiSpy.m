@@ -24,8 +24,9 @@
 #import <execinfo.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <WebKit/WebKit.h>
+#import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v2.6";
+static NSString *const kVer = @"v2.7";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1263,6 +1264,117 @@ static NSString *dmDXFire(NSString *needle) {
     return report ?: @"(nil)";
 }
 
+
+// ---------------- JavaScriptCore 引擎 + ObjC 桥（改逻辑不用重注入）----------------
+@protocol DMBridgeExport <JSExport>
+- (NSString *)mtop:(NSString *)api v:(NSString *)v dataJson:(NSString *)dataJson;
+- (NSString *)h5:(NSString *)api v:(NSString *)v dataJson:(NSString *)dataJson;
+- (NSString *)uiTree:(NSString *)kw;
+- (NSString *)dxTap:(NSString *)text state:(int)state offx:(double)ox offy:(double)oy;
+- (NSString *)tapText:(NSString *)text;
+- (NSString *)replay:(NSString *)buyParam;
+- (void)logjs:(NSString *)s;
+- (void)sleepms:(double)ms;
+@end
+
+@interface DMBridge : NSObject <DMBridgeExport>
+@property (nonatomic, strong) NSMutableString *out;
+@end
+
+@implementation DMBridge
+- (instancetype)init { if ((self = [super init])) { _out = [NSMutableString new]; } return self; }
+- (void)logjs:(NSString *)s { [_out appendFormat:@"[js] %@\n", s ?: @""]; }
+- (void)sleepms:(double)ms { usleep((useconds_t)(ms * 1000)); }
+- (NSString *)mtop:(NSString *)api v:(NSString *)v dataJson:(NSString *)dataJson {
+    id data = nil;
+    if (dataJson.length) data = [NSJSONSerialization JSONObjectWithData:[dataJson dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    NSString *r = runMtop(api, v ?: @"1.0", data ?: @{}, nil, @"js");
+    [_out appendFormat:@"[mtop %@] %@\n", api, clip(r, 2000)];
+    return r;
+}
+- (NSString *)h5:(NSString *)api v:(NSString *)v dataJson:(NSString *)dataJson {
+    NSString *r = dmH5Call(api, v ?: @"1.0", dataJson ?: @"{}");
+    [_out appendFormat:@"[h5 %@] %@\n", api, clip(r, 2000)];
+    return r;
+}
+- (NSString *)uiTree:(NSString *)kw {
+    __block NSString *o = nil;
+    dmRunOnMain(^{
+        NSMutableString *s = [NSMutableString string];
+        UIViewController *vc = dmTopVC();
+        [s appendFormat:@"topVC=%@\n", vc ? NSStringFromClass([vc class]) : @"nil"];
+        int budget = 300;
+        dmWalkViews(vc.view, 0, s, &budget, kw);
+        o = [s copy];
+    });
+    [_out appendString:clip(o, 4000)];
+    return o ?: @"";
+}
+- (NSString *)dxTap:(NSString *)text state:(int)state offx:(double)ox offy:(double)oy {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIView *tv = dmFindByText(text);
+        if (!tv) { rep = @"未找到文本节点"; return; }
+        UIView *root = tv.superview;
+        Class dxc = NSClassFromString(@"DXRootView");
+        while (root && dxc && ![root isKindOfClass:dxc]) root = root.superview;
+        if (!root) { rep = @"未找到 DXRootView"; return; }
+        id disp = nil;
+        @try { disp = [root performSelector:@selector(eventDispatcher)]; } @catch (id e) {}
+        UIGestureRecognizer *tap = nil;
+        for (UIGestureRecognizer *g in root.gestureRecognizers)
+            if ([g isKindOfClass:[UITapGestureRecognizer class]]) { tap = g; break; }
+        if (!tap || !disp) { rep = @"gesture/dispatcher 缺失"; return; }
+        CGPoint c = [tv convertPoint:CGPointMake(CGRectGetMidX(tv.bounds), CGRectGetMidY(tv.bounds)) toView:root];
+        gFakeLoc = CGPointMake(c.x + ox, c.y + oy);
+        dmSwizzleLoc(YES);
+        Ivar sIV = class_getInstanceVariable([UIGestureRecognizer class], "_state");
+        if (sIV) object_setIvar(tap, sIV, @(state));
+        Ivar vIV = class_getInstanceVariable([UIGestureRecognizer class], "_view");
+        if (vIV) @try { object_setIvar(tap, vIV, root); } @catch (id e) {}
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(disp, @selector(onTap:), tap);
+            [r appendFormat:@"onTap 调用完成 state=%d pt=(%.0f,%.0f)\n", state, gFakeLoc.x, gFakeLoc.y];
+        } @catch (id e) { [r appendFormat:@"EXC %@\n", e]; }
+        usleep(300000);
+        dmSwizzleLoc(NO);
+        rep = [r copy];
+    });
+    [_out appendString:rep ?: @""];
+    return rep ?: @"";
+}
+- (NSString *)tapText:(NSString *)text { return dmTapByText(text); }
+- (NSString *)replay:(NSString *)buyParam {
+    // 复用最近一次 create 对象
+    if (!gLastReqObj) return @"无对象";
+    if (buyParam.length) {
+        @try { [gLastReqObj setValue:buyParam forKey:@"buyParam"]; } @catch (id e) {}
+    }
+    id mr = nil; @try { mr = [gLastReqObj valueForKey:@"mrequest"]; } @catch (id e) {}
+    dmForceSign(mr);
+    id inst = mtopInstance(nil);
+    id resp = nil;
+    @try { resp = ((id (*)(id, SEL, id))objc_msgSend)(inst, @selector(sync_call:), gLastReqObj); } @catch (id e) { return @"EXC"; }
+    NSString *s = [NSString stringWithFormat:@"%@", resp];
+    [_out appendFormat:@"[replay] %@\n", clip(s, 1500)];
+    return s;
+}
+@end
+
+static NSString *dmRunJS(NSString *code) {
+    JSContext *ctx = [[JSContext alloc] init];
+    DMBridge *br = [DMBridge new];
+    ctx[@"dm"] = br;
+    ctx[@"console"] = @{@"log": ^(NSString *s) { [br logjs:s]; }};
+    ctx.exceptionHandler = ^(JSContext *c, JSValue *e) {
+        [br.out appendFormat:@"[JS-EXC] %@\n", e];
+    };
+    JSValue *v = [ctx evaluateScript:code];
+    NSString *res = v ? [v toString] : @"(nil)";
+    return [NSString stringWithFormat:@"%@\n[return] %@\n", br.out ?: @"", clip(res, 500)];
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1633,6 +1745,13 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
     } else if ([c isEqualToString:@"viewinfo"]) {
         writeOut(dmViewIvars(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"js"]) {
+        NSString *code = cmd[@"code"];
+        if (![code isKindOfClass:[NSString class]] || !code.length) {
+            code = [NSString stringWithContentsOfFile:dpath(@"dm_script.js") encoding:NSUTF8StringEncoding error:nil];
+        }
+        if (!code.length) { writeOut(@"没有 js 代码（写 Documents/dm_script.js 或传 code 参数）"); return; }
+        writeOut(dmRunJS(code));
     } else if ([c isEqualToString:@"dxfire"]) {
         writeOut(dmDXFire(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"dxgest"]) {
