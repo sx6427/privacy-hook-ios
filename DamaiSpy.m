@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v2.8";
+static NSString *const kVer = @"v2.9";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1281,6 +1281,8 @@ static NSString *dmDXFire(NSString *needle) {
 - (NSString *)eventMap:(NSString *)text;
 - (NSString *)triggerEvent:(NSString *)text name:(NSString *)name;
 - (NSString *)gaiaTap:(NSString *)text;
+- (NSString *)nodeTree:(NSString *)text;
+- (NSString *)fireNode:(NSString *)text;
 - (void)logjs:(NSString *)s;
 - (void)sleepms:(double)ms;
 @end
@@ -1348,6 +1350,73 @@ static NSString *dmDXFire(NSString *needle) {
         usleep(300000);
         dmSwizzleLoc(NO);
         rep = [r copy];
+    });
+    [_out appendString:rep ?: @""];
+    return rep ?: @"";
+}
+
+
+- (NSString *)nodeTree:(NSString *)text {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        NSMutableString *s = [NSMutableString string];
+        UIView *v = dmFindByText(text.length ? text : @"立即提交");
+        UIView *root = v;
+        Class rvc = NSClassFromString(@"DXRootView");
+        while (root && rvc && ![root isKindOfClass:rvc]) root = root.superview;
+        id wn = nil;
+        @try { wn = ((id (*)(id, SEL))objc_msgSend)(root, NSSelectorFromString(@"dx_getWidgetNode")); } @catch (id e) {}
+        [s appendFormat:@"rootNode=%@\n", wn ? NSStringFromClass([wn class]) : @"nil"];
+        if (wn) { int b = 200; dmWalkNodes(wn, 0, s, &b, text, NULL); }
+        rep = [s copy];
+    });
+    [_out appendString:clip(rep, 6000)];
+    return rep ?: @"";
+}
+
+- (NSString *)fireNode:(NSString *)text {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        NSMutableString *s = [NSMutableString string];
+        UIView *v = dmFindByText(text);
+        UIView *root = v;
+        Class rvc = NSClassFromString(@"DXRootView");
+        while (root && rvc && ![root isKindOfClass:rvc]) root = root.superview;
+        id wn = nil;
+        @try { wn = ((id (*)(id, SEL))objc_msgSend)(root, NSSelectorFromString(@"dx_getWidgetNode")); } @catch (id e) {}
+        if (!wn) { rep = @"无根节点"; return; }
+        id node = dmFindNode(wn, text);
+        if (!node) { rep = [NSString stringWithFormat:@"控件树里没找到 %@", text]; return; }
+        NSArray *ev = nil;
+        @try { ev = [node valueForKey:@"eventList"]; } @catch (id e) {}
+        [s appendFormat:@"node=%@ ev=%lu\n", NSStringFromClass([node class]), (unsigned long)ev.count];
+        if (ev.count) [s appendFormat:@"  ev[0]=%@\n", clip([NSString stringWithFormat:@"%@", ev.firstObject], 400)];
+        id event = ev.count ? ev.firstObject : nil;
+        NSArray *sels = @[@"dispatchEvent:withArgs:", @"dispatchEvent:", @"handleEvent:withArgs:", @"triggerEvent:withArgs:"];
+        BOOL done = NO;
+        for (NSString *sn in sels) {
+            SEL sel = NSSelectorFromString(sn);
+            if (![node respondsToSelector:sel]) continue;
+            @try {
+                if ([sn hasSuffix:@"withArgs:"]) ((void (*)(id, SEL, id, id))objc_msgSend)(node, sel, event, @{});
+                else ((void (*)(id, SEL, id))objc_msgSend)(node, sel, event);
+                [s appendFormat:@"★ %@ 调用完成\n", sn];
+                done = YES;
+                break;
+            } @catch (id e) { [s appendFormat:@"%@ EXC %@\n", sn, e]; }
+        }
+        if (!done) {
+            // 兜底：把节点当作可响应点击的控件，尝试 respondToTapEvent 系列
+            for (NSString *sn in @[@"respondToTapEvent", @"onClick", @"performClick"]) {
+                SEL sel = NSSelectorFromString(sn);
+                if ([node respondsToSelector:sel]) {
+                    @try { ((void (*)(id, SEL))objc_msgSend)(node, sel); [s appendFormat:@"★ %@ 调用完成\n", sn]; done = YES; break; }
+                    @catch (id e) {}
+                }
+            }
+        }
+        if (!done) [s appendString:@"节点上没有可调用的事件方法\n"];
+        rep = [s copy];
     });
     [_out appendString:rep ?: @""];
     return rep ?: @"";
@@ -1475,6 +1544,37 @@ static NSString *dmRunJS(NSString *code) {
     JSValue *v = [ctx evaluateScript:code];
     NSString *res = v ? [v toString] : @"(nil)";
     return [NSString stringWithFormat:@"%@\n[return] %@\n", br.out ?: @"", clip(res, 500)];
+}
+
+
+// 遍历 DinamicX 控件树
+static void dmWalkNodes(id node, int depth, NSMutableString *s, int *budget, NSString *needle, id *found) {
+    if (!node || *budget <= 0) return;
+    NSString *cls = NSStringFromClass([node class]);
+    CGRect f = CGRectZero;
+    @try { f = [[node valueForKey:@"frame"] CGRectValue]; } @catch (id e) {}
+    NSArray *ev = nil;
+    @try { ev = [node valueForKey:@"eventList"]; } @catch (id e) {}
+    NSString *txt = nil;
+    @try { id t = [node valueForKey:@"text"]; if ([t isKindOfClass:[NSString class]]) txt = t; } @catch (id e) {}
+    if (txt.length && needle.length && [txt rangeOfString:needle].location != NSNotFound && !*found) *found = node;
+    if (ev.count || txt.length) {
+        [s appendFormat:@"%*s%@ (%.0f,%.0f) ev=%lu txt=%@\n", depth * 2, "", cls, f.origin.x, f.origin.y,
+         (unsigned long)ev.count, clip(txt, 24)];
+        (*budget)--;
+    }
+    NSArray *kids = nil;
+    @try { kids = [node valueForKey:@"subWidgets"]; } @catch (id e) {}
+    if (!kids) @try { kids = [node valueForKey:@"children"]; } @catch (id e) {}
+    for (id k in kids) dmWalkNodes(k, depth + 1, s, budget, needle, found);
+}
+
+static id dmFindNode(id node, NSString *needle) {
+    id found = nil;
+    NSMutableString *tmp = [NSMutableString string];
+    int b = 4000;
+    dmWalkNodes(node, 0, tmp, &b, needle, &found);
+    return found;
 }
 
 // ---------------- 类扫描 ----------------
