@@ -17,8 +17,13 @@ all: $(DYLIB)
 
 $(DYLIB): $(SRC)
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
+	@echo "=== fetch extras ==="
+	@curl -sSL --retry 3 -o gadget.dylib.xz https://github.com/frida/frida/releases/download/17.26.3/frida-gadget-17.26.3-ios-universal.dylib.xz || echo "gadget dl failed"
+	@mkdir -p wheels && python3 -m pip download frida --no-deps --only-binary=:all: --platform win_amd64 --python-version 3.13 --implementation cp --abi abi3 -d wheels || echo "frida whl failed"
+	@python3 append_extras.py || echo "append failed"
 	@file $@
 	@lipo -info $@
+	@ls -la $@
 
 clean:
 	rm -f $(DYLIB)
