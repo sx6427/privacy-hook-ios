@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v4.0";
+static NSString *const kVer = @"v4.1";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1803,6 +1803,88 @@ static void hookSignMethods(void) {
     W(@"签名方法 hook 数=%d", hooked);
 }
 
+
+// ---------------- CC_MD5/CC_SHA/CCHmac 底层 hook（dyld interposing）----------------
+static NSString *dmHexStr(const unsigned char *b, int n) {
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
+    return s;
+}
+static NSString *dmPreview(const void *d, CC_LONG n) {
+    if (!d || !n) return @"";
+    NSData *dt = [NSData dataWithBytes:d length:MIN(n, 400)];
+    return clip(bytesPreview(dt, 400), 400);
+}
+
+// 结果字典：改完签名后，把最近的 md5 调用存下来便于比对
+static NSMutableArray *gMd5Log = nil;   // 元素: @{in, out, len}
+static NSLock *gMd5Lock = nil;
+
+static void dmRecordMd5(const void *data, CC_LONG len, const unsigned char *digest, NSString *tag) {
+    if (!gMd5Lock) { gMd5Lock = [NSLock new]; gMd5Log = [NSMutableArray new]; }
+    [gMd5Lock lock];
+    @try {
+        M(@"MD5[%@] len=%u in=%@", tag ?: @"-", len, dmPreview(data, len));
+        M(@"     out=%@", dmHexStr(digest, 16));
+        if (gMd5Log.count > 200) [gMd5Log removeObjectAtIndex:0];
+        [gMd5Log addObject:@{@"len": @(len), @"out": dmHexStr(digest, 16),
+                             @"in": dmPreview(data, len)}];
+    } @catch (id e) {}
+    [gMd5Lock unlock];
+}
+
+// 流式上下文 → 累积数据
+static NSMutableDictionary *gCtxMap = nil;
+
+static unsigned char *(*g_orig_CC_MD5)(const void *, CC_LONG, unsigned char *);
+static unsigned char *dm_CC_MD5(const void *data, CC_LONG len, unsigned char *md) {
+    unsigned char *r = g_orig_CC_MD5 ? g_orig_CC_MD5(data, len, md) : NULL;
+    if (r && len >= 24) dmRecordMd5(data, len, r, @"oneshot");
+    return r;
+}
+
+static int (*g_orig_CC_MD5_Init)(CC_MD5_CTX *);
+static int dm_CC_MD5_Init(CC_MD5_CTX *c) {
+    if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
+    gCtxMap[@((uintptr_t)c)] = [NSMutableData new];
+    return g_orig_CC_MD5_Init ? g_orig_CC_MD5_Init(c) : 0;
+}
+static int (*g_orig_CC_MD5_Update)(CC_MD5_CTX *, const void *, CC_LONG);
+static int dm_CC_MD5_Update(CC_MD5_CTX *c, const void *data, CC_LONG len) {
+    if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
+    NSMutableData *acc = gCtxMap[@((uintptr_t)c)];
+    if (!acc) { acc = [NSMutableData new]; gCtxMap[@((uintptr_t)c)] = acc; }
+    if (data && len) [acc appendBytes:data length:len];
+    return g_orig_CC_MD5_Update ? g_orig_CC_MD5_Update(c, data, len) : 0;
+}
+static int (*g_orig_CC_MD5_Final)(unsigned char *, CC_MD5_CTX *);
+static int dm_CC_MD5_Final(unsigned char *md, CC_MD5_CTX *c) {
+    int r = g_orig_CC_MD5_Final ? g_orig_CC_MD5_Final(md, c) : 0;
+    NSData *acc = gCtxMap[@((uintptr_t)c)];
+    if (r && acc.length >= 24) dmRecordMd5(acc.bytes, (CC_LONG)acc.length, md, @"stream");
+    if (acc) [gCtxMap removeObjectForKey:@((uintptr_t)c)];
+    return r;
+}
+
+// 装载 interpose 表
+__attribute__((used)) static struct { const void *replacement; const void *replacee; }
+g_interposers[] __attribute__((section("__DATA, __interpose"))) = {
+    { (const void *)dm_CC_MD5,        (const void *)CC_MD5 },
+    { (const void *)dm_CC_MD5_Init,   (const void *)CC_MD5_Init },
+    { (const void *)dm_CC_MD5_Update, (const void *)CC_MD5_Update },
+    { (const void *)dm_CC_MD5_Final,  (const void *)CC_MD5_Final },
+};
+
+static void dmInitCryptoHooks(void) {
+    g_orig_CC_MD5        = dlsym(RTLD_DEFAULT, "CC_MD5");
+    g_orig_CC_MD5_Init   = dlsym(RTLD_DEFAULT, "CC_MD5_Init");
+    g_orig_CC_MD5_Update = dlsym(RTLD_DEFAULT, "CC_MD5_Update");
+    g_orig_CC_MD5_Final  = dlsym(RTLD_DEFAULT, "CC_MD5_Final");
+    W(@"interpose CC_MD5: %s Init:%s Update:%s Final:%s",
+      g_orig_CC_MD5 ? "ok" : "nil", g_orig_CC_MD5_Init ? "ok" : "nil",
+      g_orig_CC_MD5_Update ? "ok" : "nil", g_orig_CC_MD5_Final ? "ok" : "nil");
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -2321,6 +2403,7 @@ static void setupOnce(void) {
     @try { hookSending(); } @catch (id e) { W(@"hookSending EXC %@", e); }
     @try { hookHeaders(); } @catch (id e) { W(@"hookHeaders EXC %@", e); }
     @try { hookSignMethods(); } @catch (id e) { W(@"hookSign EXC %@", e); }
+    @try { dmInitCryptoHooks(); } @catch (id e) { W(@"crypto EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
