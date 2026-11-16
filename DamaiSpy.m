@@ -25,7 +25,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <WebKit/WebKit.h>
 
-static NSString *const kVer = @"v2.5";
+static NSString *const kVer = @"v2.6";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1245,6 +1245,11 @@ static NSString *dmDXFire(NSString *needle) {
             if ([g isKindOfClass:[UITapGestureRecognizer class]]) { tap = g; break; }
         [r appendFormat:@"tapGesture=%@\n", tap ? NSStringFromClass([tap class]) : @"nil"];
         dmSwizzleLoc(YES);
+        // ★ 关键：把手势状态伪造成 ended(3)，否则 DinamicX handler 会提前返回
+        Ivar sIV = class_getInstanceVariable([UIGestureRecognizer class], "_state");
+        if (sIV) { object_setIvar(tap, sIV, @(3)); [r appendString:@"gesture._state → ended(3)\n"]; }
+        Ivar vIV = class_getInstanceVariable([UIGestureRecognizer class], "_view");
+        if (vIV && root) { @try { object_setIvar(tap, vIV, root); } @catch (id e) {} }
         @try {
             if ([disp respondsToSelector:@selector(onTap:)]) {
                 ((void (*)(id, SEL, id))objc_msgSend)(disp, @selector(onTap:), tap);
