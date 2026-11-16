@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v2.7";
+static NSString *const kVer = @"v2.8";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1278,6 +1278,9 @@ static NSString *dmDXFire(NSString *needle) {
 - (NSString *)dxTap:(NSString *)text state:(int)state offx:(double)ox offy:(double)oy;
 - (NSString *)tapText:(NSString *)text;
 - (NSString *)replay:(NSString *)buyParam;
+- (NSString *)eventMap:(NSString *)text;
+- (NSString *)triggerEvent:(NSString *)text name:(NSString *)name;
+- (NSString *)gaiaTap:(NSString *)text;
 - (void)logjs:(NSString *)s;
 - (void)sleepms:(double)ms;
 @end
@@ -1349,6 +1352,100 @@ static NSString *dmDXFire(NSString *needle) {
     [_out appendString:rep ?: @""];
     return rep ?: @"";
 }
+
+- (NSString *)eventMap:(NSString *)text {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        NSMutableString *s = [NSMutableString string];
+        UIView *v = dmFindByText(text);
+        if (!v) { rep = @"未找到"; return; }
+        Class rvc = NSClassFromString(@"DXRootView");
+        int depth = 0;
+        for (UIView *cur = v; cur && depth < 8; cur = cur.superview, depth++) {
+            [s appendFormat:@"[%d] %@\n", depth, NSStringFromClass([cur class])];
+            @try {
+                if ([cur respondsToSelector:NSSelectorFromString(@"dx_getWidgetNode")]) {
+                    id node = ((id (*)(id, SEL))objc_msgSend)(cur, NSSelectorFromString(@"dx_getWidgetNode"));
+                    if (node) [s appendFormat:@"    widgetNode=%@ <%p>\n", NSStringFromClass([node class]), node];
+                }
+            } @catch (id e) {}
+            @try {
+                if ([cur respondsToSelector:NSSelectorFromString(@"tbd_getEventMap")]) {
+                    id map = ((id (*)(id, SEL))objc_msgSend)(cur, NSSelectorFromString(@"tbd_getEventMap"));
+                    if (map) [s appendFormat:@"    eventMap=%@\n", clip([NSString stringWithFormat:@"%@", map], 800)];
+                }
+            } @catch (id e) {}
+            @try {
+                if ([cur respondsToSelector:NSSelectorFromString(@"gaiaEvent")]) {
+                    id ge = ((id (*)(id, SEL))objc_msgSend)(cur, NSSelectorFromString(@"gaiaEvent"));
+                    if (ge) [s appendFormat:@"    gaiaEvent=%@\n", clip([NSString stringWithFormat:@"%@", ge], 300)];
+                }
+            } @catch (id e) {}
+            if (rvc && [cur isKindOfClass:rvc]) break;
+        }
+        rep = [s copy];
+    });
+    [_out appendString:rep ?: @""];
+    return rep ?: @"";
+}
+
+- (NSString *)triggerEvent:(NSString *)text name:(NSString *)name {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        NSMutableString *s = [NSMutableString string];
+        UIView *v = dmFindByText(text);
+        if (!v) { rep = @"未找到"; return; }
+        Class rvc = NSClassFromString(@"DXRootView");
+        int depth = 0;
+        for (UIView *cur = v; cur && depth < 8; cur = cur.superview, depth++) {
+            SEL sel = NSSelectorFromString(@"tbd_triggerEvent:args:");
+            if ([cur respondsToSelector:sel]) {
+                @try {
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(cur, sel, name, @{});
+                    [s appendFormat:@"[%d] %@ tbd_triggerEvent:%@ 已调用\n", depth, NSStringFromClass([cur class]), name];
+                } @catch (id e) { [s appendFormat:@"[%d] EXC %@\n", depth, e]; }
+            }
+            if (rvc && [cur isKindOfClass:rvc]) break;
+        }
+        if (!s.length) [s appendString:@"没有任何层响应 tbd_triggerEvent:args:/n"];
+        rep = [s copy];
+    });
+    [_out appendString:rep ?: @""];
+    return rep ?: @"";
+}
+
+- (NSString *)gaiaTap:(NSString *)text {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        NSMutableString *s = [NSMutableString string];
+        UIView *v = dmFindByText(text);
+        if (!v) { rep = @"未找到"; return; }
+        SEL gsel = NSSelectorFromString(@"gaiaEvent");
+        SEL esel = NSSelectorFromString(@"emit:event:");
+        for (UIView *cur = v; cur && [cur isKindOfClass:[UIView class]]; cur = cur.superview) {
+            if ([cur respondsToSelector:gsel]) {
+                id ge = nil;
+                @try { ge = ((id (*)(id, SEL))objc_msgSend)(cur, gsel); } @catch (id e) {}
+                if (ge) {
+                    [s appendFormat:@"%@ gaiaEvent=%@\n", NSStringFromClass([cur class]), clip([NSString stringWithFormat:@"%@", ge], 200)];
+                    // 尝试用 emit:event: 触发
+                    SEL peer = NSSelectorFromString(@"emit:event:");
+                    if ([cur respondsToSelector:peer]) {
+                        @try { ((void (*)(id, SEL, id, id))objc_msgSend)(cur, peer, @"tap", ge); [s appendString:@"emit 调用完成\n"]; }
+                        @catch (id e) { [s appendFormat:@"emit EXC %@\n", e]; }
+                    }
+                    break;
+                }
+            }
+        }
+        (void)esel;
+        if (!s.length) [s appendString:@"未发现 gaiaEvent\n"];
+        rep = [s copy];
+    });
+    [_out appendString:rep ?: @""];
+    return rep ?: @"";
+}
+
 - (NSString *)tapText:(NSString *)text { return dmTapByText(text); }
 - (NSString *)replay:(NSString *)buyParam {
     // 复用最近一次 create 对象
