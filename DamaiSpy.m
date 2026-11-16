@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v3.1";
+static NSString *const kVer = @"v3.2";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1603,7 +1603,19 @@ static id dmGetHandle(NSString *k) {
     return gHandles[k];
 }
 
-@interface DMRuntime : NSObject <JSExport>
+@protocol DMRuntimeExport <JSExport>
+- (NSString *)findText:(NSString *)text;
+- (NSString *)sup:(NSString *)h;
+- (NSString *)desc:(NSString *)h;
+- (NSString *)kvc:(NSString *)h key:(NSString *)key;
+- (NSString *)clsName:(NSString *)h;
+- (NSString *)call:(NSString *)h sel:(NSString *)selName args:(NSString *)argsJson;
+- (NSString *)walk:(NSString *)h needle:(NSString *)needle;
+- (NSString *)clsInfo:(NSString *)name;
+- (NSString *)newObj:(NSString *)clsName;
+@end
+
+@interface DMRuntime : NSObject <DMRuntimeExport>
 @property (nonatomic, strong) NSMutableString *out;
 - (NSString *)reg:(JSValue *)v;
 - (NSString *)findText:(NSString *)text;
