@@ -1569,6 +1569,8 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
     } else if ([c isEqualToString:@"viewinfo"]) {
         writeOut(dmViewIvars(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"dxgest"]) {
+        writeOut(dmDXGest(cmd[@"txt"] ?: @"立即提交", [cmd[@"fire"] boolValue]));
     } else if ([c isEqualToString:@"h5confirm"] || [c isEqualToString:@"h5buy"]) {
         NSString *bp = cmd[@"buyParam"] ?: @"1091503581127_1_6311209779027";
         NSString *viewer = [cmd[@"viewer"] isKindOfClass:[NSString class]] ? cmd[@"viewer"] : @"";
