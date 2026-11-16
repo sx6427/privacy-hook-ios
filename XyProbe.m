@@ -809,12 +809,19 @@ static void xyOverlayEnsure(BOOL createIfNeeded) {
         if (!host) return;
         if (!gOverlayWV && createIfNeeded) {
             WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
-            gOverlayWV = [[WKWebView alloc] initWithFrame:host.bounds configuration:cfg];
+            // 优先用 App 自己的 webview 类（自带 windvane/AlipayJSBridge 桥 + 正版 UA），
+            // 否则纯 WKWebView 里阿里 H5 会永远停在「加载中」
+            Class wvcls = NSClassFromString(@"WVWKWebView") ?: NSClassFromString(@"WVWebView");
+            if (wvcls && [wvcls isSubclassOfClass:[WKWebView class]]) {
+                gOverlayWV = [[wvcls alloc] initWithFrame:host.bounds configuration:cfg];
+                W(@"overlay using app webview class %@", NSStringFromClass(wvcls));
+            } else {
+                gOverlayWV = [[WKWebView alloc] initWithFrame:host.bounds configuration:cfg];
+                W(@"overlay using plain WKWebView");
+            }
             gOverlayWV.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             gOverlayWV.opaque = NO;
             gOverlayWV.backgroundColor = [UIColor whiteColor];
-            NSString *ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
-            gOverlayWV.customUserAgent = ua;
             if (!gWebViews) gWebViews = [NSHashTable weakObjectsHashTable];
             [gWebViews addObject:gOverlayWV];
         }
