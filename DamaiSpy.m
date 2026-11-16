@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v3.0";
+static NSString *const kVer = @"v3.1";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -117,6 +117,7 @@ static id mtopInstance(NSString *site);
 static void dmForceSign(id mr);
 static NSString *dmH5Call(NSString *api, NSString *ver, NSString *dataJson);
 static id dmFindNode(id node, NSString *needle);
+static NSString *dmRunJS2(NSString *code);
 static void dmWalkNodes(id node, int depth, NSMutableString *s, int *budget, NSString *needle, id *found);
 static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag);
 
@@ -1586,6 +1587,139 @@ static id dmFindNode(id node, NSString *needle) {
     return found;
 }
 
+
+// ---------------- 通用 ObjC 运行时桥（句柄 + 任意调用），JS 可做一切 ----------------
+static NSMutableDictionary *gHandles = nil;
+static int gHandleSeq = 0;
+static NSString *dmReg(id o) {
+    if (!o) return @"";
+    if (!gHandles) gHandles = [NSMutableDictionary new];
+    NSString *k = [NSString stringWithFormat:@"h%d", ++gHandleSeq];
+    gHandles[k] = o;
+    return k;
+}
+static id dmGetHandle(NSString *k) {
+    if (![k isKindOfClass:[NSString class]] || !k.length) return nil;
+    return gHandles[k];
+}
+
+@interface DMRuntime : NSObject <JSExport>
+@property (nonatomic, strong) NSMutableString *out;
+- (NSString *)reg:(JSValue *)v;
+- (NSString *)findText:(NSString *)text;
+- (NSString *)sup:(NSString *)h;
+- (NSString *)desc:(NSString *)h;
+- (NSString *)kvc:(NSString *)h key:(NSString *)key;
+- (NSString *)clsName:(NSString *)h;
+- (NSString *)call:(NSString *)h sel:(NSString *)selName args:(NSString *)argsJson;
+- (NSString *)walk:(NSString *)h needle:(NSString *)needle;
+- (NSString *)clsInfo:(NSString *)name;
+- (NSString *)newObj:(NSString *)clsName;
+@end
+
+@implementation DMRuntime
+- (instancetype)init { if ((self = [super init])) { _out = [NSMutableString new]; } return self; }
+- (NSString *)reg:(JSValue *)v { id o = [v toObject]; return dmReg(o); }
+- (NSString *)findText:(NSString *)text {
+    __block NSString *h = @"";
+    dmRunOnMain(^{ UIView *v = dmFindByText(text); if (v) h = dmReg(v); });
+    return h;
+}
+- (NSString *)sup:(NSString *)h { UIView *v = dmGetHandle(h); return v.superview ? dmReg(v.superview) : @""; }
+- (NSString *)desc:(NSString *)h { id o = dmGetHandle(h); return o ? [NSString stringWithFormat:@"%@", o] : @"(nil)"; }
+- (NSString *)clsName:(NSString *)h { id o = dmGetHandle(h); return o ? NSStringFromClass([o class]) : @"(nil)"; }
+- (NSString *)kvc:(NSString *)h key:(NSString *)key {
+    id o = dmGetHandle(h);
+    if (!o) return @"(nil-handle)";
+    @try { id v = [o valueForKey:key]; return v ? [NSString stringWithFormat:@"%@", v] : @"(nil)"; }
+    @catch (id e) { return @"(KVC-EXC)"; }
+}
+- (NSString *)call:(NSString *)h sel:(NSString *)selName args:(NSString *)argsJson {
+    id o = dmGetHandle(h);
+    if (!o) return @"(nil-handle)";
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![o respondsToSelector:sel]) return [NSString stringWithFormat:@"(no-sel %@)", selName];
+    NSArray *raw = @[];
+    if (argsJson.length) {
+        id j = [NSJSONSerialization JSONObjectWithData:[argsJson dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        if ([j isKindOfClass:[NSArray class]]) raw = j;
+    }
+    NSMethodSignature *sig = [o methodSignatureForSelector:sel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.target = o; inv.selector = sel;
+    NSUInteger want = sig.numberOfArguments - 2;
+    for (NSUInteger i = 0; i < want && i < raw.count; i++) {
+        id a = raw[i];
+        if ([a isKindOfClass:[NSDictionary class]] && a[@"h"]) a = dmGetHandle(a[@"h"]) ?: [NSNull null];
+        if ([a isKindOfClass:[NSNull class]]) a = nil;
+        void *ptr = (__bridge void *)a;
+        [inv setArgument:&ptr atIndex:i + 2];
+    }
+    NSString *ret = @"(void)";
+    @try {
+        [inv invoke];
+        const char *rt = sig.methodReturnType;
+        if (rt[0] == '@') {
+            __unsafe_unretained id rv = nil;
+            [inv getReturnValue:&rv];
+            ret = rv ? [NSString stringWithFormat:@"%@", rv] : @"(nil)";
+            if ([rv isKindOfClass:[NSObject class]]) { NSString *hh = dmReg(rv); ret = [NSString stringWithFormat:@"%@ |handle=%@", ret, hh]; }
+        } else if (rt[0] == 'v') ret = @"(void)";
+        else if (rt[0] == 'B') { BOOL b = NO; [inv getReturnValue:&b]; ret = b ? @"YES" : @"NO"; }
+        else if (rt[0] == 'q' || rt[0] == 'i' || rt[0] == 'Q') { long long n = 0; [inv getReturnValue:&n]; ret = [NSString stringWithFormat:@"%lld", n]; }
+    } @catch (id e) { ret = [NSString stringWithFormat:@"(EXC %@)", e]; }
+    [_out appendFormat:@"[call %@ %@] %@\n", [o class], selName, clip(ret, 400)];
+    return ret;
+}
+- (NSString *)walk:(NSString *)h needle:(NSString *)needle {
+    __block NSString *rep = nil;
+    dmRunOnMain(^{
+        id o = dmGetHandle(h);
+        NSMutableString *s = [NSMutableString string];
+        int b = 300;
+        if ([o isKindOfClass:[UIView class]]) dmWalkViews((UIView *)o, 0, s, &b, needle);
+        else dmWalkNodes(o, 0, s, &b, needle, NULL);
+        int b2 = 300;
+        (void)b2;
+        rep = [s copy];
+    });
+    return rep ?: @"";
+}
+- (NSString *)clsInfo:(NSString *)name {
+    Class c = NSClassFromString(name);
+    if (!c) return @"(no-class)";
+    NSMutableString *s = [NSMutableString string];
+    for (Class k = c; k && k != [NSObject class]; k = class_getSuperclass(k)) {
+        unsigned int mc = 0; Method *mm = class_copyMethodList(k, &mc);
+        for (unsigned int i = 0; i < mc && i < 200; i++)
+            [s appendFormat:@"%@ %@\n", NSStringFromClass(k), NSStringFromSelector(method_getName(mm[i]))];
+        if (mm) free(mm);
+    }
+    return s;
+}
+- (NSString *)newObj:(NSString *)clsName {
+    Class c = NSClassFromString(clsName);
+    if (!c) return @"";
+    id o = ((id (*)(id, SEL))objc_msgSend)(c, @selector(alloc));
+    @try { o = ((id (*)(id, SEL))objc_msgSend)(o, @selector(init)); } @catch (id e) {}
+    return dmReg(o);
+}
+@end
+
+static NSString *dmRunJS2(NSString *code) {
+    JSContext *ctx = [[JSContext alloc] init];
+    DMBridge *br = [DMBridge new];
+    DMRuntime *rt = [DMRuntime new];
+    ctx[@"dm"] = br;
+    ctx[@"rt"] = rt;
+    ctx[@"console"] = @{@"log": ^(NSString *s) { [br logjs:s]; }};
+    __block NSString *exc = nil;
+    ctx.exceptionHandler = ^(JSContext *c, JSValue *e) { exc = [e toString]; };
+    JSValue *v = [ctx evaluateScript:code];
+    NSString *res = v ? [v toString] : @"(nil)";
+    return [NSString stringWithFormat:@"%@%@%@\n[return] %@\n", br.out ?: @"", rt.out ?: @"", exc ? [@"[JS-EXC] " stringByAppendingString:exc] : @"", clip(res, 400)];
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1962,7 +2096,7 @@ static void execCmd(NSDictionary *cmd) {
             code = [NSString stringWithContentsOfFile:dpath(@"dm_script.js") encoding:NSUTF8StringEncoding error:nil];
         }
         if (!code.length) { writeOut(@"没有 js 代码（写 Documents/dm_script.js 或传 code 参数）"); return; }
-        writeOut(dmRunJS(code));
+        writeOut(dmRunJS2(code));
     } else if ([c isEqualToString:@"dxfire"]) {
         writeOut(dmDXFire(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"dxgest"]) {
