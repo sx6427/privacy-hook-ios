@@ -25,7 +25,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <WebKit/WebKit.h>
 
-static NSString *const kVer = @"v2.3";
+static NSString *const kVer = @"v2.4";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1150,6 +1150,53 @@ static NSString *dmH5Call(NSString *api, NSString *ver, NSString *dataJson) {
         [log appendString:@"    token 失效，刷新重试\n"];
     }
     return log;
+}
+
+
+// 挖 DXRootView 手势的 target/block 并尝试直接触发
+static NSString *dmDXGest(NSString *needle, BOOL fire) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIView *tv = dmFindByText(needle);
+        UIView *root = tv ? tv.superview : nil;
+        Class dxc = NSClassFromString(@"DXRootView");
+        while (root && dxc && ![root isKindOfClass:dxc]) root = root.superview;
+        if (!root) { report = @"未找到 DXRootView（当前页面不是确认页）"; return; }
+        [r appendFormat:@"DXRootView=%@\n", root];
+        for (UIGestureRecognizer *g in root.gestureRecognizers) {
+            [r appendFormat:@"gesture=%@\n", NSStringFromClass([g class])];
+            NSArray *targets = nil;
+            @try { targets = [g valueForKey:@"_targets"]; } @catch (id e) { [r appendFormat:@"  _targets KVC EXC\n"]; }
+            if (!targets) { [r appendString:@"  _targets=nil\n"]; continue; }
+            [r appendFormat:@"  targets=%lu\n", (unsigned long)targets.count];
+            for (id t in targets) {
+                id tgt = nil, act = nil;
+                @try { tgt = [t valueForKey:@"_target"]; } @catch (id e) {}
+                @try { act = [t valueForKey:@"_action"]; } @catch (id e) {}
+                [r appendFormat:@"  entry: target=%@(%@) action=%@(%@)\n",
+                 tgt ? NSStringFromClass([tgt class]) : @"nil", tgt ? [NSString stringWithFormat:@"%p", tgt] : @"-",
+                 act ? NSStringFromClass([act class]) : @"nil", act ? @"value" : @"-"];
+                BOOL isBlock = act && [NSStringFromClass([act class]) containsString:@"Block"];
+                if (fire && isBlock) {
+                    [r appendString:@"  ★ action 是 block，尝试直接调用…\n"];
+                    @try {
+                        void (^blk)(id) = act;
+                        blk(g);
+                        [r appendString:@"  ★ block 调用完成（观察大麦是否弹出收银台）\n"];
+                    } @catch (id e) { [r appendFormat:@"  block EXC %@\n", e]; }
+                } else if (fire && tgt && act && [act isKindOfClass:[NSString class]]) {
+                    SEL sel = NSSelectorFromString(act);
+                    if ([tgt respondsToSelector:sel]) {
+                        @try { ((void (*)(id, SEL, id))objc_msgSend)(tgt, sel, g); [r appendString:@"  ★ target-action 调用完成\n"]; }
+                        @catch (id e) { [r appendFormat:@"  EXC %@\n", e]; }
+                    } else [r appendFormat:@"  target 不响应 %@\n", act];
+                }
+            }
+        }
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
 }
 
 // ---------------- 类扫描 ----------------
