@@ -112,6 +112,11 @@ static NSString *bytesPreview(NSData *d, NSUInteger max);
 static NSString *decodeParamsField(id biz);
 static NSString *dmBacktrace(int max);
 static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag);
+static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NSString *tag);
+static id mtopInstance(NSString *site);
+static void dmForceSign(id mr);
+static NSString *dmH5Call(NSString *api, NSString *ver, NSString *dataJson);
+static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag);
 
 static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
     if (!c || c == [NSObject class] || *budget <= 0) return;
