@@ -2435,6 +2435,8 @@ static void setupOnce(void) {
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
     W(@"setupOnce done hooks=%d", gHookCount);
+    gCryptoReady = 1;
+    W(@"crypto ready");
     flushAll();
 }
 
