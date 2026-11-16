@@ -25,7 +25,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <WebKit/WebKit.h>
 
-static NSString *const kVer = @"v2.4";
+static NSString *const kVer = @"v2.5";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1199,6 +1199,65 @@ static NSString *dmDXGest(NSString *needle, BOOL fire) {
     return report ?: @"(nil)";
 }
 
+
+// 劫持 locationInView: 以便 onTap: 落在指定坐标
+static CGPoint gFakeLoc;
+static BOOL gFakeLocOn = NO;
+static CGPoint (*o_locInView)(id, SEL, UIView *);
+static CGPoint dm_locInView(id self, SEL _cmd, UIView *v) {
+    if (gFakeLocOn) return gFakeLoc;
+    return o_locInView ? o_locInView(self, _cmd, v) : CGPointZero;
+}
+static void dmSwizzleLoc(BOOL on) {
+    static BOOL installed = NO;
+    if (!installed) {
+        Method m = class_getInstanceMethod([UIGestureRecognizer class], @selector(locationInView:));
+        if (m) {
+            o_locInView = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)dm_locInView);
+            installed = YES;
+            W(@"swizzle locationInView: 已安装");
+        }
+    }
+    gFakeLocOn = on;
+}
+
+// 程序化点击 DinamicX 节点：调 DXEventDispatcher onTap:
+static NSString *dmDXFire(NSString *needle) {
+    __block NSString *report = nil;
+    dmRunOnMain(^{
+        NSMutableString *r = [NSMutableString string];
+        UIView *tv = dmFindByText(needle);
+        if (!tv) { report = @"未找到目标文本节点"; return; }
+        UIView *root = tv.superview;
+        Class dxc = NSClassFromString(@"DXRootView");
+        while (root && dxc && ![root isKindOfClass:dxc]) root = root.superview;
+        if (!root) { report = @"未找到 DXRootView"; return; }
+        id disp = nil;
+        @try { disp = [root performSelector:@selector(eventDispatcher)]; } @catch (id e) {}
+        if (!disp) { report = @"eventDispatcher 为空"; return; }
+        // 目标坐标（转换成 rootView 坐标系）
+        gFakeLoc = [tv convertPoint:CGPointMake(CGRectGetMidX(tv.bounds), CGRectGetMidY(tv.bounds)) toView:root];
+        [r appendFormat:@"目标点(rootView坐标)=(%.0f,%.0f) dispatcher=%@\n", gFakeLoc.x, gFakeLoc.y, NSStringFromClass([disp class])];
+        // 找 tap 手势
+        UIGestureRecognizer *tap = nil;
+        for (UIGestureRecognizer *g in root.gestureRecognizers)
+            if ([g isKindOfClass:[UITapGestureRecognizer class]]) { tap = g; break; }
+        [r appendFormat:@"tapGesture=%@\n", tap ? NSStringFromClass([tap class]) : @"nil"];
+        dmSwizzleLoc(YES);
+        @try {
+            if ([disp respondsToSelector:@selector(onTap:)]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(disp, @selector(onTap:), tap);
+                [r appendString:@"★ onTap: 调用完成\n"];
+            } else [r appendString:@"dispatcher 不响应 onTap:/n"];
+        } @catch (id e) { [r appendFormat:@"onTap EXC %@\n", e]; }
+        usleep(200000);
+        dmSwizzleLoc(NO);
+        report = [r copy];
+    });
+    return report ?: @"(nil)";
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -1569,6 +1628,8 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmAXActivate(cmd[@"txt"] ?: @""));
     } else if ([c isEqualToString:@"viewinfo"]) {
         writeOut(dmViewIvars(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"dxfire"]) {
+        writeOut(dmDXFire(cmd[@"txt"] ?: @"立即提交"));
     } else if ([c isEqualToString:@"dxgest"]) {
         writeOut(dmDXGest(cmd[@"txt"] ?: @"立即提交", [cmd[@"fire"] boolValue]));
     } else if ([c isEqualToString:@"h5confirm"] || [c isEqualToString:@"h5buy"]) {
