@@ -25,8 +25,12 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <poll.h>
 
-static NSString *const kVer = @"v4.3";
+static NSString *const kVer = @"v5.0";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1951,6 +1955,59 @@ g_interposers[] __attribute__((section("__DATA, __interpose"))) = {
 
 static void dmInitCryptoHooks(void) { W(@"MD5 自带实现，无需 dlsym"); }
 
+
+// ---------------- TCP 中继：0.0.0.0:27043 -> 127.0.0.1:27042（Frida gadget）----------------
+static void dmRelayConn(int cs) {
+    int us = socket(AF_INET, SOCK_STREAM, 0);
+    if (us < 0) { close(cs); return; }
+    struct sockaddr_in u; memset(&u, 0, sizeof(u));
+    u.sin_family = AF_INET; u.sin_port = htons(27042); u.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(us, (struct sockaddr *)&u, sizeof(u)) < 0) { close(cs); close(us); return; }
+    char buf[8192];
+    struct pollfd fds[2];
+    fds[0].fd = cs; fds[0].events = POLLIN; fds[0].revents = 0;
+    fds[1].fd = us; fds[1].events = POLLIN; fds[1].revents = 0;
+    for (;;) {
+        int r = poll(fds, 2, 60000);
+        if (r <= 0) break;
+        int dead = 0;
+        for (int i = 0; i < 2; i++) {
+            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                ssize_t n = read(fds[i].fd, buf, sizeof(buf));
+                if (n <= 0) { dead = 1; break; }
+                ssize_t off = 0;
+                while (off < n) {
+                    ssize_t w = write(fds[1 - i].fd, buf + off, n - off);
+                    if (w <= 0) { dead = 1; break; }
+                    off += w;
+                }
+                if (dead) break;
+            }
+        }
+        if (dead) break;
+    }
+    close(cs); close(us);
+}
+
+static void dmStartRelay(void) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        int ls = socket(AF_INET, SOCK_STREAM, 0);
+        if (ls < 0) return;
+        int yes = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        struct sockaddr_in a; memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET; a.sin_port = htons(27043); a.sin_addr.s_addr = INADDR_ANY;
+        if (bind(ls, (struct sockaddr *)&a, sizeof(a)) < 0) { W(@"relay bind 27043 失败 errno=%d", errno); close(ls); return; }
+        listen(ls, 8);
+        W(@"relay 就绪: 0.0.0.0:27043 → 127.0.0.1:27042");
+        for (;;) {
+            int cs = accept(ls, NULL, NULL);
+            if (cs < 0) { usleep(100000); continue; }
+            dispatch_async(dispatch_get_global_queue(0, 0), ^{ dmRelayConn(cs); });
+        }
+    });
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -2474,11 +2531,11 @@ static void setupOnce(void) {
     flushAll();
     W(@"setupOnce done hooks=%d", gHookCount);
     gCryptoReady = 1;
-    gCryptoReady = 1;
     {
         unsigned char t[16]; dm_md5_ctx c; dm_md5_init(&c);
         dm_md5_update(&c, "abc", 3); dm_md5_final(t, &c);
-        W(@"crypto ready selftest md5(abc)=%@ (应为 900150983cd24fb0d6963f7d28e17f72)", dmHexStr(t, 16));
+        @try { dmStartRelay(); } @catch (id e) { W(@"relay EXC %@", e); }
+    W(@"crypto ready selftest md5(abc)=%@ (应为 900150983cd24fb0d6963f7d28e17f72)", dmHexStr(t, 16));
     }
     flushAll();
 }
