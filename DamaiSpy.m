@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v3.2";
+static NSString *const kVer = @"v4.0";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1732,6 +1732,77 @@ static NSString *dmRunJS2(NSString *code) {
     return [NSString stringWithFormat:@"%@%@%@\n[return] %@\n", br.out ?: @"", rt.out ?: @"", exc ? [@"[JS-EXC] " stringByAppendingString:exc] : @"", clip(res, 400)];
 }
 
+
+// ---------------- 签名方法全量 hook（找交易 linkage 的 md5）----------------
+typedef struct { Class cls; SEL sel; IMP orig; } SignHook;
+static SignHook gSignHooks[64];
+static int gSignHookCount = 0;
+
+static void dmLogSignCall(SignHook *h, id a1, id a2, id ret) {
+    M(@"==== SIGN %@ -%@ ====", NSStringFromClass(h->cls), NSStringFromSelector(h->sel));
+    M(@"  a1=%@", clip([NSString stringWithFormat:@"%@", a1], 1200));
+    if (a2) M(@"  a2=%@", clip([NSString stringWithFormat:@"%@", a2], 300));
+    if (ret) M(@"  ret=%@", clip([NSString stringWithFormat:@"%@", ret], 400));
+}
+
+// 两参版本（id,id -> id）
+static id dmSign2_0(id self, SEL _cmd, id a1, id a2);
+static id dmSign2(id self, SEL _cmd, id a1, id a2) {
+    Class cls = object_getClass(self);
+    IMP orig = NULL;
+    for (int i = 0; i < gSignHookCount; i++) {
+        if (gSignHooks[i].cls == cls && sel_isEqual(gSignHooks[i].sel, _cmd)) { orig = gSignHooks[i].orig; break; }
+    }
+    id ret = orig ? ((id (*)(id, SEL, id, id))orig)(self, _cmd, a1, a2) : nil;
+    SignHook h = { cls, _cmd, orig };
+    dmLogSignCall(&h, a1, a2, ret);
+    return ret;
+}
+
+// 一参版本（id -> id）
+static id dmSign1(id self, SEL _cmd, id a1) {
+    Class cls = object_getClass(self);
+    IMP orig = NULL;
+    for (int i = 0; i < gSignHookCount; i++) {
+        if (gSignHooks[i].cls == cls && sel_isEqual(gSignHooks[i].sel, _cmd)) { orig = gSignHooks[i].orig; break; }
+    }
+    id ret = orig ? ((id (*)(id, SEL, id))orig)(self, _cmd, a1) : nil;
+    SignHook h = { cls, _cmd, orig };
+    dmLogSignCall(&h, a1, nil, ret);
+    return ret;
+}
+
+static void hookSignMethods(void) {
+    NSArray *targets = @[@"generateMD5Sign:withSecret:", @"generateSignWithKey:content:",
+                         @"generateMD5ByString:", @"generateMd5String:", @"generateSignStringWithParameters:",
+                         @"generateSignWithKey:timestamp:havanaId:needSdkVersion:"];
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * n);
+    n = objc_getClassList(classes, n);
+    int hooked = 0;
+    for (int i = 0; i < n; i++) {
+        Class c = classes[i];
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned j = 0; j < mc; j++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[j]));
+            if (![targets containsObject:sn]) continue;
+            unsigned want = (unsigned)[[sn componentsSeparatedByString:@":"] count] - 1;
+            if (want > 2) continue;
+            if (gSignHookCount >= 60) break;
+            IMP old = method_getImplementation(ms[j]);
+            gSignHooks[gSignHookCount++] = (SignHook){ c, method_getName(ms[j]), old };
+            method_setImplementation(ms[j], (IMP)(want == 1 ? dmSign1 : dmSign2));
+            W(@"hook SIGN %@ -%@", NSStringFromClass(c), sn);
+            hooked++;
+        }
+        if (ms) free(ms);
+    }
+    free(classes);
+    W(@"签名方法 hook 数=%d", hooked);
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -2249,6 +2320,7 @@ static void setupOnce(void) {
     @try { hookDX(); } @catch (id e) { W(@"hookDX EXC %@", e); }
     @try { hookSending(); } @catch (id e) { W(@"hookSending EXC %@", e); }
     @try { hookHeaders(); } @catch (id e) { W(@"hookHeaders EXC %@", e); }
+    @try { hookSignMethods(); } @catch (id e) { W(@"hookSign EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
