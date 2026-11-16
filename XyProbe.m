@@ -808,7 +808,22 @@ static void xyOverlayEnsure(BOOL createIfNeeded) {
         }
         if (!host) return;
         if (!gOverlayWV && createIfNeeded) {
-            WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
+            // 借用一个现有 App webview 的 configuration（含 windvane 注入脚本/消息通道）
+            WKWebViewConfiguration *cfg = nil;
+            for (id v in gWebViews.allObjects) {
+                if (![v isKindOfClass:[WKWebView class]]) continue;
+                WKWebView *w = (WKWebView *)v;
+                NSString *cn = NSStringFromClass([w class]);
+                if ([cn containsString:@"WV"] || [cn containsString:@"TB"]) {
+                    cfg = w.configuration;
+                    W(@"overlay borrow config from %@ (scripts=%lu handlers=%lu)",
+                      cn,
+                      (unsigned long)w.configuration.userContentController.userScripts.count,
+                      (unsigned long)0);
+                    break;
+                }
+            }
+            if (!cfg) cfg = [WKWebViewConfiguration new];
             // 优先用 App 自己的 webview 类（自带 windvane/AlipayJSBridge 桥 + 正版 UA），
             // 否则纯 WKWebView 里阿里 H5 会永远停在「加载中」
             Class wvcls = NSClassFromString(@"WVWKWebView") ?: NSClassFromString(@"WVWebView");
