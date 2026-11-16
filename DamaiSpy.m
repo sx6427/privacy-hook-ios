@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v4.1";
+static NSString *const kVer = @"v4.2";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1818,6 +1818,7 @@ static NSString *dmPreview(const void *d, CC_LONG n) {
 
 // 结果字典：改完签名后，把最近的 md5 调用存下来便于比对
 static NSMutableArray *gMd5Log = nil;   // 元素: @{in, out, len}
+static volatile int gCryptoReady = 0;
 static NSLock *gMd5Lock = nil;
 
 static void dmRecordMd5(const void *data, CC_LONG len, const unsigned char *digest, NSString *tag) {
@@ -1838,31 +1839,46 @@ static NSMutableDictionary *gCtxMap = nil;
 
 static unsigned char *(*g_orig_CC_MD5)(const void *, CC_LONG, unsigned char *);
 static unsigned char *dm_CC_MD5(const void *data, CC_LONG len, unsigned char *md) {
-    unsigned char *r = g_orig_CC_MD5 ? g_orig_CC_MD5(data, len, md) : NULL;
-    if (r && len >= 24) dmRecordMd5(data, len, r, @"oneshot");
+    if (!g_orig_CC_MD5) return md;
+    unsigned char *r = g_orig_CC_MD5(data, len, md);
+    if (r && len >= 24 && gCryptoReady) {
+        @try { dmRecordMd5(data, len, r, @"oneshot"); } @catch (id e) {}
+    }
     return r;
 }
 
 static int (*g_orig_CC_MD5_Init)(CC_MD5_CTX *);
 static int dm_CC_MD5_Init(CC_MD5_CTX *c) {
-    if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
-    gCtxMap[@((uintptr_t)c)] = [NSMutableData new];
-    return g_orig_CC_MD5_Init ? g_orig_CC_MD5_Init(c) : 0;
+    if (!g_orig_CC_MD5_Init) return 0;
+    if (!gCryptoReady) return g_orig_CC_MD5_Init(c);
+    @try {
+        if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
+        gCtxMap[@((uintptr_t)c)] = [NSMutableData new];
+    } @catch (id e) {}
+    return g_orig_CC_MD5_Init(c);
 }
 static int (*g_orig_CC_MD5_Update)(CC_MD5_CTX *, const void *, CC_LONG);
 static int dm_CC_MD5_Update(CC_MD5_CTX *c, const void *data, CC_LONG len) {
-    if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
-    NSMutableData *acc = gCtxMap[@((uintptr_t)c)];
-    if (!acc) { acc = [NSMutableData new]; gCtxMap[@((uintptr_t)c)] = acc; }
-    if (data && len) [acc appendBytes:data length:len];
-    return g_orig_CC_MD5_Update ? g_orig_CC_MD5_Update(c, data, len) : 0;
+    if (!g_orig_CC_MD5_Update) return 0;
+    if (!gCryptoReady) return g_orig_CC_MD5_Update(c, data, len);
+    @try {
+        if (!gCtxMap) gCtxMap = [NSMutableDictionary new];
+        NSMutableData *acc = gCtxMap[@((uintptr_t)c)];
+        if (!acc) { acc = [NSMutableData new]; gCtxMap[@((uintptr_t)c)] = acc; }
+        if (data && len) [acc appendBytes:data length:len];
+    } @catch (id e) {}
+    return g_orig_CC_MD5_Update(c, data, len);
 }
 static int (*g_orig_CC_MD5_Final)(unsigned char *, CC_MD5_CTX *);
 static int dm_CC_MD5_Final(unsigned char *md, CC_MD5_CTX *c) {
-    int r = g_orig_CC_MD5_Final ? g_orig_CC_MD5_Final(md, c) : 0;
-    NSData *acc = gCtxMap[@((uintptr_t)c)];
-    if (r && acc.length >= 24) dmRecordMd5(acc.bytes, (CC_LONG)acc.length, md, @"stream");
-    if (acc) [gCtxMap removeObjectForKey:@((uintptr_t)c)];
+    if (!g_orig_CC_MD5_Final) return 0;
+    int r = g_orig_CC_MD5_Final(md, c);
+    if (!gCryptoReady) return r;
+    @try {
+        NSData *acc = gCtxMap[@((uintptr_t)c)];
+        if (r && acc.length >= 24) dmRecordMd5(acc.bytes, (CC_LONG)acc.length, md, @"stream");
+        if (acc) [gCtxMap removeObjectForKey:@((uintptr_t)c)];
+    } @catch (id e) {}
     return r;
 }
 
@@ -1876,10 +1892,21 @@ g_interposers[] __attribute__((section("__DATA, __interpose"))) = {
 };
 
 static void dmInitCryptoHooks(void) {
-    g_orig_CC_MD5        = dlsym(RTLD_DEFAULT, "CC_MD5");
-    g_orig_CC_MD5_Init   = dlsym(RTLD_DEFAULT, "CC_MD5_Init");
-    g_orig_CC_MD5_Update = dlsym(RTLD_DEFAULT, "CC_MD5_Update");
-    g_orig_CC_MD5_Final  = dlsym(RTLD_DEFAULT, "CC_MD5_Final");
+    g_orig_CC_MD5        = dlsym(RTLD_NEXT, "CC_MD5");
+    g_orig_CC_MD5_Init   = dlsym(RTLD_NEXT, "CC_MD5_Init");
+    g_orig_CC_MD5_Update = dlsym(RTLD_NEXT, "CC_MD5_Update");
+    g_orig_CC_MD5_Final  = dlsym(RTLD_NEXT, "CC_MD5_Final");
+    // 兜底：RTLD_NEXT 拿不到就从 libcommonCrypto 句柄取
+    if (!g_orig_CC_MD5) {
+        void *h = dlopen("/usr/lib/libcommonCrypto.dylib", RTLD_LAZY);
+        if (!h) h = dlopen("/usr/lib/system/libcommonCrypto.dylib", RTLD_LAZY);
+        if (h) {
+            g_orig_CC_MD5        = dlsym(h, "CC_MD5");
+            g_orig_CC_MD5_Init   = dlsym(h, "CC_MD5_Init");
+            g_orig_CC_MD5_Update = dlsym(h, "CC_MD5_Update");
+            g_orig_CC_MD5_Final  = dlsym(h, "CC_MD5_Final");
+        }
+    }
     W(@"interpose CC_MD5: %s Init:%s Update:%s Final:%s",
       g_orig_CC_MD5 ? "ok" : "nil", g_orig_CC_MD5_Init ? "ok" : "nil",
       g_orig_CC_MD5_Update ? "ok" : "nil", g_orig_CC_MD5_Final ? "ok" : "nil");
