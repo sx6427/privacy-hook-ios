@@ -26,7 +26,7 @@
 #import <WebKit/WebKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 
-static NSString *const kVer = @"v2.9";
+static NSString *const kVer = @"v3.0";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1551,24 +1551,31 @@ static NSString *dmRunJS(NSString *code) {
 
 // 遍历 DinamicX 控件树
 static void dmWalkNodes(id node, int depth, NSMutableString *s, int *budget, NSString *needle, id *found) {
-    if (!node || *budget <= 0) return;
-    NSString *cls = NSStringFromClass([node class]);
-    CGRect f = CGRectZero;
-    @try { f = [[node valueForKey:@"frame"] CGRectValue]; } @catch (id e) {}
-    NSArray *ev = nil;
-    @try { ev = [node valueForKey:@"eventList"]; } @catch (id e) {}
-    NSString *txt = nil;
-    @try { id t = [node valueForKey:@"text"]; if ([t isKindOfClass:[NSString class]]) txt = t; } @catch (id e) {}
-    if (txt.length && needle.length && [txt rangeOfString:needle].location != NSNotFound && !*found) *found = node;
-    if (ev.count || txt.length) {
-        [s appendFormat:@"%*s%@ (%.0f,%.0f) ev=%lu txt=%@\n", depth * 2, "", cls, f.origin.x, f.origin.y,
-         (unsigned long)ev.count, clip(txt, 24)];
-        (*budget)--;
+    if (!node || *budget <= 0 || depth > 40) return;
+    if (![node isKindOfClass:[NSObject class]]) return;
+    @try {
+        NSString *cls = NSStringFromClass([node class]);
+        CGRect f = CGRectZero;
+        @try { id fv = [node valueForKey:@"frame"]; if ([fv isKindOfClass:[NSValue class]]) f = [fv CGRectValue]; } @catch (id e) {}
+        NSArray *ev = nil;
+        @try { id e2 = [node valueForKey:@"eventList"]; if ([e2 isKindOfClass:[NSArray class]]) ev = e2; } @catch (id e) {}
+        NSString *txt = nil;
+        @try { id t = [node valueForKey:@"text"]; if ([t isKindOfClass:[NSString class]]) txt = t; } @catch (id e) {}
+        if (txt.length && needle.length && [txt rangeOfString:needle].location != NSNotFound && found && !*found) *found = node;
+        if (ev.count || txt.length) {
+            [s appendFormat:@"%*s%@ (%.0f,%.0f) ev=%lu txt=%@\n", depth * 2, "", cls, f.origin.x, f.origin.y,
+             (unsigned long)ev.count, clip(txt, 24)];
+            (*budget)--;
+        }
+        NSArray *kids = nil;
+        @try { id k = [node valueForKey:@"subWidgets"]; if ([k isKindOfClass:[NSArray class]]) kids = k; } @catch (id e) {}
+        if (!kids) @try { id k = [node valueForKey:@"children"]; if ([k isKindOfClass:[NSArray class]]) kids = k; } @catch (id e) {}
+        for (id k in kids) {
+            if ([k isKindOfClass:[NSObject class]]) dmWalkNodes(k, depth + 1, s, budget, needle, found);
+        }
+    } @catch (id e) {
+        [s appendFormat:@"<walk EXC %@ at depth %d>\n", e, depth];
     }
-    NSArray *kids = nil;
-    @try { kids = [node valueForKey:@"subWidgets"]; } @catch (id e) {}
-    if (!kids) @try { kids = [node valueForKey:@"children"]; } @catch (id e) {}
-    for (id k in kids) dmWalkNodes(k, depth + 1, s, budget, needle, found);
 }
 
 static id dmFindNode(id node, NSString *needle) {
