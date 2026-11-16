@@ -776,6 +776,66 @@ static id xyFindTreeWeb(NSMutableArray *log) {
 }
 
 // 挑一个真的显示在屏幕上的 webview（有 window、尺寸正常、不太小）
+// ---- 覆盖层：新建一个真正可见的 webview 并保活（防页面切换把它挤掉）----
+static WKWebView *gOverlayWV = nil;
+static NSTimer *gOverlayTimer = nil;
+
+static UIViewController *xyTopVC(void) {
+    UIWindow *kw = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { kw = w; break; }
+    }
+    if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+    UIViewController *vc = kw.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if ([vc isKindOfClass:[UINavigationController class]])
+        vc = ((UINavigationController *)vc).topViewController ?: vc;
+    if ([vc isKindOfClass:[UITabBarController class]])
+        vc = ((UITabBarController *)vc).selectedViewController ?: vc;
+    return vc;
+}
+
+static void xyOverlayEnsure(BOOL createIfNeeded) {
+    @try {
+        UIViewController *vc = xyTopVC();
+        UIView *host = vc.view ?: nil;
+        if (!host) {
+            UIWindow *kw = nil;
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (w.isKeyWindow) { kw = w; break; }
+            }
+            host = kw;
+        }
+        if (!host) return;
+        if (!gOverlayWV && createIfNeeded) {
+            WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
+            gOverlayWV = [[WKWebView alloc] initWithFrame:host.bounds configuration:cfg];
+            gOverlayWV.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            gOverlayWV.opaque = NO;
+            gOverlayWV.backgroundColor = [UIColor whiteColor];
+            NSString *ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
+            gOverlayWV.customUserAgent = ua;
+            if (!gWebViews) gWebViews = [NSHashTable weakObjectsHashTable];
+            [gWebViews addObject:gOverlayWV];
+        }
+        if (gOverlayWV) {
+            if (gOverlayWV.superview != host) {
+                [gOverlayWV removeFromSuperview];
+                gOverlayWV.frame = host.bounds;
+                [host addSubview:gOverlayWV];
+            }
+            gOverlayWV.hidden = NO;
+            gOverlayWV.alpha = 1;
+            [host bringSubviewToFront:gOverlayWV];
+            W(@"overlay pinned %@ %.0fx%.0f win=%d",
+              NSStringFromClass([host class]),
+              gOverlayWV.frame.size.width, gOverlayWV.frame.size.height,
+              (int)(gOverlayWV.window != nil));
+            flushLogs();
+        }
+    } @catch (id e) {}
+}
+
 static WKWebView *xyPickVisibleWebView(void) {
     WKWebView *best = nil;
     CGFloat bestArea = 0;
@@ -892,6 +952,24 @@ static void pollCmd(void) {
                 W(@"webopen pick=%@ %@", pick, [us substringToIndex:MIN((NSUInteger)110, us.length)]);
                 if (uu) {
                     dispatch_async(dispatch_get_main_queue(), ^{
+                        BOOL wantFresh = [obj[@"fresh"] boolValue];
+                        if (wantFresh) {
+                            xyOverlayEnsure(YES);
+                            if (gOverlayWV) {
+                                [gOverlayWV loadRequest:[NSURLRequest requestWithURL:uu]];
+                                gWebView = gOverlayWV;
+                                W(@"webopen(fresh) ok frame=%.0fx%.0f win=%d",
+                                  gOverlayWV.frame.size.width, gOverlayWV.frame.size.height,
+                                  (int)(gOverlayWV.window != nil));
+                                flushLogs();
+                                // 加载后再钉两次，防止页面切换把覆盖层挤掉
+                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                                               dispatch_get_main_queue(), ^{ xyOverlayEnsure(NO); });
+                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                                               dispatch_get_main_queue(), ^{ xyOverlayEnsure(NO); });
+                                return;
+                            }
+                        }
                         id target = xyPickVisibleWebView();
                         if (!target) target = xyFindTreeWeb(nil);
                         // 别把页面塞进隐形 webview（0 尺寸/无窗口）——宁可自己造一个
