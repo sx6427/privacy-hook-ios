@@ -116,6 +116,8 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
 static id mtopInstance(NSString *site);
 static void dmForceSign(id mr);
 static NSString *dmH5Call(NSString *api, NSString *ver, NSString *dataJson);
+static id dmFindNode(id node, NSString *needle);
+static void dmWalkNodes(id node, int depth, NSMutableString *s, int *budget, NSString *needle, id *found);
 static NSString *runCreateViaRequest(NSDictionary *biz, NSString *api, NSString *v, NSString *tag);
 
 static void dumpIvarsOf(id o, Class c, NSMutableString *s, int *budget) {
