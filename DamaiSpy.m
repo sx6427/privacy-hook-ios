@@ -1949,26 +1949,7 @@ g_interposers[] __attribute__((section("__DATA, __interpose"))) = {
     { (const void *)dm_CC_MD5_Final,  (const void *)CC_MD5_Final },
 };
 
-static void dmInitCryptoHooks(void) {
-    g_orig_CC_MD5        = dlsym(RTLD_NEXT, "CC_MD5");
-    g_orig_CC_MD5_Init   = dlsym(RTLD_NEXT, "CC_MD5_Init");
-    g_orig_CC_MD5_Update = dlsym(RTLD_NEXT, "CC_MD5_Update");
-    g_orig_CC_MD5_Final  = dlsym(RTLD_NEXT, "CC_MD5_Final");
-    // 兜底：RTLD_NEXT 拿不到就从 libcommonCrypto 句柄取
-    if (!g_orig_CC_MD5) {
-        void *h = dlopen("/usr/lib/libcommonCrypto.dylib", RTLD_LAZY);
-        if (!h) h = dlopen("/usr/lib/system/libcommonCrypto.dylib", RTLD_LAZY);
-        if (h) {
-            g_orig_CC_MD5        = dlsym(h, "CC_MD5");
-            g_orig_CC_MD5_Init   = dlsym(h, "CC_MD5_Init");
-            g_orig_CC_MD5_Update = dlsym(h, "CC_MD5_Update");
-            g_orig_CC_MD5_Final  = dlsym(h, "CC_MD5_Final");
-        }
-    }
-    W(@"interpose CC_MD5: %s Init:%s Update:%s Final:%s",
-      g_orig_CC_MD5 ? "ok" : "nil", g_orig_CC_MD5_Init ? "ok" : "nil",
-      g_orig_CC_MD5_Update ? "ok" : "nil", g_orig_CC_MD5_Final ? "ok" : "nil");
-}
+static void dmInitCryptoHooks(void) { W(@"MD5 自带实现，无需 dlsym"); }
 
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
@@ -2488,7 +2469,6 @@ static void setupOnce(void) {
     @try { hookSending(); } @catch (id e) { W(@"hookSending EXC %@", e); }
     @try { hookHeaders(); } @catch (id e) { W(@"hookHeaders EXC %@", e); }
     @try { hookSignMethods(); } @catch (id e) { W(@"hookSign EXC %@", e); }
-    @try { dmInitCryptoHooks(); } @catch (id e) { W(@"crypto EXC %@", e); }
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
