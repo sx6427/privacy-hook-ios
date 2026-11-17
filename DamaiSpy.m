@@ -33,7 +33,7 @@
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v6.1";
+static NSString *const kVer = @"v6.2";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -2082,10 +2082,22 @@ static void dm_md5_transform_hook(void *state, const void *data, size_t blocks) 
 
 
 // ---------------- 壳内 MD5 预言机（调用而非改写）----------------
+static uintptr_t dmMainImageBase(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "DMPortal")) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    return 0;
+}
+
 static void dmShellMd5(const void *data, size_t len, unsigned char out[16]) {
     typedef void (*TFn)(uint32_t *, const void *, size_t);
-    uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
-    TFn tf = (TFn)(base + 0x4d05b64);
+    uintptr_t base = dmMainImageBase();
+    uintptr_t addr = base + 0x4d05b64;
+    TFn tf = (TFn)addr;
     uint32_t st[4] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
     size_t total = ((len + 8) / 64 + 1) * 64;
     unsigned char *buf = (unsigned char *)calloc(1, total);
@@ -2097,10 +2109,8 @@ static void dmShellMd5(const void *data, size_t len, unsigned char out[16]) {
     tf(st, buf, total / 64);
     free(buf);
     for (int i = 0; i < 4; i++) {
-        out[i * 4] = (unsigned char)(st[i]);
-        out[i * 4 + 1] = (unsigned char)(st[i] >> 8);
-        out[i * 4 + 2] = (unsigned char)(st[i] >> 16);
-        out[i * 4 + 3] = (unsigned char)(st[i] >> 24);
+        out[i*4+0]=(unsigned char)(st[i]); out[i*4+1]=(unsigned char)(st[i]>>8);
+        out[i*4+2]=(unsigned char)(st[i]>>16); out[i*4+3]=(unsigned char)(st[i]>>24);
     }
 }
 
@@ -2491,7 +2501,15 @@ static void execCmd(NSDictionary *cmd) {
         dm_md5_ctx mc; dm_md5_init(&mc);
         dm_md5_update(&mc, in.bytes, in.length);
         dm_md5_final(mine, &mc);
-        writeOut([NSString stringWithFormat:@"input=%@ len=%lu\nshell=%@\nstd =%@\n一致=%@",
+        NSMutableString *imgs = [NSMutableString string];
+        for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm && (strstr(nm, "DMPortal") || strstr(nm, "DamaiSpy") || strstr(nm, "Privacy")))
+                [imgs appendFormat:@"  img%d %s base=%p\n", i, nm, _dyld_get_image_header(i)];
+        }
+        uintptr_t mb = dmMainImageBase();
+        writeOut([NSString stringWithFormat:@"%@base=%p target=%p\ninput=%@ len=%lu\nshell=%@\nstd =%@\n一致=%@",
+                  imgs, (void *)mb, (void *)(mb + 0x4d05b64),
                   clip(txt, 60), (unsigned long)in.length, dmHexStr(shell, 16), dmHexStr(mine, 16),
                   [dmHexStr(shell,16) isEqualToString:dmHexStr(mine,16)] ? @"YES" : @"NO"]);
     } else if ([c isEqualToString:@"dxgest"]) {
