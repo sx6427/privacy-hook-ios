@@ -29,8 +29,11 @@
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <poll.h>
+#import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v5.0";
+static NSString *const kVer = @"v6.0";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -2008,6 +2011,75 @@ static void dmStartRelay(void) {
     });
 }
 
+
+// ---------------- 替换壳内 MD5 transform（0x104d05b64）----------------
+static void dm_md5_transform(uint32_t st[4], const unsigned char block[64]);
+static void dm_md5_transform_hook(void *state, const void *data, size_t blocks);
+
+static NSString *gPatchReport = nil;
+
+static void dmPatchShellMd5(void) {
+    const struct mach_header *hdr = _dyld_get_image_header(0);
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    uintptr_t target = (uintptr_t)hdr + 0x4d05b64;   // vmaddr 0x104d05b64 - image base 0x100000000
+    (void)slide;
+    size_t ps = 16384;
+    uintptr_t page = target & ~(ps - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, ps, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        gPatchReport = [NSString stringWithFormat:@"vm_protect 失败 kr=%d", kr];
+        W(@"patch shell md5: %@", gPatchReport);
+        return;
+    }
+    uint32_t *p32 = (uint32_t *)target;
+    uint32_t old0 = p32[0], old1 = p32[1];
+    uint32_t ldr = 0x58000049;   // ldr x9, #8
+    uint32_t br  = 0xD61F0120;   // br x9
+    uint64_t fn  = (uint64_t)(uintptr_t)dm_md5_transform_hook;
+    memcpy((void *)target, &ldr, 4);
+    memcpy((void *)(target + 4), &br, 4);
+    memcpy((void *)(target + 8), &fn, 8);
+    sys_icache_invalidate((void *)target, 16);
+    vm_protect(mach_task_self(), page, ps, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    gPatchReport = [NSString stringWithFormat:@"ok (原指令 %08x %08x → %p)", old0, old1, (void *)target];
+    W(@"patch shell md5: %@", gPatchReport);
+}
+
+static void dm_md5_transform_hook(void *state, const void *data, size_t blocks) {
+    @try {
+        if (data && blocks > 0 && blocks <= 8192) {
+            size_t len = blocks * 64;
+            const unsigned char *b = (const unsigned char *)data;
+            // 标记检测
+            BOOL hit = NO;
+            size_t scan = len < 8192 ? len : 8192;
+            for (size_t i = 0; i + 8 < scan; i++) {
+                if (b[i] == 'a' && !memcmp(b + i, "ali.china", 9)) { hit = YES; break; }
+                if (b[i] == 'H' && !memcmp(b + i, "HALO", 4)) { hit = YES; break; }
+                if (b[i] == 'o' && !memcmp(b + i, "orderLine", 9)) { hit = YES; break; }
+                if (b[i] == 's' && !memcmp(b + i, "submitParam", 11)) { hit = YES; break; }
+            }
+            if (hit) {
+                M(@"==== MD5-TRANSFORM blocks=%lu len=%lu ====", (unsigned long)blocks, (unsigned long)len);
+                M(@"  head=%@", clip(bytesPreview([NSData dataWithBytes:b length:MIN(len, 300)], 300), 300));
+                // 完整落盘（追加）
+                NSMutableData *out = [NSMutableData data];
+                uint32_t l = (uint32_t)len;
+                [out appendBytes:&l length:4];
+                [out appendBytes:b length:len];
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:dpath(@"dm_cap.bin")];
+                if (!fh) { [[NSData data] writeToFile:dpath(@"dm_cap.bin") atomically:NO]; fh = [NSFileHandle fileHandleForWritingAtPath:dpath(@"dm_cap.bin")]; }
+                [fh seekToEndOfFile]; [fh writeData:out]; [fh closeFile];
+            }
+        }
+    } @catch (id e) {}
+    if (!state || !data) return;
+    uint32_t *st = (uint32_t *)state;
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < blocks; i++) dm_md5_transform(st, p + i * 64);
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -2534,7 +2606,7 @@ static void setupOnce(void) {
     {
         unsigned char t[16]; dm_md5_ctx c; dm_md5_init(&c);
         dm_md5_update(&c, "abc", 3); dm_md5_final(t, &c);
-        @try { dmStartRelay(); } @catch (id e) { W(@"relay EXC %@", e); }
+        @try { dmPatchShellMd5(); } @catch (id e) { W(@"patch EXC %@", e); }
     W(@"crypto ready selftest md5(abc)=%@ (应为 900150983cd24fb0d6963f7d28e17f72)", dmHexStr(t, 16));
     }
     flushAll();
