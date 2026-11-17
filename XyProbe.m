@@ -1073,6 +1073,20 @@ static void pollCmd(void) {
             } else {
                 W(@"webopen: bad url");
             }
+        } else if ([mode isEqualToString:@"pick"]) {
+            // 把 gWebView 指向当前屏幕上真正可见的 webview（用于接管 App 自己打开的页面）
+            dispatch_async(dispatch_get_main_queue(), ^{
+                WKWebView *v = xyPickVisibleWebView();
+                if (v) {
+                    gWebView = v;
+                    W(@"pick ok %@ %.0fx%.0f win=%d url=%@",
+                      NSStringFromClass([v class]), v.frame.size.width, v.frame.size.height,
+                      (int)(v.window != nil), [(v.URL.absoluteString ?: @"-") substringToIndex:MIN((NSUInteger)70, (v.URL.absoluteString ?: @"-").length)]);
+                } else {
+                    W(@"pick: no visible webview");
+                }
+                flushLogs();
+            });
         } else if ([mode isEqualToString:@"webviews"]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSArray *all = gWebViews.allObjects;
