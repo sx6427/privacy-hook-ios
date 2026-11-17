@@ -17,9 +17,6 @@ all: $(DYLIB)
 
 $(DYLIB): $(SRC)
 	clang $(CFLAGS) $(LDFLAGS) -o $@ $^
-	@echo "=== fetch capstone ==="
-	@mkdir -p wheels && python3 -m pip download capstone --only-binary=:all: --platform win_amd64 --python-version 3.13 -d wheels || echo "capstone whl failed"
-	@python3 append_extras.py || echo "append failed"
 	@file $@
 	@lipo -info $@
 	@ls -la $@
