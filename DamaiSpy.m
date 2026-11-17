@@ -33,7 +33,7 @@
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v6.2";
+static NSString *const kVer = @"v6.3";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -2081,6 +2081,47 @@ static void dm_md5_transform_hook(void *state, const void *data, size_t blocks) 
 }
 
 
+
+static NSString *dmImageDiag(void) {
+    NSMutableString *s = [NSMutableString string];
+    uint32_t count = _dyld_image_count();
+    [s appendFormat:@"images=%u\n", count];
+    for (uint32_t i = 0; i < count; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        NSString *n = nm ? [NSString stringWithUTF8String:nm] : @"?";
+        if ([n containsString:@"DMPortal"] || [n containsString:@"DamaiSpy"] || [n containsString:@"Privacy"] || i == 0) {
+            [s appendFormat:@"  [%u] %@ base=%p type=%d slide=%ld\n", i, [n lastPathComponent], h, h ? h->filetype : -1,
+             (long)_dyld_get_image_vmaddr_slide(i)];
+        }
+    }
+    uintptr_t base = dmMainImageBase();
+    uintptr_t target = base + 0x4d05b64;
+    [s appendFormat:@"base=%p target=%p\n", (void *)base, (void *)target];
+    // 查目标页权限
+    vm_address_t addr = (vm_address_t)(target & ~0x3FFF);
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &cnt, &obj);
+    if (kr == KERN_SUCCESS) {
+        [s appendFormat:@"region=0x%llx size=0x%llx prot=%d(max=%d) shared=%d\n",
+         (unsigned long long)addr, (unsigned long long)size, info.protection, info.max_protection, info.shared];
+    } else {
+        [s appendFormat:@"vm_region kr=%d\n", kr];
+    }
+    // 尝试读目标首 4 字节
+    if (target) {
+        @try {
+            uint32_t w = *(volatile uint32_t *)target;
+            [s appendFormat:@"first_insn=%08x\n", w];
+        } @catch (id e) { [s appendString:@"读指令 EXC\n"]; }
+    }
+    return s;
+}
+
 // ---------------- 壳内 MD5 预言机（调用而非改写）----------------
 static uintptr_t dmMainImageBase(void) {
     uint32_t count = _dyld_image_count();
@@ -2493,6 +2534,8 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmRunJS2(code));
     } else if ([c isEqualToString:@"dxfire"]) {
         writeOut(dmDXFire(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"imgdiag"]) {
+        writeOut(dmImageDiag());
     } else if ([c isEqualToString:@"md5oracle"]) {
         NSString *txt = cmd[@"text"] ?: @"abc";
         NSData *in = [txt dataUsingEncoding:NSUTF8StringEncoding];
