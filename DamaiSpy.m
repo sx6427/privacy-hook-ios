@@ -33,7 +33,7 @@
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v6.0";
+static NSString *const kVer = @"v6.1";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -2080,6 +2080,30 @@ static void dm_md5_transform_hook(void *state, const void *data, size_t blocks) 
     for (size_t i = 0; i < blocks; i++) dm_md5_transform(st, p + i * 64);
 }
 
+
+// ---------------- 壳内 MD5 预言机（调用而非改写）----------------
+static void dmShellMd5(const void *data, size_t len, unsigned char out[16]) {
+    typedef void (*TFn)(uint32_t *, const void *, size_t);
+    uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
+    TFn tf = (TFn)(base + 0x4d05b64);
+    uint32_t st[4] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    unsigned char *buf = (unsigned char *)calloc(1, total);
+    if (!buf) return;
+    memcpy(buf, data, len);
+    buf[len] = 0x80;
+    uint64_t bits = (uint64_t)len * 8;
+    memcpy(buf + total - 8, &bits, 8);
+    tf(st, buf, total / 64);
+    free(buf);
+    for (int i = 0; i < 4; i++) {
+        out[i * 4] = (unsigned char)(st[i]);
+        out[i * 4 + 1] = (unsigned char)(st[i] >> 8);
+        out[i * 4 + 2] = (unsigned char)(st[i] >> 16);
+        out[i * 4 + 3] = (unsigned char)(st[i] >> 24);
+    }
+}
+
 // ---------------- 类扫描 ----------------
 static NSArray *kwList(NSString *s) {
     NSMutableArray *a = [NSMutableArray array];
@@ -2459,6 +2483,17 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmRunJS2(code));
     } else if ([c isEqualToString:@"dxfire"]) {
         writeOut(dmDXFire(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"md5oracle"]) {
+        NSString *txt = cmd[@"text"] ?: @"abc";
+        NSData *in = [txt dataUsingEncoding:NSUTF8StringEncoding];
+        unsigned char shell[16] = {0}, mine[16] = {0};
+        dmShellMd5(in.bytes, in.length, shell);
+        dm_md5_ctx mc; dm_md5_init(&mc);
+        dm_md5_update(&mc, in.bytes, in.length);
+        dm_md5_final(mine, &mc);
+        writeOut([NSString stringWithFormat:@"input=%@ len=%lu\nshell=%@\nstd =%@\n一致=%@",
+                  clip(txt, 60), (unsigned long)in.length, dmHexStr(shell, 16), dmHexStr(mine, 16),
+                  [dmHexStr(shell,16) isEqualToString:dmHexStr(mine,16)] ? @"YES" : @"NO"]);
     } else if ([c isEqualToString:@"dxgest"]) {
         writeOut(dmDXGest(cmd[@"txt"] ?: @"立即提交", [cmd[@"fire"] boolValue]));
     } else if ([c isEqualToString:@"h5confirm"] || [c isEqualToString:@"h5buy"]) {
