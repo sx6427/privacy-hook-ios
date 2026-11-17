@@ -2082,6 +2082,8 @@ static void dm_md5_transform_hook(void *state, const void *data, size_t blocks) 
 
 
 
+static uintptr_t dmMainImageBase(void);
+
 static NSString *dmImageDiag(void) {
     NSMutableString *s = [NSMutableString string];
     uint32_t count = _dyld_image_count();
