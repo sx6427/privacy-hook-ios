@@ -795,6 +795,31 @@ static UIViewController *xyTopVC(void) {
     return vc;
 }
 
+// 把 native 的 cookie（淘宝/天猫/闲鱼/支付宝）同步进这个 WKWebView 的 cookie 罐，
+// 否则页面拿不到登录态，会弹「请重新登录」/卡在加载中
+static void xySyncCookies(WKWebView *wv) {
+    @try {
+        WKHTTPCookieStore *cs = wv.configuration.websiteDataStore.httpCookieStore;
+        if (!cs) return;
+        NSArray *all = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
+        dispatch_group_t grp = dispatch_group_create();
+        __block int n = 0;
+        for (NSHTTPCookie *c in all) {
+            NSString *d = c.domain.lowercaseString ?: @"";
+            if ([d rangeOfString:@"taobao"].location == NSNotFound &&
+                [d rangeOfString:@"tmall"].location == NSNotFound &&
+                [d rangeOfString:@"goofish"].location == NSNotFound &&
+                [d rangeOfString:@"alipay"].location == NSNotFound) continue;
+            dispatch_group_enter(grp);
+            [cs setCookie:c completionHandler:^{ dispatch_group_leave(grp); }];
+            n++;
+        }
+        dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)));
+        W(@"overlay cookies synced %d", n);
+        flushLogs();
+    } @catch (id e) {}
+}
+
 static void xyOverlayEnsure(BOOL createIfNeeded) {
     @try {
         UIViewController *vc = xyTopVC();
@@ -978,6 +1003,7 @@ static void pollCmd(void) {
                         if (wantFresh) {
                             xyOverlayEnsure(YES);
                             if (gOverlayWV) {
+                                if (!gOverlayWV.URL) xySyncCookies(gOverlayWV);   // 只在新容器首载前同步
                                 [gOverlayWV loadRequest:[NSURLRequest requestWithURL:uu]];
                                 gWebView = gOverlayWV;
                                 W(@"webopen(fresh) ok frame=%.0fx%.0f win=%d",
