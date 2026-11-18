@@ -33,7 +33,7 @@
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v6.3";
+static NSString *const kVer = @"v6.4";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -2124,6 +2124,42 @@ static NSString *dmImageDiag(void) {
     return s;
 }
 
+
+// 扫描所有区域，找可执行映射里的目标字节序列
+static NSString *dmMemFind(NSData *pat, int maxHits) {
+    NSMutableString *s = [NSMutableString string];
+    vm_address_t addr = 0;
+    int hits = 0, regions = 0;
+    while (hits < maxHits) {
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS) break;
+        regions++;
+        if ((info.protection & VM_PROT_READ) && size >= pat.length) {
+            const uint8_t *p0 = (const uint8_t *)addr;
+            size_t limit = size - pat.length;
+            const uint8_t *needle = (const uint8_t *)pat.bytes;
+            size_t nl = pat.length;
+            for (size_t i = 0; i <= limit; i++) {
+                if (p0[i] == needle[0] && memcmp(p0 + i, needle, nl) == 0) {
+                    [s appendFormat:@"HIT region=0x%llx size=0x%llx prot=%d exec=%d at=0x%llx\n",
+                     (unsigned long long)addr, (unsigned long long)size, info.protection,
+                     (info.protection & VM_PROT_EXECUTE) ? 1 : 0, (unsigned long long)(addr + i)];
+                    hits++;
+                    if (hits >= maxHits) break;
+                }
+            }
+        }
+        addr += size;
+    }
+    [s appendFormat:@"扫描区域数=%d 命中最少=%d\n", regions, hits];
+    return s;
+}
+
 // ---------------- 壳内 MD5 预言机（调用而非改写）----------------
 static uintptr_t dmMainImageBase(void) {
     uint32_t count = _dyld_image_count();
@@ -2536,6 +2572,15 @@ static void execCmd(NSDictionary *cmd) {
         writeOut(dmRunJS2(code));
     } else if ([c isEqualToString:@"dxfire"]) {
         writeOut(dmDXFire(cmd[@"txt"] ?: @"立即提交"));
+    } else if ([c isEqualToString:@"memfind"]) {
+        NSString *hex = cmd[@"hex"] ?: @"a9bd5ff8a90157f6";
+        NSMutableData *pat = [NSMutableData data];
+        for (NSUInteger i = 0; i + 1 < hex.length; i += 2) {
+            unsigned int b = 0;
+            [[NSScanner scannerWithString:[hex substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&b];
+            uint8_t v = (uint8_t)b; [pat appendBytes:&v length:1];
+        }
+        writeOut(dmMemFind(pat, 6));
     } else if ([c isEqualToString:@"imgdiag"]) {
         writeOut(dmImageDiag());
     } else if ([c isEqualToString:@"md5oracle"]) {
