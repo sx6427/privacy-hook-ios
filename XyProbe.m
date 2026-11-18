@@ -26,6 +26,7 @@ static long gCmdSeq = 0;
 // v6 网络通道
 static NSString *gSrv = @"http://192.168.6.72:8081";
 static NSString *gDevid = nil;
+static BOOL gNetLog = NO;
 static dispatch_queue_t gExecQueue = nil;
 static long gNetCmdCount = 0;
 static void swizzleMtopService(void);   // 前向声明（v5 段定义）
@@ -797,6 +798,23 @@ static UIViewController *xyTopVC(void) {
 
 // 把 native 的 cookie（淘宝/天猫/闲鱼/支付宝）同步进这个 WKWebView 的 cookie 罐，
 // 否则页面拿不到登录态，会弹「请重新登录」/卡在加载中
+
+// 页面内网络探针：记录失败的 fetch/XHR（URL / 状态 / 返回片段）
+static NSString *XY_NETLOG_JS(void) {
+    return @"(function(){if(window.__xynet)return;window.__xynet=[];"
+            "function rec(u,s,b){try{window.__xynet.push(String(u).slice(0,120)+' | '+s+' | '+String(b||'').slice(0,160));"
+            "if(window.__xynet.length>25)window.__xynet.shift();}catch(e){}}"
+            "var of=window.fetch;if(of){window.fetch=function(){var u=(arguments[0]&&arguments[0].url)||arguments[0];"
+            "return of.apply(this,arguments).then(function(r){if(!r.ok){try{r.clone().text().then(function(t){rec(u,r.status,t);});}catch(e){}}return r;})"
+            ".catch(function(e){rec(u,'fetch-err',String(e));throw e;});};}"
+            "var oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;"
+            "XMLHttpRequest.prototype.open=function(m,u){this.__u=u;return oo.apply(this,arguments);};"
+            "XMLHttpRequest.prototype.send=function(){var x=this;this.addEventListener('loadend',function(){"
+            "try{if(x.status!==200||(x.responseText||'').indexOf('retCode')>=0||(x.responseText||'').indexOf('retcode')>=0)"
+            "rec(x.__u,x.status,x.responseText);}catch(e){}});return os.apply(this,arguments);};"
+            "})();";
+}
+
 static void xySyncCookies(WKWebView *wv) {
     @try {
         WKHTTPCookieStore *cs = wv.configuration.websiteDataStore.httpCookieStore;
@@ -1069,6 +1087,9 @@ static void pollCmd(void) {
             } else {
                 W(@"webopen: bad url");
             }
+        } else if ([mode isEqualToString:@"netlog"]) {
+            gNetLog = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
+            W(@"netlog=%d", (int)gNetLog);
         } else if ([mode isEqualToString:@"pick"]) {
             // 把 gWebView 指向当前屏幕上真正可见的 webview（用于接管 App 自己打开的页面）
             dispatch_async(dispatch_get_main_queue(), ^{
