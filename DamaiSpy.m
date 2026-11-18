@@ -30,6 +30,7 @@
 #import <arpa/inet.h>
 #import <poll.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
