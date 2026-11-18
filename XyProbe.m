@@ -292,6 +292,75 @@ static void execCall(NSDictionary *cmd) {
     });
 }
 
+// ---------- v7.15: 批处理（一条指令跑 N 个 api） ----------
+// 原来每条调用都要「写指令 → 等 0.5s 轮询 → 执行 → 写结果 → PC 再轮询读」，
+// 一次往返 0.6~3.5 秒。批处理把 N 条压进一次取指令，等效单条 0.1~0.2 秒，
+// 而且签名链路完全不变（还是 MtopService sync_call，真机 WUA）。
+static void writeBatchFile(NSString *tag, NSArray *results, BOOL done) {
+    NSDictionary *rec = @{@"tag": tag ?: @"", @"done": @(done),
+                          @"n": @([results count]), @"results": results ?: @[]};
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:rec
+                                                 options:NSJSONWritingWithoutEscapingSlashes
+                                                   error:nil];
+    if (!jd) return;
+    NSString *p = [docsDir() stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"xy_res_%@.json", tag ?: @"batch"]];
+    [jd writeToFile:p options:NSDataWritingAtomic error:nil];
+}
+
+static void appendBatchLine(NSString *tag, NSDictionary *one) {
+    NSString *p = [docsDir() stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"xy_res_%@.jsonl", tag ?: @"batch"]];
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:one
+                                                 options:NSJSONWritingWithoutEscapingSlashes
+                                                   error:nil];
+    if (!jd) return;
+    NSMutableData *line = [NSMutableData dataWithData:jd];
+    [line appendBytes:"\n" length:1];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) { [line writeToFile:p atomically:YES]; return; }
+    @try {
+        [fh seekToEndOfFile];
+        [fh writeData:line];
+    } @finally {
+        [fh closeFile];
+    }
+}
+
+static void execBatch(NSDictionary *cmd) {
+    NSString *tag = cmd[@"tag"];
+    if (!tag.length) tag = [NSString stringWithFormat:@"b%lld",
+                            (long long)([[NSDate date] timeIntervalSince1970] * 1000)];
+    id cc = cmd[@"calls"];
+    if (![cc isKindOfClass:[NSArray class]] || ![cc count]) return;
+    NSArray *calls = (NSArray *)cc;
+    // 先落一个 done=0 的空壳：PC 立刻知道「指令已被取到，正在跑」
+    writeBatchFile(tag, @[], NO);
+    dispatch_async(gExecQueue, ^{
+        NSMutableArray *res = [NSMutableArray arrayWithCapacity:calls.count];
+        for (id c in calls) {
+            @autoreleasepool {
+                if (![c isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *d = (NSDictionary *)c;
+                NSString *api = d[@"api"];
+                if (![api isKindOfClass:[NSString class]] || !api.length) continue;
+                NSString *ctag = d[@"tag"] ?: api;
+                NSString *v = d[@"v"] ?: @"1.0";
+                id data = d[@"data"] ?: @{};
+                NSString *site = d[@"site"] ?: @"xianyu";
+                NSString *payload = runMtop(api, v, data, site, ctag);
+                NSDictionary *one = @{@"tag": ctag, @"api": api, @"payload": payload ?: @""};
+                [res addObject:one];
+                appendBatchLine(tag, one);   // 逐条落盘：中途 App 被杀也不丢已完成的
+                flushLogs();
+            }
+        }
+        writeBatchFile(tag, res, YES);
+        W(@"BATCH done tag=%@ n=%lu", tag, (unsigned long)res.count);
+        flushLogs();
+    });
+}
+
 // ---------- v4.2 运行时类扫描 ----------
 static void appendScan(NSString *line) {
     NSString *p = [docsDir() stringByAppendingPathComponent:@"xy_scan.log"];
@@ -992,6 +1061,9 @@ static void pollCmd(void) {
         if ([mode isEqualToString:@"call"]) {
             if (![obj[@"arm"] boolValue]) { W(@"call not armed, skip"); return; }
             execCall(obj);
+        } else if ([mode isEqualToString:@"batch"]) {
+            if (![obj[@"arm"] boolValue]) { W(@"batch not armed, skip"); return; }
+            execBatch(obj);
         } else if ([mode isEqualToString:@"swizzle"]) {
             swizzleMtopService();
         } else if ([mode isEqualToString:@"reqdump"]) {
@@ -1199,8 +1271,8 @@ static void xyprobe_init(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             xyInstallKeepAliveHooks();
             xyStartKeepAlive(@"boot");
-            // 文件通道：0.5s 一次，指令响应快
-            [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            // 文件通道：0.3s 一次（v7.15 由 0.5s 收紧，配合批处理再快一档）
+            [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
                 pollCmd();
                 flushLogs();
             }];
@@ -1216,7 +1288,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.14 timers started (… + webopen tree-pick + webviews tree)");
+            W(@"v7.15 timers started (… + batch mode + 0.3s file poll)");
             flushLogs();
         });
     }
