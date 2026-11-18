@@ -1109,6 +1109,18 @@ static void pollCmd(void) {
             } else {
                 W(@"webopen: bad url");
             }
+        } else if ([mode isEqualToString:@"front"]) {
+            // 把我们的容器顶到最前（App 的页面会把我们压到后面，用户就只看到"加载中"）
+            dispatch_async(dispatch_get_main_queue(), ^{
+                WKWebView *w = gOverlayWV ?: gWebView;
+                if (w && w.superview) {
+                    [w.superview bringSubviewToFront:w];
+                    W(@"front ok %@", NSStringFromClass([w class]));
+                } else {
+                    W(@"front: no webview");
+                }
+                flushLogs();
+            });
         } else if ([mode isEqualToString:@"netlog"]) {
             gNetLog = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
             W(@"netlog=%d", (int)gNetLog);
