@@ -33,7 +33,7 @@
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v6.4";
+static NSString *const kVer = @"v6.5";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -2129,8 +2129,12 @@ static NSString *dmImageDiag(void) {
 static NSString *dmMemFind(NSData *pat, int maxHits) {
     NSMutableString *s = [NSMutableString string];
     vm_address_t addr = 0;
-    int hits = 0, regions = 0;
-    while (hits < maxHits) {
+    int hits = 0, regions = 0, scanned = 0;
+    const uint8_t *needle = (const uint8_t *)pat.bytes;
+    size_t nl = pat.length;
+    uint8_t *buf = malloc(0x100000);
+    if (!buf) return @"no mem";
+    while (hits < maxHits && scanned < 3000) {
         vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -2139,24 +2143,32 @@ static NSString *dmMemFind(NSData *pat, int maxHits) {
                                         (vm_region_info_t)&info, &cnt, &obj);
         if (kr != KERN_SUCCESS) break;
         regions++;
-        if ((info.protection & VM_PROT_READ) && size >= pat.length) {
-            const uint8_t *p0 = (const uint8_t *)addr;
-            size_t limit = size - pat.length;
-            const uint8_t *needle = (const uint8_t *)pat.bytes;
-            size_t nl = pat.length;
-            for (size_t i = 0; i <= limit; i++) {
-                if (p0[i] == needle[0] && memcmp(p0 + i, needle, nl) == 0) {
-                    [s appendFormat:@"HIT region=0x%llx size=0x%llx prot=%d exec=%d at=0x%llx\n",
-                     (unsigned long long)addr, (unsigned long long)size, info.protection,
-                     (info.protection & VM_PROT_EXECUTE) ? 1 : 0, (unsigned long long)(addr + i)];
-                    hits++;
-                    if (hits >= maxHits) break;
+        if ((info.protection & VM_PROT_EXECUTE) && (info.protection & VM_PROT_READ) && size > nl) {
+            scanned++;
+            vm_address_t cur = addr;
+            vm_address_t endA = addr + size;
+            while (cur < endA && hits < maxHits) {
+                vm_size_t chunk = MIN((vm_size_t)0x100000, endA - cur);
+                mach_vm_size_t outSize = 0;
+                kern_return_t r2 = mach_vm_read_overwrite(mach_task_self(), cur, chunk,
+                                                          (mach_vm_address_t)buf, &outSize);
+                if (r2 == KERN_SUCCESS && outSize >= nl) {
+                    for (mach_vm_size_t i = 0; i + nl <= outSize; i++) {
+                        if (buf[i] == needle[0] && memcmp(buf + i, needle, nl) == 0) {
+                            [s appendFormat:@"HIT exec region=0x%llx prot=%d at=0x%llx\n",
+                             (unsigned long long)addr, info.protection, (unsigned long long)(cur + i)];
+                            hits++;
+                            if (hits >= maxHits) break;
+                        }
+                    }
                 }
+                cur += chunk;
             }
         }
         addr += size;
     }
-    [s appendFormat:@"扫描区域数=%d 命中最少=%d\n", regions, hits];
+    free(buf);
+    [s appendFormat:@"区域=%d 扫描执行区=%d 命中=%d\n", regions, scanned, hits];
     return s;
 }
 
