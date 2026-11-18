@@ -869,10 +869,17 @@ static void xyOverlayEnsure(BOOL createIfNeeded) {
                     WKWebViewConfiguration *c2 = [WKWebViewConfiguration new];
                     for (WKUserScript *us in cfg.userContentController.userScripts)
                         [c2.userContentController addUserScript:us];
-                    [c2.userContentController addUserScript:
-                     [WKUserScript scriptWithSource:XY_NETLOG_JS()
-                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                  forMainFrameOnly:NO]];
+                    SEL selUS = @selector(scriptWithSource:injectionTime:forMainFrameOnly:);
+                    WKUserScript *usNew = nil;
+                    if ([WKUserScript respondsToSelector:selUS]) {
+                        typedef id (*USF)(id, SEL, NSString *, NSInteger, BOOL);
+                        USF fn = (USF)[WKUserScript methodForSelector:selUS];
+                        if (fn) usNew = fn([WKUserScript class], selUS, XY_NETLOG_JS(), 0, NO);
+                    }
+                    if (!usNew) usNew = [[WKUserScript alloc] initWithSource:XY_NETLOG_JS()
+                                                               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                            forMainFrameOnly:NO];
+                    if (usNew) [c2.userContentController addUserScript:usNew];
                     c2.preferences.javaScriptEnabled = YES;
                     cfg = c2;
                     W(@"netlog script injected (scripts=%lu)", (unsigned long)c2.userContentController.userScripts.count);
