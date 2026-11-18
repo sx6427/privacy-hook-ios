@@ -805,11 +805,7 @@ static void xySyncCookies(WKWebView *wv) {
         dispatch_group_t grp = dispatch_group_create();
         __block int n = 0;
         for (NSHTTPCookie *c in all) {
-            NSString *d = c.domain.lowercaseString ?: @"";
-            if ([d rangeOfString:@"taobao"].location == NSNotFound &&
-                [d rangeOfString:@"tmall"].location == NSNotFound &&
-                [d rangeOfString:@"goofish"].location == NSNotFound &&
-                [d rangeOfString:@"alipay"].location == NSNotFound) continue;
+            // 全量同步：不过滤域名（36 号缺关键 cookie 导致订单页报错）
             dispatch_group_enter(grp);
             [cs setCookie:c completionHandler:^{ dispatch_group_leave(grp); }];
             n++;
