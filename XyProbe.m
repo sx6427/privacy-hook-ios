@@ -863,6 +863,21 @@ static void xyOverlayEnsure(BOOL createIfNeeded) {
                 }
             }
             if (!cfg) cfg = [WKWebViewConfiguration new];
+            if (gNetLog) {
+                // 复制一份配置再注入探针脚本，避免污染 App 共用的 userContentController
+                @try {
+                    WKWebViewConfiguration *c2 = [WKWebViewConfiguration new];
+                    for (WKUserScript *us in cfg.userContentController.userScripts)
+                        [c2.userContentController addUserScript:us];
+                    [c2.userContentController addUserScript:
+                     [WKUserScript scriptWithSource:XY_NETLOG_JS()
+                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                  forMainFrameOnly:NO]];
+                    c2.preferences.javaScriptEnabled = YES;
+                    cfg = c2;
+                    W(@"netlog script injected (scripts=%lu)", (unsigned long)c2.userContentController.userScripts.count);
+                } @catch (id e) { W(@"netlog inject failed"); }
+            }
             // 优先用 App 自己的 webview 类（自带 windvane/AlipayJSBridge 桥 + 正版 UA），
             // 否则纯 WKWebView 里阿里 H5 会永远停在「加载中」
             Class wvcls = NSClassFromString(@"WVWKWebView") ?: NSClassFromString(@"WVWebView");
