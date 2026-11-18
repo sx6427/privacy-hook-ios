@@ -779,6 +779,7 @@ static id xyFindTreeWeb(NSMutableArray *log) {
 // 挑一个真的显示在屏幕上的 webview（有 window、尺寸正常、不太小）
 // ---- 覆盖层：新建一个真正可见的 webview 并保活（防页面切换把它挤掉）----
 static WKWebView *gOverlayWV = nil;
+static __weak WKWebView *gDonorWV = nil;
 static NSTimer *gOverlayTimer = nil;
 
 static UIViewController *xyTopVC(void) {
@@ -855,6 +856,7 @@ static void xyOverlayEnsure(BOOL createIfNeeded) {
                 NSString *cn = NSStringFromClass([w class]);
                 if ([cn containsString:@"WV"] || [cn containsString:@"TB"]) {
                     cfg = w.configuration;
+                    gDonorWV = w;
                     W(@"overlay borrow config from %@ (scripts=%lu handlers=%lu)",
                       cn,
                       (unsigned long)w.configuration.userContentController.userScripts.count,
@@ -896,6 +898,19 @@ static void xyOverlayEnsure(BOOL createIfNeeded) {
                 W(@"overlay using plain WKWebView");
             }
             gOverlayWV.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            // ★ 关键：借 App 容器的 navigationDelegate / UIDelegate —— windvane 桥是在这里注入的
+            if (gDonorWV) {
+                @try {
+                    if (gDonorWV.navigationDelegate) {
+                        gOverlayWV.navigationDelegate = gDonorWV.navigationDelegate;
+                        W(@"borrowed navigationDelegate %@", NSStringFromClass([gDonorWV.navigationDelegate class]));
+                    }
+                    if (gDonorWV.UIDelegate) {
+                        gOverlayWV.UIDelegate = gDonorWV.UIDelegate;
+                        W(@"borrowed UIDelegate %@", NSStringFromClass([gDonorWV.UIDelegate class]));
+                    }
+                } @catch (id e) { W(@"borrow delegates failed"); }
+            }
             gOverlayWV.opaque = NO;
             gOverlayWV.backgroundColor = [UIColor whiteColor];
             if (!gWebViews) gWebViews = [NSHashTable weakObjectsHashTable];
