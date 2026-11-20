@@ -891,29 +891,35 @@ static void xySyncCookies(WKWebView *wv) {
         if (!cs) return;
         NSArray *all = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
         dispatch_group_t grp = dispatch_group_create();
-        __block int n = 0;
+        __block int n = 0, skip = 0;
         for (NSHTTPCookie *c in all) {
-            // 全量同步：不过滤域名（36 号缺关键 cookie 导致订单页报错）
+            // v7.17: 跳过 H5 令牌。App 的 NSHTTPCookieStorage 里那份 _m_h5_tk 与服务器发给
+            // h5api.m.tmall.com 的那份同名不同域，灌进 webview 后页面 sign 用旧值 →
+            // 服务端一律回 FAIL_SYS_TOKEN_EMPTY（下单页「网络繁忙」）。让页面自己取新的。
+            if ([c.name hasPrefix:@"_m_h5_tk"]) { skip++; continue; }
             dispatch_group_enter(grp);
             [cs setCookie:c completionHandler:^{ dispatch_group_leave(grp); }];
             n++;
         }
         dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)));
-        W(@"overlay cookies synced %d", n);
+        W(@"overlay cookies synced %d (skip h5tk %d)", n, skip);
         flushLogs();
     } @catch (id e) {}
 }
 
 static void xyOverlayEnsure(BOOL createIfNeeded) {
     @try {
-        UIViewController *vc = xyTopVC();
-        UIView *host = vc.view ?: nil;
+        // v7.19: 优先挂到 keyWindow 上（原来挂 xyTopVC().view，有的 VC 不在窗口层级里，
+        // 结果页面加载正常但用户屏幕上什么也看不到）。
+        UIWindow *kw = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { kw = w; break; }
+        }
+        UIViewController *vc = nil;
+        UIView *host = kw;
         if (!host) {
-            UIWindow *kw = nil;
-            for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                if (w.isKeyWindow) { kw = w; break; }
-            }
-            host = kw;
+            vc = xyTopVC();
+            host = vc.view;
         }
         if (!host) return;
         if (!gOverlayWV && createIfNeeded) {
@@ -1124,9 +1130,24 @@ static void pollCmd(void) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         BOOL wantFresh = [obj[@"fresh"] boolValue];
                         if (wantFresh) {
+                            // ★ fresh 必须先销毁旧容器：xyOverlayEnsure 只在 gOverlayWV==nil 时才
+                            // 借 App 容器的 config/delegate（windvane 桥在里面）。复用旧容器 = 永远没桥。
+                            if (gOverlayWV) {
+                                @try { [gOverlayWV removeFromSuperview]; } @catch (id e) {}
+                                gOverlayWV = nil;
+                                W(@"fresh: dropped old overlay for re-create");
+                            }
                             xyOverlayEnsure(YES);
                             if (gOverlayWV) {
-                                if (!gOverlayWV.URL) xySyncCookies(gOverlayWV);   // 只在新容器首载前同步
+                                // v7.18: **默认不往容器里灌 cookie**。
+                                // 回滚 bf211db（"sync native taobao/tmall cookies into webview"）：
+                                // 全量塞 206 条导致 tmall 域 cookie 作用域被污染，下单页
+                                // 一直 FAIL_SYS_TOKEN_EMPTY（网络繁忙）。v7.14 没有这步 → 能进页面。
+                                // 只有在显式 resync=1 时才同步（保留排障手段）。
+                                if ([obj[@"resync"] boolValue]) {
+                                    xySyncCookies(gOverlayWV);
+                                    W(@"overlay resync by request");
+                                }
                                 [gOverlayWV loadRequest:[NSURLRequest requestWithURL:uu]];
                                 gWebView = gOverlayWV;
                                 W(@"webopen(fresh) ok frame=%.0fx%.0f win=%d",
@@ -1201,6 +1222,21 @@ static void pollCmd(void) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 WKWebView *w = gOverlayWV ?: gWebView;
                 if (w && w.superview) {
+                    // v7.19: 如果父视图不是 keyWindow，直接搬到 keyWindow 上并铺满
+                    UIWindow *kw = nil;
+                    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+                        if (win.isKeyWindow) { kw = win; break; }
+                    }
+                    if (kw && w.superview != kw) {
+                        [w removeFromSuperview];
+                        w.frame = kw.bounds;
+                        w.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                              UIViewAutoresizingFlexibleHeight;
+                        [kw addSubview:w];
+                        W(@"front: moved to keyWindow");
+                    }
+                    w.hidden = NO;
+                    w.alpha = 1.0;
                     [w.superview bringSubviewToFront:w];
                     W(@"front ok %@", NSStringFromClass([w class]));
                 } else {
@@ -1211,6 +1247,26 @@ static void pollCmd(void) {
         } else if ([mode isEqualToString:@"netlog"]) {
             gNetLog = obj[@"on"] ? [obj[@"on"] boolValue] : YES;
             W(@"netlog=%d", (int)gNetLog);
+        } else if ([mode isEqualToString:@"overlayreset"]) {
+            // v7.16: 销毁 overlay 容器。下次 webopen fresh 会重建并**重新同步 cookie**。
+            // 背景：xySyncCookies 只在容器首次创建时执行（if (!gOverlayWV.URL)），
+            // 容器常驻后 cookie 会过期 → 天猫下单页一直报「网络繁忙」。
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    if (gOverlayWV) {
+                        [gOverlayWV stopLoading];
+                        [gOverlayWV removeFromSuperview];
+                        W(@"overlay reset ok");
+                    } else {
+                        W(@"overlay reset: none");
+                    }
+                    gOverlayWV = nil;
+                    gDonorWV = nil;
+                } @catch (id e) {
+                    W(@"overlay reset failed");
+                }
+                flushLogs();
+            });
         } else if ([mode isEqualToString:@"pick"]) {
             // 把 gWebView 指向当前屏幕上真正可见的 webview（用于接管 App 自己打开的页面）
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1288,7 +1344,7 @@ static void xyprobe_init(void) {
             }];
             gWebDump = YES;
             xySwizzleWeb();
-            W(@"v7.15 timers started (… + batch mode + 0.3s file poll)");
+            W(@"v7.19 timers started (… + batch + overlay on keyWindow)");
             flushLogs();
         });
     }
