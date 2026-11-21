@@ -30,7 +30,7 @@
 #import <arpa/inet.h>
 #import <poll.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
@@ -2150,11 +2150,11 @@ static NSString *dmMemFind(NSData *pat, int maxHits) {
             vm_address_t endA = addr + size;
             while (cur < endA && hits < maxHits) {
                 vm_size_t chunk = MIN((vm_size_t)0x100000, endA - cur);
-                mach_vm_size_t outSize = 0;
-                kern_return_t r2 = mach_vm_read_overwrite(mach_task_self(), cur, chunk,
-                                                          (mach_vm_address_t)buf, &outSize);
+                vm_size_t outSize = 0;
+                kern_return_t r2 = vm_read_overwrite(mach_task_self(), (vm_address_t)cur, (vm_size_t)chunk,
+                                                     (vm_address_t)buf, &outSize);
                 if (r2 == KERN_SUCCESS && outSize >= nl) {
-                    for (mach_vm_size_t i = 0; i + nl <= outSize; i++) {
+                    for (size_t i = 0; i + nl <= outSize; i++) {
                         if (buf[i] == needle[0] && memcmp(buf + i, needle, nl) == 0) {
                             [s appendFormat:@"HIT exec region=0x%llx prot=%d at=0x%llx\n",
                              (unsigned long long)addr, info.protection, (unsigned long long)(cur + i)];
