@@ -2,7 +2,7 @@
 SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
 
 ARCH    = -arch arm64
-CFLAGS  = $(ARCH) -isysroot $(SDKROOT) -miphoneos-version-min=15.0 -fobjc-arc -Wall -O2
+CFLAGS  = $(ARCH) -isysroot $(SDKROOT) -miphoneos-version-min=15.0 -fobjc-arc -Wall -O2 -DDM_MINIMAL
 LDFLAGS = $(ARCH) -isysroot $(SDKROOT) -miphoneos-version-min=15.0 \
           -dynamiclib -framework Foundation -framework UIKit -framework CoreFoundation -framework CoreGraphics -framework JavaScriptCore \
           -install_name @executable_path/DamaiSpy.dylib \
