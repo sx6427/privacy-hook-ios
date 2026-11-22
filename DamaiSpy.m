@@ -34,7 +34,7 @@
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 
-static NSString *const kVer = @"v6.5";
+static NSString *const kVer = @"v7.0-min";
 
 // ---------------- 日志 ----------------
 static NSLock *gLock;
@@ -1949,6 +1949,7 @@ static int dm_CC_MD5_Final(unsigned char *md, CC_MD5_CTX *c) {
 }
 
 // 装载 interpose 表
+#ifndef DM_MINIMAL
 __attribute__((used)) static struct { const void *replacement; const void *replacee; }
 g_interposers[] __attribute__((section("__DATA, __interpose"))) = {
     { (const void *)dm_CC_MD5,        (const void *)CC_MD5 },
@@ -1956,6 +1957,9 @@ g_interposers[] __attribute__((section("__DATA, __interpose"))) = {
     { (const void *)dm_CC_MD5_Update, (const void *)CC_MD5_Update },
     { (const void *)dm_CC_MD5_Final,  (const void *)CC_MD5_Final },
 };
+#else
+static void dmCryptoStub(void) {}
+#endif
 
 static void dmInitCryptoHooks(void) { W(@"MD5 自带实现，无需 dlsym"); }
 
@@ -2753,7 +2757,9 @@ static void setupOnce(void) {
     @try { hookDX(); } @catch (id e) { W(@"hookDX EXC %@", e); }
     @try { hookSending(); } @catch (id e) { W(@"hookSending EXC %@", e); }
     @try { hookHeaders(); } @catch (id e) { W(@"hookHeaders EXC %@", e); }
+#ifndef DM_MINIMAL
     @try { hookSignMethods(); } @catch (id e) { W(@"hookSign EXC %@", e); }
+#endif
     @try { hookMtop(); } @catch (id e) { W(@"hookMtop EXC %@", e); }
     @try { bootMtopInfo(); } @catch (id e) { M(@"bootMtopInfo EXC %@", e); }
     flushAll();
@@ -2762,7 +2768,9 @@ static void setupOnce(void) {
     {
         unsigned char t[16]; dm_md5_ctx c; dm_md5_init(&c);
         dm_md5_update(&c, "abc", 3); dm_md5_final(t, &c);
-        @try { dmPatchShellMd5(); } @catch (id e) { W(@"patch EXC %@", e); }
+    #ifndef DM_MINIMAL
+    @try { dmPatchShellMd5(); } @catch (id e) { W(@"patch EXC %@", e); }
+#endif
     W(@"crypto ready selftest md5(abc)=%@ (应为 900150983cd24fb0d6963f7d28e17f72)", dmHexStr(t, 16));
     }
     flushAll();
