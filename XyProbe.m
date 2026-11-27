@@ -252,7 +252,11 @@ static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NS
         if (gAsync < 0) {
             const char *e = getenv("XY_ASYNC");
             BOOL envOn = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
-            BOOL fileOn = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/xy_async.on"];
+            NSArray *doms = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+            NSString *docDir = doms.count ? doms[0] : @"/var/mobile/Documents";
+            BOOL fileOn = [[NSFileManager defaultManager] fileExistsAtPath:
+                           [docDir stringByAppendingPathComponent:@"xy_async.on"]];
+            if (fileOn) W(@"ASYNC flag in %@", docDir);
             gAsync = (envOn || fileOn) ? 1 : 0;
             W(@"ASYNC gate env=%d file=%d -> %d", envOn, fileOn, gAsync);
             flushLogs();
