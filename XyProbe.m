@@ -155,6 +155,35 @@ static void doSwizzle(void) {
 }
 
 
+
+// ---------- v9: 探针——谁在构造 XIFMtopRequest ----------
+static void xyProbeXIF(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    Class c = NSClassFromString(@"XIFMtopRequest");
+    if (!c) { W(@"v9: no XIFMtopRequest"); return; }
+    NSArray *sels = @[@"setApiName:", @"setApiVer:", @"setParams:", @"setMtopServer:"];
+    for (NSString *sn in sels) {
+        SEL sel = NSSelectorFromString(sn);
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) { W(@"v9: missing %@", sn); continue; }
+        IMP orig = method_getImplementation(m);
+        __block IMP blkOrig = orig;
+        IMP newImp = imp_implementationWithBlock(^(id self_, NSString *val) {
+            @try {
+                W(@"v9 XIF %@ = %@", sn, [val isKindOfClass:[NSString class]] ? val : [val description]);
+                NSArray *bt = [NSThread callStackSymbols];
+                for (NSUInteger i = 1; i < MIN(bt.count, 9); i++) W(@"v9  bt%lu %@", (unsigned long)i, bt[i]);
+                flushLogs();
+            } @catch (id e) {}
+            ((void (*)(id, SEL, id))blkOrig)(self_, sel, val);
+        });
+        method_setImplementation(m, newImp);
+        W(@"v9 hooked %@", sn);
+    }
+}
+
 // ---------- v8: 异步同款通道（XY_ASYNC=1 启用）----------
 // 目的：走 App 的 async_call:delegate: 管线（带 wua / 上下文 / 人机校验），
 //       而不是 sync_call 直调；失败自动回落 sync_call，不影响现有日跑。
@@ -364,6 +393,7 @@ static void execNetCmd(NSDictionary *cmd) {
         // 远程控制指令
         if ([api isEqualToString:@"__swizzle"]) {
             swizzleMtopService();
+            xyProbeXIF();
             postResult(cmd[@"tag"], @"__swizzle", @"{\"ok\":true}");
             return;
         }
