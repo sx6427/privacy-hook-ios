@@ -154,12 +154,112 @@ static void doSwizzle(void) {
     W(@"SWIZZLE evaluateJavaScript OK");
 }
 
+
+// ---------- v8: 异步同款通道（XY_ASYNC=1 启用）----------
+// 目的：走 App 的 async_call:delegate: 管线（带 wua / 上下文 / 人机校验），
+//       而不是 sync_call 直调；失败自动回落 sync_call，不影响现有日跑。
+@interface XYAsyncCatcher : NSObject
+@property (nonatomic, strong) id resp;
+@property (nonatomic, strong) NSCondition *cond;
+@property (nonatomic, assign) BOOL done;
+@end
+
+@implementation XYAsyncCatcher
+- (instancetype)init {
+    if (self = [super init]) { _cond = [NSCondition new]; }
+    return self;
+}
+- (BOOL)respondsToSelector:(SEL)aSelector { return YES; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    return [NSMethodSignature signatureWithObjCTypes:"v@:@"];
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    @try {
+        if ([[inv methodSignature] numberOfArguments] >= 3) {
+            __unsafe_unretained id arg = nil;
+            [inv getArgument:&arg atIndex:2];
+            if (arg) self.resp = arg;
+        }
+    } @catch (id e) {}
+    [self.cond lock];
+    self.done = YES;
+    [self.cond broadcast];
+    [self.cond unlock];
+}
+@end
+
+static NSString *payloadFromResp(id resp) {
+    if (!resp) return nil;
+    id d = nil;
+    @try { d = [resp valueForKey:@"data"]; } @catch (id e) { d = nil; }
+    if ([d isKindOfClass:[NSDictionary class]] || [d isKindOfClass:[NSArray class]]) {
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+        if (jd) return [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+    }
+    if ([resp isKindOfClass:[NSDictionary class]] || [resp isKindOfClass:[NSArray class]]) {
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+        if (jd) return [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+    }
+    return [NSString stringWithFormat:@"%@", resp];
+}
+
+static id xyBuildRequest(NSString *api, NSString *v, id data) {
+    Class rc = NSClassFromString(@"MtopRequest");
+    if (!rc) rc = NSClassFromString(@"MtopExtRequest");
+    if (!rc) return nil;
+    id req = nil;
+    @try { req = [[rc alloc] init]; } @catch (id e) { return nil; }
+    if (!req) return nil;
+    @try { [req setValue:api forKey:@"api"]; } @catch (id e) {}
+    @try { [req setValue:v forKey:@"version"]; } @catch (id e) {}
+    @try { [req setValue:data forKey:@"data"]; } @catch (id e) {}
+    return req;
+}
+
+static NSString *runMtopAsync(NSString *api, NSString *v, id data, NSString *site, NSString *tag) {
+    if (!site.length) site = @"xianyu";
+    Class ms = NSClassFromString(@"MtopService");
+    if (!ms) return nil;
+    id inst = ((id (*)(id, SEL, id))objc_msgSend)(ms, @selector(getInstanceWithAccountSite:), site);
+    if (!inst) return nil;
+    id req = xyBuildRequest(api, v, data);
+    if (!req) return nil;
+    SEL asel = @selector(async_call:delegate:);
+    if (![inst respondsToSelector:asel]) return nil;
+    XYAsyncCatcher *catcher = [XYAsyncCatcher new];
+    W(@"MS-ASYNC %@ v=%@ tag=%@", api, v, tag);
+    flushLogs();
+    ((void (*)(id, SEL, id, id))objc_msgSend)(inst, asel, req, catcher);
+    [catcher.cond lock];
+    if (!catcher.done) [catcher.cond waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:25]];
+    BOOL ok = catcher.done;
+    [catcher.cond unlock];
+    if (!ok) { W(@"MS-ASYNC timeout tag=%@", tag); flushLogs(); return nil; }
+    NSString *pl = payloadFromResp(catcher.resp);
+    W(@"MS-ASYNC-DONE tag=%@ len=%lu", tag, (unsigned long)pl.length);
+    flushLogs();
+    return pl;
+}
+
 // ---------- mtop 执行核心（文件通道与网络通道共用） ----------
 // 返回 payload 文本（描述文本，内含 http body JSON）；失败返回错误说明
 static NSString *runMtop(NSString *api, NSString *v, id data, NSString *site, NSString *tag) {
     if (!site.length) site = @"xianyu";
     W(@"MS-CALL %@ v=%@ site=%@ tag=%@", api, v, site, tag);
     flushLogs();
+    {
+        static int gAsync = -1;
+        if (gAsync < 0) {
+            const char *e = getenv("XY_ASYNC");
+            gAsync = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T')) ? 1 : 0;
+        }
+        if (gAsync) {
+            NSString *apl = runMtopAsync(api, v, data, site, tag);
+            if (apl.length) return apl;
+            W(@"MS-ASYNC fallback -> sync_call");
+            flushLogs();
+        }
+    }
     Class ms = NSClassFromString(@"MtopService");
     if (!ms) { W(@"no MtopService"); flushLogs(); return @"{\"error\":\"no MtopService\"}"; }
     SEL gs = @selector(getInstanceWithAccountSite:);
