@@ -204,15 +204,26 @@ static NSString *payloadFromResp(id resp) {
 }
 
 static id xyBuildRequest(NSString *api, NSString *v, id data) {
-    Class rc = NSClassFromString(@"MtopRequest");
-    if (!rc) rc = NSClassFromString(@"MtopExtRequest");
-    if (!rc) return nil;
+    NSArray *names = @[@"MtopRequest", @"MtopExtRequest", @"MtopBizRequest"];
     id req = nil;
-    @try { req = [[rc alloc] init]; } @catch (id e) { return nil; }
-    if (!req) return nil;
-    @try { [req setValue:api forKey:@"api"]; } @catch (id e) {}
-    @try { [req setValue:v forKey:@"version"]; } @catch (id e) {}
-    @try { [req setValue:data forKey:@"data"]; } @catch (id e) {}
+    NSString *used = nil;
+    for (NSString *n in names) {
+        Class rc = NSClassFromString(n);
+        if (!rc) continue;
+        @try { req = [[rc alloc] init]; } @catch (id e) { req = nil; }
+        if (req) { used = n; break; }
+    }
+    if (!req) { W(@"ASYNC: no request class"); flushLogs(); return nil; }
+    W(@"ASYNC: req class %@", used);
+    BOOL okApi = NO, okVer = NO, okData = NO;
+    @try { [req performSelector:NSSelectorFromString(@"setApi:") withObject:api]; okApi = YES; } @catch (id e) {}
+    if (!okApi) { @try { [req setValue:api forKey:@"api"]; okApi = YES; } @catch (id e) {} }
+    @try { [req performSelector:NSSelectorFromString(@"setVersion:") withObject:v]; okVer = YES; } @catch (id e) {}
+    if (!okVer) { @try { [req setValue:v forKey:@"version"]; okVer = YES; } @catch (id e) {} }
+    @try { [req performSelector:NSSelectorFromString(@"setData:") withObject:data]; okData = YES; } @catch (id e) {}
+    if (!okData) { @try { [req setValue:data forKey:@"data"]; okData = YES; } @catch (id e) {} }
+    W(@"ASYNC: set api=%d ver=%d data=%d | %@", okApi, okVer, okData, [req description]);
+    flushLogs();
     return req;
 }
 
@@ -226,10 +237,20 @@ static NSString *runMtopAsync(NSString *api, NSString *v, id data, NSString *sit
     if (!req) return nil;
     SEL asel = @selector(async_call:delegate:);
     if (![inst respondsToSelector:asel]) return nil;
+    static XYAsyncCatcher *gCatcher = nil;
     XYAsyncCatcher *catcher = [XYAsyncCatcher new];
+    gCatcher = catcher;   // 静态持有，避免被释放
     W(@"MS-ASYNC %@ v=%@ tag=%@", api, v, tag);
     flushLogs();
-    ((void (*)(id, SEL, id, id))objc_msgSend)(inst, asel, req, catcher);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(inst, asel, req, catcher);
+        } @catch (NSException *ex) {
+            W(@"ASYNC: exception %@", ex.reason);
+            flushLogs();
+            [catcher.cond lock]; catcher.done = YES; [catcher.cond broadcast]; [catcher.cond unlock];
+        }
+    });
     [catcher.cond lock];
     if (!catcher.done) [catcher.cond waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:25]];
     BOOL ok = catcher.done;
